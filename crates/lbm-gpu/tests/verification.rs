@@ -738,6 +738,20 @@ fn fans_and_porous_zones_are_refused_clearly() {
     assert!(e.as_deref().is_some_and(|e| e.contains("Vent") && e.contains("cpu")), "{e:?}");
 }
 
+/// The Smagorinsky eddy viscosity runs on the CPU only for now: the backend says so before it
+/// looks for a device.
+#[test]
+fn turbulence_is_refused_clearly() {
+    let mut p = step(10.0, 1.0, None);
+    if let Procedure::Fluid { turbulence, .. } = &mut p {
+        *turbulence = Some(fieldcraft_model::Turbulence::Smagorinsky { constant: 0.17, prandtl: 0.9 });
+    }
+    let m = model(1.0, 0.1, domain([0.0; 3], [4.0, 2.0, 2.0], 1.0), p);
+    let (_, flow) = prepare(&m, &[]);
+    let e = GpuFlow::with_options(&flow, Policy::from_env().expect("FIELDCRAFT_GPU names a policy"), Options::default()).err().map(|e| e.to_string());
+    assert!(e.as_deref().is_some_and(|e| e.contains("turbulence") && e.contains("cpu")), "{e:?}");
+}
+
 // ---- Conducting solids ----
 
 /// A column across y with a powered conducting slab against the cold plate and another against
