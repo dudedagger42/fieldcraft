@@ -613,6 +613,10 @@ JCP 232(1):100–117, 2013, DOI [10.1016/j.jcp.2012.07.023](https://doi.org/10.1
 - **Method.** The strain rate is local in LBM (from the non-equilibrium second moment), so `ν_t = (C_s Δ)² |S|` is
   computed without finite differences and enters as a local τ. Cheap and local.
 - **Limits.** Smagorinsky is over-dissipative near walls (needs damping or a wall model) and in transition.
+- **As implemented** (`crates/lbm/src/turbulence.rs`, #663/#664): Hou et al.'s closed-form local τ from the
+  non-equilibrium flux `P = Π^neq + ½(uF + Fu)` of Guo's forcing, in both the regularised and the two-relaxation-time
+  collision (τ⁻ follows τ⁺, keeping Λ); with heat, the turbulent diffusivity `α_t = ν_t / Pr_t` adds to each cell's
+  τ_T. No wall damping yet.
 
 **C5.2 Malaspinas & Sagaut 2012, 2014 — consistent SGS and wall models.** **Verdict: reference (wall model later).**
 - *Consistent subgrid scale modelling for lattice Boltzmann methods.* JFM 700:514–542, 2012. DOI [10.1017/jfm.2012.155](https://doi.org/10.1017/jfm.2012.155).

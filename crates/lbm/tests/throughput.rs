@@ -77,6 +77,7 @@ fn scaling_over_threads() {
             magic: None,
             collision: None,
             steady: None,
+            turbulence: None,
         },
     );
     let available = fieldcraft_parallel::available();
