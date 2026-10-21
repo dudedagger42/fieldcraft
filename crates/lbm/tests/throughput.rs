@@ -35,6 +35,7 @@ fn cell_updates_per_second() {
                 frames: 1,
                 magic: None,
                 collision: Some(collision),
+                turbulence: None,
                 steady: None,
             },
         );

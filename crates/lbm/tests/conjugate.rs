@@ -338,6 +338,7 @@ fn a_low_capacity_solid_with_strong_links_stays_stable() {
             frames: 1,
             magic: None,
             collision: None,
+            turbulence: None,
             steady: rule,
         };
         let m = cht_model([1.0, alpha, alpha], (capacity, [8.0 * alpha; 3], 1.0), d, procedure);
@@ -454,6 +455,7 @@ fn heated_block(capacity: f64, end_time: f64, steady: Option<fieldcraft_model::S
         frames: 2,
         magic: None,
         collision: None,
+        turbulence: None,
         steady,
     };
     let m = cht_model([1.0, nu, alpha], (capacity, [0.5; 3], 1.0), d, procedure);

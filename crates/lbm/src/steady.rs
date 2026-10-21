@@ -442,6 +442,7 @@ mod tests {
             frames: 1,
             magic: None,
             collision: None,
+            turbulence: None,
             steady: Some(rule),
         };
         m.add_step(Step::new("Run", p), None).unwrap();

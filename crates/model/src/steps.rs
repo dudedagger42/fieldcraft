@@ -73,7 +73,8 @@ pub enum Procedure {
     /// ([`Collision`], two relaxation times by default); `magic` is the two-relaxation-time
     /// parameter Λ (default 3/16, which puts bounce-back walls exactly halfway between cells).
     /// With `steady`, the run stops on its own once the flow stops changing ([`Steady`]); its
-    /// length is then the most it may run.
+    /// length is then the most it may run. `turbulence` adds a subgrid eddy viscosity
+    /// ([`Turbulence`]; none by default).
     Fluid {
         domain: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -88,6 +89,8 @@ pub enum Procedure {
         magic: Option<f64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         collision: Option<Collision>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turbulence: Option<Turbulence>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         steady: Option<Steady>,
     },
@@ -130,6 +133,25 @@ impl Collision {
             Collision::Regularized => "regularized",
         }
     }
+}
+
+/// A fluid step's turbulence model.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Turbulence {
+    /// Smagorinsky's subgrid eddy viscosity ν_t = (C Δx)² |S|, with `constant` C (0.1 to 0.2 is
+    /// usual; 0.17 is Lilly's for isotropic turbulence) and |S| = √(2 S:S) the local strain
+    /// rate. With heat, the turbulent diffusivity α_t = ν_t / Pr_t adds to the fluid's, with
+    /// `prandtl` the turbulent Prandtl number Pr_t (0.85 to 0.9 is usual; default 0.9).
+    Smagorinsky {
+        constant: f64,
+        #[serde(default = "default_turbulent_prandtl")]
+        prandtl: f64,
+    },
+}
+
+fn default_turbulent_prandtl() -> f64 {
+    0.9
 }
 
 /// Most quantities a steady-state rule monitors besides the residual.

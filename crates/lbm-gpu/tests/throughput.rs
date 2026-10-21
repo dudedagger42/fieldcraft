@@ -42,6 +42,7 @@ fn cell_updates_per_second() {
                 frames: 1,
                 magic: None,
                 collision: Some(collision),
+                turbulence: None,
                 steady: None,
             },
         );
@@ -117,6 +118,7 @@ fn conjugate_cell_updates_per_second() {
         frames: 1,
         magic: None,
         collision: Some(fieldcraft_model::Collision::Regularized),
+        turbulence: None,
         steady: None,
     };
     let m = cht_model([1.0, 0.02, 0.03], (2.0, [2.0; 3], 1.0), d, procedure);
@@ -174,6 +176,7 @@ fn fixed_cost_per_solve() {
         frames: 1,
         magic: None,
         collision: None,
+        turbulence: None,
         steady: None,
     };
     let m = cht_model([1.0, 0.02, 0.03], (2.0, [2.0; 3], 1.0), d, procedure);
