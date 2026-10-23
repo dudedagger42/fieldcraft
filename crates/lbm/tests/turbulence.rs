@@ -259,3 +259,108 @@ fn with_the_model_on_taylor_green_approaches_the_laminar_decay_to_second_order()
         assert!(o > 1.8, "second order: {o:.3}");
     }
 }
+
+/// A turbulent channel at Re_τ = 180 (walls at y = 0 and 2δ, periodic over 2πδ × πδ, driven by
+/// the body force u_τ²/δ), `n` cells per half-height, Smagorinsky's model with constant `c`:
+/// the mean bulk and centreline speeds over u_τ, averaged over the planes and over
+/// `average` δ/u_τ after `discard` δ/u_τ of start-up. In units δ = u_τ = 1.
+fn channel(n: usize, c: f64, discard: f64, average: f64) -> (f64, f64) {
+    use std::f64::consts::PI;
+    let (re_tau, ub_guess, lattice_ub) = (180.0, 15.7, 0.1);
+    let nu = 1.0 / re_tau;
+    let dx = 1.0 / n as f64;
+    // About 2πδ × πδ, in whole cells.
+    let (lx, lz) = ((2.0 * PI * n as f64).round() * dx, (PI * n as f64).round() * dx);
+    let (kx, kz) = (2.0 * PI / lx, 2.0 * PI / lz);
+    let mut d = domain([0.0; 3], [lx, 2.0, lz], dx);
+    for f in [&mut d.faces.x_min, &mut d.faces.x_max, &mut d.faces.z_min, &mut d.faces.z_max] {
+        *f = PERIODIC;
+    }
+    d.acceleration = [1.0, 0.0, 0.0];
+    let dt = lattice_ub * dx / ub_guess;
+    let mut p = collide(discard + average, dt, None, Collision::Regularized);
+    if let Procedure::Fluid { turbulence, .. } = &mut p {
+        *turbulence = Some(Turbulence::Smagorinsky { constant: c, prandtl: 0.9 });
+    }
+    let (setup, mut flow) = prepare(&model(1.0, nu, d, p), &[]);
+    let grid = *flow.grid();
+    let to_lattice = 1.0 / setup.velocity_scale();
+    // A blunt turbulent-like profile with streamwise vortices and a wavy streak to trip it.
+    flow.set_equilibrium(|cell| {
+        let [x, y, z] = grid.centre(cell);
+        let eta = y - 1.0;
+        let wall = 1.0 - eta * eta;
+        let u = 1.15 * ub_guess * (1.0 - eta.abs().powi(8)) + 2.0 * (2.0 * kz * z).sin() * (kx * x).cos() * wall;
+        let v = 1.5 * wall * (2.0 * kz * z).cos() * (3.0 * kx * x).sin();
+        let w = 1.5 * wall * eta * (kx * x).sin() * (kz * z).cos();
+        (1.0, [u * to_lattice, v * to_lattice, w * to_lattice])
+    });
+    let [nx, ny, nz] = grid.cells;
+    let steps = setup.steps;
+    let from = (discard / dt) as u64;
+    let every = ((0.05 / dt) as u64).max(1);
+    let mut profile = vec![0.0; ny];
+    let mut samples = 0usize;
+    for k in 0..steps {
+        flow.step().unwrap_or_else(|e| panic!("{n} cells per δ: step {k}: {e}"));
+        if k >= from && k % every == 0 {
+            for cell in 0..grid.len() {
+                let [_, j, _] = grid.coords(cell);
+                profile[j] += flow.moments(cell).unwrap().1[0] * setup.velocity_scale();
+            }
+            samples += 1;
+        }
+        if k % (steps / 10).max(1) == 0 {
+            let ub: f64 = (0..grid.len()).map(|c| flow.moments(c).unwrap().1[0]).sum::<f64>() / grid.len() as f64 * setup.velocity_scale();
+            println!("  {n}/δ: t = {:.1} δ/u_τ, U_b/u_τ = {ub:.2}, largest ν_t/ν {:.2}", k as f64 * dt, flow.eddy_viscosity_ratio());
+        }
+    }
+    for u in &mut profile {
+        *u /= (samples * nx * nz) as f64;
+    }
+    let ub = profile.iter().sum::<f64>() / ny as f64;
+    let uc = 0.5 * (profile[ny / 2 - 1] + profile[ny / 2]);
+    (ub, uc)
+}
+
+/// The #664 oracle: Moser, Kim & Mansour (1999) at Re_τ = 178 give U_b/u_τ ≈ 15.7 (Re_b = 5600 on
+/// 2δ) and a centreline U_c/u_τ ≈ 18.3. Reported on four grids so the grid dependence shows; a
+/// flow that went laminar would accelerate towards U_b/u_τ = Re_τ/3 = 60. Slow (1.8 h on 32
+/// threads): `cargo test --release -p fieldcraft-lbm --test turbulence -- --ignored --nocapture
+/// channel`.
+///
+/// Measured (C = 0.1, regularised collision, 10 δ/u_τ discarded and 15 averaged):
+///
+/// | cells per δ | y⁺ per cell | U_b/u_τ | U_c/u_τ | C_f |
+/// |---|---|---|---|---|
+/// | 12 | 15.0 | 9.95 (−36.6 %) | 13.07 (−28.6 %) | 2.02e-2 |
+/// | 18 | 10.0 | 11.55 (−26.4 %) | 14.42 (−21.2 %) | 1.50e-2 |
+/// | 24 | 7.5 | 12.81 (−18.4 %) | 15.60 (−14.8 %) | 1.22e-2 |
+/// | 32 | 5.6 | 14.17 (−9.8 %) | 17.00 (−7.1 %) | 9.96e-3 |
+///
+/// The bulk speed approaches MKM's as the first cell moves into the viscous sublayer: without
+/// wall damping Smagorinsky's eddy viscosity is too large in the first cells off the wall, so
+/// the friction is too high on coarse grids (literature C5.1, "Limits"). Van Driest damping, or a
+/// wall model, is the next step. On the finest grid the bulk speed was still falling slowly at
+/// the end of the averaging, so its mean is an upper bound of this run's.
+#[test]
+#[ignore]
+fn a_channel_at_re_tau_180_has_the_bulk_and_centreline_speeds_of_moser_kim_and_mansour() {
+    let c = 0.1;
+    let mut ubs = Vec::new();
+    for n in [12, 18, 24, 32] {
+        let (ub, uc) = channel(n, c, 10.0, 15.0);
+        ubs.push(ub);
+        println!(
+            "channel Re_τ 180, C = {c}, {n} cells per δ (y⁺ {:.1} per cell): U_b/u_τ {ub:.2} (MKM 15.7, {:+.1}%), U_c/u_τ {uc:.2} (MKM 18.3, {:+.1}%), C_f {:.3e} (MKM 8.18e-3)",
+            180.0 / n as f64,
+            100.0 * (ub / 15.7 - 1.0),
+            100.0 * (uc / 18.3 - 1.0),
+            2.0 / (ub * ub)
+        );
+        assert!(ub > 5.0 && ub < 30.0, "{n}: turbulent, not laminar: U_b/u_τ {ub}");
+    }
+    // Closer to MKM on every finer grid, and within 15 % on the finest.
+    assert!(ubs.windows(2).all(|w| w[1] > w[0]), "{ubs:?}");
+    assert!((ubs[ubs.len() - 1] / 15.7 - 1.0).abs() < 0.15, "{ubs:?}");
+}
