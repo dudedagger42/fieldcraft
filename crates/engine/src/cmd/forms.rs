@@ -758,6 +758,13 @@ const FAN: &[Field] = &[
         .hint("0.01"),
 ];
 
+const ROTOR: &[Field] = &[
+    reference("body", "Body", C::Body).help("The body that turns: an impeller, a fan wheel (not also an obstacle).").req(),
+    xyz("origin", "Point on axis", D::Length).help("A point on the axis it turns about.").req().def("[0, 0, 0]"),
+    xyz("axis", "Axis", D::None).help("Direction of the axis; positive speeds turn right-handed about it.").req().def("[0, 0, 1]"),
+    num("speed", "Speed", D::AngularVelocity).help("Angular speed in radians per time unit, or with a unit: \"3000 rpm\".").req(),
+];
+
 pub const FLUID_DOMAIN: &[Field] = &[
     NAME,
     reference("material", "Fluid", C::Material).help("The fluid material: needs a density and a viscosity.").req(),
@@ -799,6 +806,8 @@ pub const FLUID_DOMAIN: &[Field] = &[
     rows("porous", "Vents and filters", POROUS_ZONE)
         .help("Porous resistance zones: vents, grilles, filters and perforated plates without resolving every hole."),
     rows("fans", "Fans", FAN).help("Fans: zones that raise the pressure by their pressure–flow curve; the solve finds the operating point."),
+    rows("rotors", "Rotors", ROTOR)
+        .help("Bodies that turn through the fluid blade by blade; the solve reports each one's torque and the power it gives the fluid (CPU backend, without heat)."),
 ];
 
 pub const FLUID_BOUNDARY: &[Field] = &[

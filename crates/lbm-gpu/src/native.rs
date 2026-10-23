@@ -521,6 +521,9 @@ impl GpuFlow {
         if flow.smagorinsky() > 0.0 {
             return Err(Error::Invalid("the GPU backend does not model turbulence (`turbulence`) yet: solve on the CPU (`backend: \"cpu\"`)".into()));
         }
+        if let Some(r) = flow.rotors().first() {
+            return Err(Error::Invalid(format!("the GPU backend does not turn rotors yet (`{}`): solve on the CPU (`backend: \"cpu\"`)", r.body)));
+        }
         if let Some(zone) = flow.zones().first() {
             return Err(Error::Invalid(format!(
                 "the GPU backend does not step fans or porous zones yet (`{}`): solve on the CPU (`backend: \"cpu\"`)",

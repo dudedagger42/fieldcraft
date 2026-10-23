@@ -545,8 +545,8 @@ fn nonlinear_history(s: &Session, step: &str, r: &fieldcraft_solver::StaticResul
 /// surfaces come out in metres, as the domain is.
 fn obstacles(s: &Session, domain: &FluidDomain) -> Result<Vec<Obstacle>> {
     let tolerance = crate::units::to_geometry_length(domain.tolerance.unwrap_or(domain.spacing / 10.0));
-    let mut out = Vec::with_capacity(domain.obstacles.len());
-    for body in &domain.obstacles {
+    let mut out = Vec::with_capacity(domain.obstacles.len() + domain.rotors.len());
+    for body in domain.obstacles.iter().chain(domain.rotors.iter().map(|r| &r.body)) {
         let (mesh, faces) = if let Some(shape) = s.design.as_deref().and_then(|d| d.body(body)) {
             (std::borrow::Cow::Owned(shape.tessellate(tolerance)?), shape.faces().iter().map(|f| f.name.clone()).collect())
         } else if let Some(t) = s.surfaces.iter().find(|t| &t.name == body) {
@@ -947,6 +947,7 @@ fn fluid_summary(r: &FluidResult, display: &DisplaySystem) -> Value {
         "magic": r.stats.magic,
         "collision": r.stats.collision.name(),
         "eddy_viscosity_ratio": r.stats.eddy_viscosity_ratio,
+        "rotors": r.stats.rotors.iter().map(|x| json!({"body": x.body, "torque": x.torque, "last_torque": x.last_torque, "power": x.power, "turns": x.turns})).collect::<Vec<_>>(),
         "velocity_scale": r.stats.velocity,
         "lattice_velocity": r.stats.lattice_velocity,
         "mach": r.stats.mach,
@@ -2029,6 +2030,36 @@ pub(crate) mod tests {
         )
         .unwrap();
         assert!(s.execute("solve.fluid", &json!({})).is_err());
+    }
+
+    /// A paddle of the design (16 × 3 × 12 mm) turning at 600 rpm about z in a closed 40 mm box of
+    /// a thick fluid, through commands: the reply gives its torque against the turning, the power
+    /// it puts into the fluid and the turns made, and the speed takes its unit (the GPU backend's
+    /// refusal is in `fieldcraft-lbm-gpu`'s verification tests).
+    #[test]
+    fn a_rotor_of_the_design_stirs_a_box_and_the_reply_gives_its_torque_and_power() {
+        let (_dir, opened) = super::super::datum::tests::scripted(json!([
+            {"command": "solid.box", "params": {"length": 16, "width": 3, "height": 12, "corner": [12, 18.5, 14], "body_name": "Paddle"}},
+        ]));
+        let mut s = opened;
+        std::mem::forget(_dir);
+        let script = json!([
+            // mm, t and s: ν = 200 mm²/s.
+            {"command": "model.material.create", "params": {"name": "Syrup", "density": 1e-9, "fluid": {"type": "newtonian", "viscosity": 2e-7}}},
+            {"command": "model.fluid_domain.create", "params": {"name": "Box", "material": "Syrup", "min": [0, 0, 0], "max": [40, 40, 40], "spacing": 2,
+                "rotors": [{"body": "Paddle", "origin": [20, 20, 20], "axis": [0, 0, 1], "speed": "600 rpm"}]}},
+            {"command": "model.step.create", "params": {"name": "Stir", "procedure": {"type": "fluid", "domain": "Box", "steps": 1000, "time_step": 4e-4, "frames": 1}}},
+        ]);
+        s.run_script(&script).unwrap();
+        let r = s.execute("solve.fluid", &json!({})).unwrap();
+        let rotor = &r["rotors"][0];
+        assert_eq!(rotor["body"], "Paddle", "{r}");
+        let (torque, power, turns) = (rotor["torque"].as_f64().unwrap(), rotor["power"].as_f64().unwrap(), rotor["turns"].as_f64().unwrap());
+        // 600 rpm for 1000 steps of 0.4 ms: four turns.
+        assert!((turns - 4.0).abs() < 1e-9, "{rotor}");
+        assert!(torque < 0.0 && power > 0.0, "{rotor}");
+        let speed = 600.0 * std::f64::consts::TAU / 60.0;
+        assert!((power + torque * speed).abs() < 1e-12 * power.abs().max(1e-30), "{rotor}");
     }
 
     /// A duct 60 × 4 × 4 with walls around, periodic along x (a closed loop): a fan at x 2..4

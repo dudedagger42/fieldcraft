@@ -613,6 +613,7 @@ pub(crate) mod tests {
             backend: "cpu".into(),
             tau_thermal: None,
             eddy_viscosity_ratio: None,
+            rotors: vec![],
         };
         FluidResult {
             step: "Flow".into(),

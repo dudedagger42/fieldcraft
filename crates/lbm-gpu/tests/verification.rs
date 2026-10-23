@@ -752,6 +752,19 @@ fn turbulence_is_refused_clearly() {
     assert!(e.as_deref().is_some_and(|e| e.contains("turbulence") && e.contains("cpu")), "{e:?}");
 }
 
+/// Rotors turn on the CPU only for now: the backend says so, by name, before it looks for a
+/// device.
+#[test]
+fn rotors_are_refused_clearly() {
+    let mut d = domain([0.0; 3], [16.0, 16.0, 8.0], 1.0);
+    d.rotors = vec![fieldcraft_model::Rotor { body: "Wheel".into(), origin: [8.0, 8.0, 0.0], axis: [0.0, 0.0, 1.0], speed: 0.01 }];
+    let m = model(1.0, 0.1, d, step(10.0, 1.0, None));
+    let wheel = fieldcraft_lbm::Obstacle { body: "Wheel".into(), surface: cylinder([8.0, 8.0], 4.0, 2.0, 6.0, 32), faces: vec![] };
+    let (_, flow) = prepare(&m, &[wheel]);
+    let e = GpuFlow::with_options(&flow, Policy::from_env().expect("FIELDCRAFT_GPU names a policy"), Options::default()).err().map(|e| e.to_string());
+    assert!(e.as_deref().is_some_and(|e| e.contains("Wheel") && e.contains("rotor") && e.contains("cpu")), "{e:?}");
+}
+
 // ---- Conducting solids ----
 
 /// A column across y with a powered conducting slab against the cold plate and another against
