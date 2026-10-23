@@ -561,7 +561,7 @@ fn natural_convection_matches_the_cpu() {
 #[test]
 fn runs_to_steady_state_stop_where_the_cpu_does() {
     let steady = |tolerance: f64, window: f64, monitors: Vec<fieldcraft_model::FlowMonitor>| {
-        Some(fieldcraft_model::Steady { monitors, tolerance, window: Some(window), min_time: None, divergence: None })
+        Some(fieldcraft_model::Steady { monitors, tolerance, window: Some(window), min_time: None, divergence: None, averaging: None })
     };
     let fluid = |end_time: f64, dt: f64, steady: Option<fieldcraft_model::Steady>| Procedure::Fluid {
         domain: "Flow".into(),

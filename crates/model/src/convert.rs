@@ -360,9 +360,12 @@ impl Quantities for Step {
                 for v in [end_time, time_step].into_iter().flatten() {
                     f(Q::Time, v);
                 }
-                if let Some(Steady { monitors: _, tolerance: _, window, min_time, divergence: _ }) = steady {
+                if let Some(Steady { monitors: _, tolerance: _, window, min_time, divergence: _, averaging }) = steady {
                     for v in [window, min_time].into_iter().flatten() {
                         f(Q::Time, v);
+                    }
+                    if let Some(a) = averaging {
+                        f(Q::Time, &mut a.start);
                     }
                 }
             }
