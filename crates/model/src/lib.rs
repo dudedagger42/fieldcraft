@@ -50,6 +50,7 @@ pub mod nodal;
 pub mod progress;
 pub mod relaxations;
 pub mod rename;
+pub mod rotors;
 pub mod sections;
 pub mod seeds;
 pub mod sets;
@@ -84,6 +85,7 @@ pub use mesh::{
 };
 pub use mesh_plans::{CutRole, MeshPlan, PlanCut, PlanFeature, PlanMesher, PlanRing, PlanUnmapped, RingKind};
 pub use relaxations::{Relaxation, RelaxationCell};
+pub use rotors::Rotor;
 pub use sections::{BeamProfile, Extent, Formulation, Integration, Section, SectionKind};
 pub use seeds::{Bias, BiasToward, Divisions, Seed, SeedConstraint};
 pub use sets::Set;

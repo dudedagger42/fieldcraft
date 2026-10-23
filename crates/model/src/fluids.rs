@@ -653,6 +653,9 @@ pub struct FluidDomain {
     /// Fans: zones that raise the pressure by their pressure–flow curve.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fans: Vec<Fan>,
+    /// Bodies that turn about an axis, blade by blade ([`crate::Rotor`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rotors: Vec<crate::Rotor>,
 }
 
 fn is_zero(v: &[f64; 3]) -> bool {
@@ -752,6 +755,7 @@ impl FluidDomain {
             positive("tolerance", t)?;
         }
         crate::fluid_zones::validate_zones(&self.porous, &self.fans)?;
+        crate::rotors::validate_rotors(&self.rotors, &self.obstacles)?;
         Ok(())
     }
 
@@ -919,6 +923,7 @@ mod tests {
             thermal: None,
             porous: vec![],
             fans: vec![],
+            rotors: vec![],
         }
     }
 

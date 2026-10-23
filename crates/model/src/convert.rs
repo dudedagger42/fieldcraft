@@ -240,6 +240,7 @@ impl Quantities for FluidDomain {
             thermal,
             porous,
             fans,
+            rotors,
         } = self;
         each(min, Q::Length, f);
         each(max, Q::Length, f);
@@ -309,6 +310,10 @@ impl Quantities for FluidDomain {
                 f(Q::VolumeFlow, flow);
                 f(Q::Pressure, rise);
             }
+        }
+        for crate::Rotor { body: _, origin, axis: _, speed } in rotors {
+            each(origin, Q::Length, f);
+            f(Q::AngularVelocity, speed);
         }
     }
 }
