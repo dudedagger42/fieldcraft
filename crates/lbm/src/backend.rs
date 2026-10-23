@@ -50,6 +50,11 @@ pub trait Backend {
     fn eddy_viscosity_ratio(&self) -> f64 {
         0.0
     }
+    /// The rotors' torques and angles. A backend without rotors refuses a flow with them when
+    /// it is made, so the default is none.
+    fn rotors(&self) -> Vec<crate::rotor::RotorSample> {
+        Vec::new()
+    }
     fn groups(&self) -> &[Group];
     fn fluid_cells(&self) -> usize;
     fn is_fluid(&self, cell: usize) -> bool;

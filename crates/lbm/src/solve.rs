@@ -133,6 +133,23 @@ pub struct FluidStats {
     pub tau_thermal: Option<f64>,
     /// With a turbulence model: the largest eddy viscosity over the fluid's own in the last step.
     pub eddy_viscosity_ratio: Option<f64>,
+    /// Each rotor's torque and power at the end (model units).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rotors: Vec<RotorReport>,
+}
+
+/// A rotor at the end of a fluid step, in model units.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct RotorReport {
+    pub body: String,
+    /// The torque the fluid exerts on the rotor about its axis (right-handed; against the
+    /// rotation when it drives the fluid), averaged over the last turn, and in the last step.
+    pub torque: f64,
+    pub last_torque: f64,
+    /// The power the rotor gives the fluid, `−torque · speed`, from the averaged torque.
+    pub power: f64,
+    /// The turns made.
+    pub turns: f64,
 }
 
 /// The result of a fluid step.
@@ -460,6 +477,23 @@ pub fn run(setup: &Setup, flow: &mut dyn Backend, limits: &Limits) -> Result<Flu
             backend: flow.name(),
             tau_thermal: setup.thermal.as_ref().map(|t| t.tau),
             eddy_viscosity_ratio: (setup.smagorinsky > 0.0).then(|| flow.eddy_viscosity_ratio()),
+            rotors: {
+                // A moment is a force times a length.
+                let moment = setup.force_scale() * setup.grid.spacing;
+                flow.rotors()
+                    .into_iter()
+                    .map(|r| {
+                        let speed = r.omega / setup.time_step;
+                        RotorReport {
+                            body: r.body,
+                            torque: r.mean_torque * moment,
+                            last_torque: r.torque * moment,
+                            power: -r.mean_torque * moment * speed,
+                            turns: r.angle / std::f64::consts::TAU,
+                        }
+                    })
+                    .collect()
+            },
         },
         warnings,
         steady,

@@ -528,6 +528,7 @@ mod tests {
             thermal: None,
             porous: vec![],
             fans: vec![],
+            rotors: vec![],
         };
         m.add_fluid_domain("Flow", domain).unwrap();
         let rule = Steady { monitors: vec![], tolerance: 1e-3, window: Some(50.0), min_time: None, divergence: None, averaging: None };

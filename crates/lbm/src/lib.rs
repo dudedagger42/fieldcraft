@@ -62,6 +62,7 @@ pub mod lattice;
 pub mod memory;
 pub mod outlet;
 pub mod regularized;
+pub mod rotor;
 pub mod setup;
 pub mod solve;
 pub mod steady;

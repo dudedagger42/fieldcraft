@@ -617,6 +617,9 @@ impl Setup {
             }
         };
 
+        if !domain.rotors.is_empty() && domain.thermal.is_some() {
+            return Err(Error::Invalid("rotors in a fluid with heat are not supported yet: solve the flow without `thermal`".into()));
+        }
         // Obstacles, their face names and their faces' wall velocities.
         let mut domain_obstacles = Vec::with_capacity(domain.obstacles.len());
         for body in &domain.obstacles {

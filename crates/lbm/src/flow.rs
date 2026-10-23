@@ -301,6 +301,10 @@ impl ThermalState {
 pub struct Flow {
     grid: Grid,
     n: usize,
+    /// The rotors ([`crate::rotor`]) and, per cell, which one covers it now (1 + its index; 0:
+    /// none; empty without rotors).
+    rotors: Vec<crate::rotor::RotorState>,
+    rotor_owner: Vec<u8>,
     /// The distance between two directions' arrays in `f` and `g` (at least `n`).
     stride: usize,
     fluid: Vec<bool>,
@@ -745,9 +749,38 @@ impl Flow {
         // goes back before the steps.
         links.shrink_to_fit();
         open.shrink_to_fit();
+        // Rotors, placed after the static rules so that those see only the static obstacles.
+        let mut rotors = Vec::with_capacity(setup.domain.rotors.len());
+        let mut rotor_owner = Vec::new();
+        if !setup.domain.rotors.is_empty() {
+            rotor_owner = filled(n, 0u8, "rotor cells")?;
+            for (k, r) in setup.domain.rotors.iter().enumerate() {
+                let o = obstacles
+                    .iter()
+                    .find(|o| o.body == r.body)
+                    .ok_or_else(|| Error::NotFound(format!("rotor body `{}` has no surface (open the design or import its surface)", r.body)))?;
+                let faces = &setup.domain.faces;
+                let periodic = [(BoxFace::XMin, BoxFace::XMax), (BoxFace::YMin, BoxFace::YMax), (BoxFace::ZMin, BoxFace::ZMax)]
+                    .map(|(a, b)| matches!(faces.get(a), FaceCondition::Periodic {}) && matches!(faces.get(b), FaceCondition::Periodic {}));
+                let mut state =
+                    crate::rotor::RotorState::new(&r.body, &o.surface, r.origin, r.unit_axis(), r.speed * setup.time_step, &grid, &fluid, periodic)?;
+                let tip = state.tip_speed(grid.spacing);
+                if tip > crate::rotor::MAX_TIP_SPEED {
+                    return Err(Error::Invalid(format!(
+                        "rotor `{}`: its rim moves {tip:.3} cells per time step, more than {}: lower the time step or the speed",
+                        r.body,
+                        crate::rotor::MAX_TIP_SPEED
+                    )));
+                }
+                state.place(&grid, &mut fluid, &mut rotor_owner, (k + 1) as u8);
+                rotors.push(state);
+            }
+        }
         let mut flow = Flow {
             grid,
             n,
+            rotors,
+            rotor_owner,
             stride,
             fluid,
             f,
@@ -782,6 +815,11 @@ impl Flow {
         };
         flow.outlets = Outlets::new(&flow.open, &View { flow: &flow, f: &flow.f });
         Ok(flow)
+    }
+
+    /// The rotors, with the momentum and torque the fluid gave each in the last step.
+    pub fn rotors(&self) -> &[crate::rotor::RotorState] {
+        &self.rotors
     }
 
     /// What the convective outlet cells keep between steps.
@@ -1101,7 +1139,14 @@ impl Flow {
         }
         self.stream();
         self.open_boundaries();
+        for (k, r) in self.rotors.iter_mut().enumerate() {
+            r.bounce(&self.grid, &self.f, &mut self.g, self.stride, &self.fluid, &self.rotor_owner, (k + 1) as u8);
+        }
         std::mem::swap(&mut self.f, &mut self.g);
+        for (k, r) in self.rotors.iter_mut().enumerate() {
+            r.advance(&self.grid, &mut self.f, self.stride, &mut self.fluid, &mut self.rotor_owner, (k + 1) as u8);
+            r.record();
+        }
         if self.thermal.is_some() {
             self.collide_thermal();
             self.stream_thermal();
@@ -1808,6 +1853,10 @@ impl crate::backend::Backend for Flow {
 
     fn eddy_viscosity_ratio(&self) -> f64 {
         Flow::eddy_viscosity_ratio(self)
+    }
+
+    fn rotors(&self) -> Vec<crate::rotor::RotorSample> {
+        self.rotors.iter().map(|r| r.sample()).collect()
     }
 
     fn empty_obstacles(&self) -> &[String] {
