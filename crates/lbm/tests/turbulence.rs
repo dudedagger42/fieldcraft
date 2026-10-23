@@ -159,3 +159,103 @@ fn the_closure_holds_a_cavity_too_fast_for_the_lattice_alone() {
     println!("cavity 48², Re {re} (cell Re {:.0}): without a model {plain:?}; with C = 0.17, unstable at {closed:?} of {steps_run} steps", re / 48.0);
     assert!(matches!(closed, Ok(None)), "{closed:?}");
 }
+
+/// Plane Poiseuille flow (walls at y = 0 and 1, driven by a body force, peak 0.1) with
+/// Smagorinsky's model on, `n` cells across and diffusive time steps (τ fixed): the largest
+/// error of the velocity against the laminar parabola, over its peak. With Λ = 3/16 the lattice
+/// alone is exact for the parabola, so the error left is the eddy viscosity's, (C Δ)² |S|.
+fn smagorinsky_poiseuille(n: usize, c: f64, collision: Collision) -> f64 {
+    let (h, nu, umax) = (1.0, 1.0 / 6.0, 0.1);
+    let dx = h / n as f64;
+    let a = 8.0 * nu * umax / (h * h);
+    let mut d = domain([0.0; 3], [dx, h, dx], dx);
+    for f in [&mut d.faces.x_min, &mut d.faces.x_max, &mut d.faces.z_min, &mut d.faces.z_max] {
+        *f = PERIODIC;
+    }
+    d.acceleration = [a, 0.0, 0.0];
+    let mut p = collide(6.0 * h * h / nu, dx * dx, Some(3.0 / 16.0), collision);
+    if let Procedure::Fluid { turbulence, .. } = &mut p {
+        *turbulence = Some(Turbulence::Smagorinsky { constant: c, prandtl: 0.9 });
+    }
+    let (setup, mut flow) = prepare(&model(1.0, nu, d, p), &[]);
+    run_all(&setup, &mut flow);
+    let mut err: f64 = 0.0;
+    for j in 0..n {
+        let y = (j as f64 + 0.5) * dx;
+        let exact = a / (2.0 * nu) * y * (h - y);
+        let (_, u) = flow.moments(j).unwrap();
+        err = err.max((u[0] * setup.velocity_scale() - exact).abs() / umax);
+    }
+    err
+}
+
+/// #664: Smagorinsky's model adds viscosity wherever there is shear, laminar flow included, so
+/// with it on the laminar answer is reached only as the grid is refined: the eddy viscosity
+/// (C Δ)² |S| falls like Δ², and so does Poiseuille's error against the parabola.
+#[test]
+fn with_the_model_on_poiseuille_converges_to_the_laminar_profile_like_dx_squared() {
+    let c = 0.4;
+    for collision in COLLISIONS {
+        let errors: Vec<f64> = [8, 16, 32, 64].iter().map(|&n| smagorinsky_poiseuille(n, c, collision)).collect();
+        let p = orders(&errors, 2.0);
+        println!("{} Poiseuille with C = {c}, 8 → 64 cells: errors {errors:?}, observed orders {p:.3?}", collision.name());
+        assert!(errors[0] > 1e-5, "the eddy viscosity shows: {errors:?}");
+        // Observed (C = 0.4): TRT 1.970, 1.993, 1.998; regularised 1.839, 1.906, 1.950, which
+        // approaches 2 from below, as its own O(Δ²) wall error joins the eddy viscosity's.
+        assert!(p.iter().all(|o| *o > 1.8), "{}: second order, observed {p:.3?}", collision.name());
+        assert!(p.windows(2).all(|w| w[1] >= w[0] - 1e-3) && (p[p.len() - 1] - 2.0).abs() < 0.06, "{}: {p:.3?}", collision.name());
+    }
+}
+
+/// The decaying Taylor–Green vortex on [0, 2π]² (as in `verification.rs`) with Smagorinsky's
+/// model on: the amplitude's relative error after its half-life against the laminar decay.
+fn smagorinsky_taylor_green(n: usize, c: f64) -> f64 {
+    let (nu, u0, l) = (0.1, 0.1, 2.0 * std::f64::consts::PI);
+    let dx = l / n as f64;
+    let mut d = domain([0.0; 3], [l, l, dx], dx);
+    for f in fieldcraft_model::BoxFace::ALL {
+        *d.faces.get_mut(f) = PERIODIC;
+    }
+    let dt = 0.3 * dx * dx / (3.0 * nu);
+    let half_life = std::f64::consts::LN_2 / (2.0 * nu);
+    let mut p = collide(half_life, dt, None, Collision::Regularized);
+    if let Procedure::Fluid { turbulence, .. } = &mut p {
+        *turbulence = Some(Turbulence::Smagorinsky { constant: c, prandtl: 0.9 });
+    }
+    let (setup, mut flow) = prepare(&model(1.0, nu, d, p), &[]);
+    let grid = *flow.grid();
+    let mode = |cell: usize| {
+        let [x, y, _] = grid.centre(cell);
+        [-x.cos() * y.sin(), x.sin() * y.cos()]
+    };
+    let to_lattice = 1.0 / setup.velocity_scale();
+    flow.set_equilibrium(|cell| {
+        let [x, y, _] = grid.centre(cell);
+        let pressure = -u0 * u0 / 4.0 * ((2.0 * x).cos() + (2.0 * y).cos());
+        let m = mode(cell);
+        (setup.lattice_density(pressure), [u0 * m[0] * to_lattice, u0 * m[1] * to_lattice, 0.0])
+    });
+    run_all(&setup, &mut flow);
+    let (mut num, mut den) = (0.0, 0.0);
+    for cell in 0..grid.len() {
+        let (_, u) = flow.moments(cell).unwrap();
+        let m = mode(cell);
+        num += u[0] * m[0] + u[1] * m[1];
+        den += m[0] * m[0] + m[1] * m[1];
+    }
+    let amplitude = num / den * setup.velocity_scale();
+    let exact = u0 * (-2.0 * nu * setup.steps as f64 * setup.time_step).exp();
+    (amplitude / exact - 1.0).abs()
+}
+
+/// The vortex decays faster with the model on, and approaches the laminar decay to second order.
+#[test]
+fn with_the_model_on_taylor_green_approaches_the_laminar_decay_to_second_order() {
+    let c = 0.4;
+    let errors: Vec<f64> = [16, 32, 64].iter().map(|&n| smagorinsky_taylor_green(n, c)).collect();
+    let p = orders(&errors, 2.0);
+    println!("Taylor–Green with C = {c}, 16 → 64 cells: amplitude errors {errors:?}, observed orders {p:.3?}");
+    for o in p {
+        assert!(o > 1.8, "second order: {o:.3}");
+    }
+}
