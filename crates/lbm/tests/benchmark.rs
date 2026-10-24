@@ -27,7 +27,14 @@ fn schafer_turek_2d1(dx: f64, time_step: Option<f64>, walls: Walls) -> (f64, f64
     dom.obstacles = vec!["Cylinder".into()];
     dom.walls = walls;
     let cyl = obstacle("Cylinder", cylinder([0.2, 0.2], d / 2.0, -0.1, 0.1, 1024), &["side", "bottom", "top"]);
-    let procedure = Procedure::Fluid { domain: "Flow".into(), end_time: Some(10.0), steps: None, time_step, frames: 1, magic: None };
+    let procedure = Procedure::Fluid {
+        domain: "Flow".into(),
+        end_time: Some(std::env::var("ST_END").ok().and_then(|v| v.parse().ok()).unwrap_or(40.0)),
+        steps: None,
+        time_step,
+        frames: 1,
+        magic: None,
+    };
     let m = model(1.0, nu, dom, procedure);
     let r = solve_fluid(&m, None, std::slice::from_ref(&cyl), &Limits::default()).unwrap();
     let side = r.forces.iter().find(|f| f.name == "side").unwrap();
@@ -66,25 +73,47 @@ fn schafer_turek_2d1_cylinder_drag_and_lift() {
         let (cd, cl, dp) = schafer_turek_2d1(dx, Some(dt * (dx / 0.01)), Walls::Halfway);
         println!("Schäfer–Turek 2D-1, D/Δx = {}: c_D = {cd:.4} (5.57–5.59), c_L = {cl:.4} (0.0104–0.0110), Δp = {dp:.4} (0.1172–0.1176)", 0.1 / dx);
         if dx <= 0.005 {
-            // A staircase cylinder of 20 cells (measured: c_D 5.773, +3.4%; c_L 0.0107, inside
-            // the interval). Δp is read in the cells half a spacing off the staircase, where the
-            // pressure changes fast, so it is reported, not asserted (measured 0.108).
-            assert!((cd / 5.58 - 1.0).abs() < 0.05, "{cd}");
+            // A staircase cylinder of 20 cells, settled (measured: c_D 5.655, +1.3 %; c_L 0.0108
+            // and Δp 0.1172, inside their intervals; Δp is extrapolated to the surface from the
+            // two cells in front of and behind it). At 10 time units, unsettled, it read 5.773.
+            assert!((cd / 5.58 - 1.0).abs() < 0.02, "{cd}");
             assert!((cl / 0.0107 - 1.0).abs() < 0.2, "{cl}");
+            assert!((dp / 0.1174 - 1.0).abs() < 0.02, "{dp}");
         }
     }
 }
 
-/// Schäfer–Turek 2D-1 with interpolated walls: the cylinder keeps its round shape between the
-/// cells, so its drag, lift and pressure difference come within a percent of the reference on
-/// the grids that halfway walls leave several percent off.
+/// Schäfer–Turek 2D-1 with the wall where the surface is. The run is 40 time units: the wake
+/// settles over several viscous times D²/ν (10), and at 10 units the drag still read 6 % high on
+/// 10 cells (1.4 % at 30, 1.3 % at 60). Settled, on 20 cells across the cylinder (measured):
+/// half-way c_D +1.34 %, Δp −0.2 %; interpolated +0.54 %, −0.5 %; quadratic +0.32 %, −0.9 %. Lift,
+/// a hundredth of the drag, comes out 7–9 % low with the interpolated walls.
 #[test]
 #[ignore]
 fn schafer_turek_2d1_with_interpolated_walls() {
-    for (dx, walls) in [(0.01, Walls::Interpolated), (0.005, Walls::Interpolated), (0.01, Walls::Quadratic), (0.005, Walls::Quadratic)] {
+    // ST_GRIDS picks the runs, e.g. `0.005:halfway,0.005:interpolated` (cell size and walls).
+    let grids: Vec<(f64, Walls)> = match std::env::var("ST_GRIDS") {
+        Ok(list) => list
+            .split(',')
+            .filter_map(|g| {
+                let (dx, w) = g.split_once(':')?;
+                let walls = match w {
+                    "halfway" => Walls::Halfway,
+                    "quadratic" => Walls::Quadratic,
+                    _ => Walls::Interpolated,
+                };
+                Some((dx.parse().ok()?, walls))
+            })
+            .collect(),
+        Err(_) => vec![(0.01, Walls::Interpolated), (0.005, Walls::Interpolated), (0.01, Walls::Quadratic), (0.005, Walls::Quadratic)],
+    };
+    for (dx, walls) in grids {
         let dt = 0.025 * dx / 0.3 * (dx / 0.01);
         let (cd, cl, dp) = schafer_turek_2d1(dx, Some(dt), walls);
         let (ecd, ecl, edp) = (cd / 5.58 - 1.0, cl / 0.0107 - 1.0, dp / 0.1174 - 1.0);
+        if dx <= 0.005 && walls != Walls::Halfway {
+            assert!(ecd.abs() < 0.01 && edp.abs() < 0.015, "{walls:?}: c_D {cd}, Δp {dp}");
+        }
         println!(
             "{walls:?} Schäfer–Turek 2D-1, D/Δx = {}: c_D = {cd:.4} ({:+.2}%), c_L = {cl:.5} ({:+.1}%), Δp = {dp:.4} ({:+.2}%)",
             0.1 / dx,
