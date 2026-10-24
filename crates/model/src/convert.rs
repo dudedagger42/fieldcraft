@@ -238,6 +238,7 @@ impl Quantities for FluidDomain {
             acceleration,
             tolerance,
             thermal,
+            walls: _,
             porous,
             fans,
         } = self;

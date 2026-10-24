@@ -429,6 +429,7 @@ mod tests {
             acceleration: [0.0; 3],
             tolerance: None,
             thermal: None,
+            walls: Default::default(),
             porous: vec![],
             fans: vec![],
         };

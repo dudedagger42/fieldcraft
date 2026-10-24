@@ -653,6 +653,31 @@ pub struct FluidDomain {
     /// Fans: zones that raise the pressure by their pressure–flow curve.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fans: Vec<Fan>,
+    /// Where the obstacles' walls lie between the cells ([`Walls`]).
+    #[serde(default, skip_serializing_if = "Walls::is_halfway")]
+    pub walls: Walls,
+}
+
+/// How the lattice places an obstacle's wall on the links that cross it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Walls {
+    /// Halfway between the fluid cell and the solid one (bounce-back): a curved wall becomes a
+    /// staircase of cell faces.
+    #[default]
+    Halfway,
+    /// Where the surface actually crosses each link (Bouzidi, Firdaouss & Lallemand's linear
+    /// interpolated bounce-back): curved walls keep their shape between the cells.
+    Interpolated,
+    /// The same with their quadratic interpolation, from one more cell into the fluid: second
+    /// order, so a parabolic profile between plates is exact wherever the plates lie. On the CPU.
+    Quadratic,
+}
+
+impl Walls {
+    pub fn is_halfway(&self) -> bool {
+        *self == Walls::Halfway
+    }
 }
 
 fn is_zero(v: &[f64; 3]) -> bool {
@@ -919,6 +944,7 @@ mod tests {
             thermal: None,
             porous: vec![],
             fans: vec![],
+            walls: Walls::Halfway,
         }
     }
 

@@ -24,6 +24,7 @@ pub fn domain(min: [f64; 3], max: [f64; 3], spacing: f64) -> FluidDomain {
         thermal: None,
         porous: vec![],
         fans: vec![],
+        walls: Default::default(),
     }
 }
 

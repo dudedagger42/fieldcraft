@@ -23,7 +23,7 @@ use fieldcraft_lbm::{Flow, Setup};
 use fieldcraft_lbm_gpu::{GpuFlow, Options, Streaming};
 use fieldcraft_model::{
     BoxFace, Collision, Directional, FaceCondition, Fluid, FluidDomain, FluidThermal, Material, Model, Outflow, Procedure, Profile, Step, Thermal,
-    ThermalCondition,
+    ThermalCondition, Walls,
 };
 
 const PERIODIC: FaceCondition = FaceCondition::Periodic {};
@@ -259,6 +259,55 @@ fn flow_past_a_sphere_matches_the_cpu_fields_and_forces() {
         let scale = fc[skin].iter().map(|v| v.abs()).fold(0.0, f64::max);
         let dforce = (0..3).map(|a| (fc[skin][a] - fg[skin][a]).abs()).fold(0.0, f64::max) / scale;
         println!("{collision:?} Sphere: CPU/GPU velocity {du:.2e}, density {drho:.2e}; drag CPU {:?} GPU {:?} ({dforce:.2e})", fc[skin], fg[skin]);
+        assert!(du < 2e-5 && drho < 1e-6, "{du} {drho}");
+        assert!(dforce < 5e-5, "{dforce}");
+    }
+}
+
+/// The same sphere with its wall where the surface is (interpolated bounce-back): each link's
+/// wall fraction travels in 15 bits around the reset flag and the cell behind it as its source,
+/// and the GPU's fields and drag follow the CPU's.
+#[test]
+fn flow_past_a_sphere_with_interpolated_walls_matches_the_cpu() {
+    for (collision, streaming) in cases() {
+        let l = 24usize;
+        let side = l as f64;
+        let mut d = domain([0.0; 3], [side; 3], 1.0);
+        for f in BoxFace::ALL {
+            *d.faces.get_mut(f) = PERIODIC;
+        }
+        d.acceleration = [1e-5, 0.0, 0.0];
+        d.obstacles = vec!["Ball".into()];
+        d.walls = Walls::Interpolated;
+        let ball = obstacle("Ball", sphere([side / 2.0 + 0.3, side / 2.0 - 0.2, side / 2.0 + 0.1], 6.0, 3), &["skin"]);
+        let m = model(
+            1.0,
+            1.0 / 6.0,
+            d,
+            Procedure::Fluid {
+                domain: "Flow".into(),
+                end_time: None,
+                steps: Some(300),
+                time_step: Some(1.0),
+                frames: 1,
+                magic: None,
+                collision: Some(collision),
+                steady: None,
+            },
+        );
+        let (setup, flow) = prepare(&m, std::slice::from_ref(&ball));
+        let interpolated = flow.links().iter().filter(|l| matches!(l.rule, fieldcraft_lbm::Rule::Interp { .. })).count();
+        assert!(interpolated > 100, "{interpolated} interpolated links");
+        let Some((mut cpu, mut gpu)) = both(&setup, flow, streaming) else { continue };
+        let (du, drho) = field_difference(&mut cpu, &mut gpu);
+        let (fc, fg) = (Backend::forces(&mut cpu).unwrap(), gpu.forces().unwrap());
+        let skin = cpu.groups().iter().position(|g| g.name == "skin").unwrap();
+        let scale = fc[skin].iter().map(|v| v.abs()).fold(0.0, f64::max);
+        let dforce = (0..3).map(|a| (fc[skin][a] - fg[skin][a]).abs()).fold(0.0, f64::max) / scale;
+        println!(
+            "{collision:?} interpolated sphere ({interpolated} links): CPU/GPU velocity {du:.2e}, density {drho:.2e}; drag CPU {:?} GPU {:?} ({dforce:.2e})",
+            fc[skin], fg[skin]
+        );
         assert!(du < 2e-5 && drho < 1e-6, "{du} {drho}");
         assert!(dforce < 5e-5, "{dforce}");
     }

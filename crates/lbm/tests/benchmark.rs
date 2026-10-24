@@ -7,7 +7,7 @@ mod common;
 
 use common::*;
 use fieldcraft_lbm::{Limits, solve_fluid};
-use fieldcraft_model::{Collision, FaceCondition, Outflow, Procedure, Profile};
+use fieldcraft_model::{Collision, FaceCondition, Outflow, Procedure, Profile, Walls};
 
 /// Benchmark "2D-1" (steady flow around a cylinder at Re = 20): M. Schäfer, S. Turek, *Benchmark
 /// computations of laminar flow around a cylinder*, in: Flow Simulation with High-Performance
@@ -17,7 +17,7 @@ use fieldcraft_model::{Collision, FaceCondition, Outflow, Procedure, Profile};
 /// coefficient 0.0104–0.0110, pressure difference between the cylinder's front and back
 /// 0.1172–0.1176. Run quasi-2D: one periodic cell across z.
 /// Returns (c_D, c_L, Δp).
-fn schafer_turek_2d1(dx: f64, time_step: Option<f64>, collision: Collision) -> (f64, f64, f64) {
+fn schafer_turek_2d1(dx: f64, time_step: Option<f64>, collision: Collision, walls: Walls) -> (f64, f64, f64) {
     let (h, l, d, um, nu) = (0.41, 2.2, 0.1, 0.3, 1e-3);
     let mut dom = domain([0.0; 3], [l, h, dx], dx);
     dom.faces.x_min = FaceCondition::Velocity { velocity: [um, 0.0, 0.0], profile: Profile::Parabolic };
@@ -25,10 +25,13 @@ fn schafer_turek_2d1(dx: f64, time_step: Option<f64>, collision: Collision) -> (
     dom.faces.z_min = FaceCondition::Periodic {};
     dom.faces.z_max = FaceCondition::Periodic {};
     dom.obstacles = vec!["Cylinder".into()];
+    dom.walls = walls;
     let cyl = obstacle("Cylinder", cylinder([0.2, 0.2], d / 2.0, -0.1, 0.1, 1024), &["side", "bottom", "top"]);
+    // 40 time units: the wake settles over several viscous times D²/ν (10). At 10 units the drag
+    // still read several percent high for every wall and collision (ST_END overrides it).
     let procedure = Procedure::Fluid {
         domain: "Flow".into(),
-        end_time: Some(10.0),
+        end_time: Some(std::env::var("ST_END").ok().and_then(|v| v.parse().ok()).unwrap_or(40.0)),
         steps: None,
         time_step,
         frames: 1,
@@ -45,13 +48,19 @@ fn schafer_turek_2d1(dx: f64, time_step: Option<f64>, collision: Collision) -> (
     let mean = |a: usize| tail.iter().map(|v| v[a]).sum::<f64>() / tail.len() as f64 / dx;
     let mean_u = 2.0 / 3.0 * um;
     let coefficient = |f: f64| 2.0 * f / (mean_u * mean_u * d);
-    // Pressure in the fluid cells just in front of and behind the cylinder on its axis
-    // (the average of the two cell rows about y = 0.2).
+    // Pressure on the cylinder's axis (the average of the two cell rows about y = 0.2) at its
+    // front and back points: extrapolated linearly to the surface from the first two fluid cell
+    // centres outside it, `toward` the cylinder from x.
     let p = |x: f64| {
         let at = |y: f64| f64::from(r.probe(1, [x, y, 0.5 * dx]).unwrap().2);
         0.5 * (at(0.2 - 0.5 * dx) + at(0.2 + 0.5 * dx))
     };
-    let dp = p(0.15 - 0.5 * dx) - p(0.25 + 0.5 * dx);
+    let surface = |xs: f64, toward: f64| {
+        let first = if toward > 0.0 { ((xs / dx - 0.5).floor() + 0.5) * dx } else { ((xs / dx - 0.5).ceil() + 0.5) * dx };
+        let (p1, p2) = (p(first), p(first - toward * dx));
+        p1 + (p1 - p2) * (xs - first).abs() / dx
+    };
+    let dp = surface(0.15, 1.0) - surface(0.25, -1.0);
     println!("Schäfer–Turek 2D-1, Δx = {dx}: {:?}; warnings {:?}", r.stats, r.warnings);
     (coefficient(mean(0)), coefficient(mean(1)), dp)
 }
@@ -64,23 +73,62 @@ fn schafer_turek_2d1_cylinder_drag_and_lift() {
     for collision in [Collision::Trt, Collision::Regularized] {
         for dx in [0.01, 0.005] {
             let dt = 0.025 * dx / 0.3;
-            let (cd, cl, dp) = schafer_turek_2d1(dx, Some(dt * (dx / 0.01)), collision);
+            let (cd, cl, dp) = schafer_turek_2d1(dx, Some(dt * (dx / 0.01)), collision, Walls::Halfway);
             println!(
                 "{collision:?} Schäfer–Turek 2D-1, D/Δx = {}: c_D = {cd:.4} (5.57–5.59), c_L = {cl:.4} (0.0104–0.0110), Δp = {dp:.4} (0.1172–0.1176)",
                 0.1 / dx
             );
             if dx <= 0.005 {
-                // A staircase cylinder of 20 cells. Measured with two relaxation times: c_D 5.773
-                // (+3.4%), c_L 0.0107 (inside the interval); regularized: c_D 5.890 (+5.5%), c_L
-                // 0.0132 (+23%): without the two-relaxation-time parameter's exact wall placement
-                // its staircase wall sits a little off (as in its Poiseuille test). Δp is read in
-                // the cells half a spacing off the staircase, where the pressure changes fast, so
-                // it is reported, not asserted (measured 0.108 and 0.105).
+                // A staircase cylinder of 20 cells. Settled (40 time units), two relaxation times:
+                // c_D 5.655 (+1.3 %), c_L 0.0108 and Δp 0.1172 inside their intervals (Δp
+                // extrapolated to the surface from the two cells in front of and behind it). At 10
+                // units, unsettled, it read c_D 5.773, and the regularized collision 5.890.
                 let (drag, lift) = if collision == Collision::Trt { (0.05, 0.2) } else { (0.07, 0.3) };
                 assert!((cd / 5.58 - 1.0).abs() < drag, "{cd}");
                 assert!((cl / 0.0107 - 1.0).abs() < lift, "{cl}");
             }
         }
+    }
+}
+
+/// Schäfer–Turek 2D-1 with the wall where the surface is. The run is 40 time units: the wake
+/// settles over several viscous times D²/ν (10), and at 10 units the drag still read 6 % high on
+/// 10 cells (1.4 % at 30, 1.3 % at 60). Settled, on 20 cells across the cylinder (measured):
+/// half-way c_D +1.34 %, Δp −0.2 %; interpolated +0.54 %, −0.5 %; quadratic +0.32 %, −0.9 %. Lift,
+/// a hundredth of the drag, comes out 7–9 % low with the interpolated walls.
+#[test]
+#[ignore]
+fn schafer_turek_2d1_with_interpolated_walls() {
+    // ST_GRIDS picks the runs, e.g. `0.005:halfway,0.005:interpolated` (cell size and walls).
+    let grids: Vec<(f64, Walls)> = match std::env::var("ST_GRIDS") {
+        Ok(list) => list
+            .split(',')
+            .filter_map(|g| {
+                let (dx, w) = g.split_once(':')?;
+                let walls = match w {
+                    "halfway" => Walls::Halfway,
+                    "quadratic" => Walls::Quadratic,
+                    _ => Walls::Interpolated,
+                };
+                Some((dx.parse().ok()?, walls))
+            })
+            .collect(),
+        Err(_) => vec![(0.01, Walls::Interpolated), (0.005, Walls::Interpolated), (0.01, Walls::Quadratic), (0.005, Walls::Quadratic)],
+    };
+    for (dx, walls) in grids {
+        let dt = 0.025 * dx / 0.3 * (dx / 0.01);
+        let (cd, cl, dp) = schafer_turek_2d1(dx, Some(dt), Collision::Trt, walls);
+        let (ecd, ecl, edp) = (cd / 5.58 - 1.0, cl / 0.0107 - 1.0, dp / 0.1174 - 1.0);
+        if dx <= 0.005 && walls != Walls::Halfway {
+            assert!(ecd.abs() < 0.01 && edp.abs() < 0.015, "{walls:?}: c_D {cd}, Δp {dp}");
+        }
+        println!(
+            "{walls:?} Schäfer–Turek 2D-1, D/Δx = {}: c_D = {cd:.4} ({:+.2}%), c_L = {cl:.5} ({:+.1}%), Δp = {dp:.4} ({:+.2}%)",
+            0.1 / dx,
+            100.0 * ecd,
+            100.0 * ecl,
+            100.0 * edp
+        );
     }
 }
 

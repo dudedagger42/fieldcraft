@@ -53,6 +53,7 @@ const KIND_OPEN: u32 = 3u;
 // the open boundary sets after streaming: the heat the link gives never stays in the fluid, and
 // the wall heat leaves it out (fieldcraft_lbm::flow::ThermalState::resets).
 const RESET: u32 = 0x1000000u;
+const KIND_INTERP: u32 = 4u;
 
 struct Params {
     n: u32,
@@ -470,6 +471,8 @@ fn gather_link(l: u32, exchange: bool) {
     } else if kind == KIND_REFLECT {
         // The mirrored direction has the same weight, so h reflects like f.
         v = post(q2, lu.y);
+    } else if kind == KIND_INTERP {
+        v = interpolated(l, lu, q);
     } else {
         v = post(opp(q), cell);
     }
@@ -699,12 +702,28 @@ fn zou_he(o: u32, kind: u32, cell: u32, axis: u32, sign: f32, xyz: vec3<i32>, ap
     }
 }
 
+// Interpolated bounce-back (Bouzidi et al. 2001) at a wall a fraction qw of the link from the
+// cell (15 bits of the link's first word: bits 16–23 and 25–31, around the reset flag), the cell behind at +c_q in lu.y (or none): the
+// same weights for f and h, as opposite directions share a weight (flow.rs, interpolated_bounce).
+fn interpolated(l: u32, lu: vec4<u32>, q: u32) -> f32 {
+    let qw = f32(((lu.x >> 16u) & 0xffu) | (((lu.x >> 25u) & 0x7fu) << 8u)) / 32767.0;
+    let out = post(opp(q), lu.w);
+    let du = link_f[l];
+    if qw < 0.5 {
+        if lu.y == 0xffffffffu { return out + du; }
+        return 2.0 * qw * out + (1.0 - 2.0 * qw) * post(opp(q), lu.y) + du;
+    }
+    return (out + (2.0 * qw - 1.0) * post(q, lu.w) + du) / (2.0 * qw);
+}
+
 fn momentum_exchange(l: u32, lu: vec4<u32>, q: u32, kind: u32, q2: u32) -> vec3<f32> {
     var v = vec3<f32>(0.0);
     if kind == KIND_BOUNCE {
         let out = post(opp(q), lu.w);
         let back = out + link_f[l];
         v = -vec3<f32>(c_of(q)) * (out + back);
+    } else if kind == KIND_INTERP {
+        v = -vec3<f32>(c_of(q)) * (post(opp(q), lu.w) + interpolated(l, lu, q));
     } else if kind == KIND_REFLECT {
         let out = post(q2, lu.y);
         v = vec3<f32>(c_of(q2)) * out - vec3<f32>(c_of(q)) * out;
@@ -731,7 +750,7 @@ fn link_forces(@builtin(local_invocation_index) lid: u32, @builtin(workgroup_id)
     if !AA_MODE { v = momentum_exchange(l, lu, q, kind, q2); }
     var heat = 0.0;
     // The heat the link gave its wall: what left the fluid minus what came back.
-    if has_heat() && q < QT && (kind == KIND_BOUNCE || kind == KIND_REFLECT) && (lu.x & RESET) == 0u {
+    if has_heat() && q < QT && (kind == KIND_BOUNCE || kind == KIND_INTERP || kind == KIND_REFLECT) && (lu.x & RESET) == 0u {
         heat = t[opp(q) * n + cell] - thermal_rule(lu, q, kind, cell);
     }
     contrib[l] = vec4<f32>(v, heat);
