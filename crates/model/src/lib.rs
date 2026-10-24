@@ -68,7 +68,7 @@ pub use datums::{Datum, Partition};
 pub use discrete::{Direction, Mass, PointMass, ResolvedDirection, ResolvedMass, ResolvedSpring, Spring};
 pub use fluids::{
     BoxFace, BoxFaces, BoxThermalFaces, FaceCondition, FluidBoundary, FluidDomain, FluidThermal, Profile, SurfaceBoundary, SurfaceCondition,
-    SurfaceThermalBoundary, ThermalCondition,
+    SurfaceThermalBoundary, ThermalCondition, Walls,
 };
 pub use geometry::{BodyMesh, Classification, Entity, GeometryRef};
 pub use loads::{Distribution, Load, centrifugal_acceleration};

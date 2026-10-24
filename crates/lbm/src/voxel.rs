@@ -368,6 +368,68 @@ impl TriangleTree {
         }
         best.map(|(_, t)| t)
     }
+
+    /// Where the segment from `a` to `b` first crosses the surface, as a fraction of the way
+    /// from `a` (0..=1), or `None` when it crosses no triangle. Each triangle is tested with
+    /// Möller & Trumbore's ray–triangle intersection (*Fast, minimum storage ray/triangle
+    /// intersection*, J. Graphics Tools 2(1), 1997), inside the boxes the segment passes through.
+    pub fn crossing(&self, a: [f64; 3], b: [f64; 3]) -> Option<f64> {
+        let d = sub(b, a);
+        let inv = d.map(|x| if x == 0.0 { f64::INFINITY } else { 1.0 / x });
+        // The part of the segment inside a node's box (slab test), whether any.
+        let meets = |n: &Node| {
+            let (mut t0, mut t1) = (0.0f64, 1.0f64);
+            for k in 0..3 {
+                if d[k] == 0.0 {
+                    if a[k] < n.lo[k] || a[k] > n.hi[k] {
+                        return false;
+                    }
+                    continue;
+                }
+                let (u, v) = ((n.lo[k] - a[k]) * inv[k], (n.hi[k] - a[k]) * inv[k]);
+                t0 = t0.max(u.min(v));
+                t1 = t1.min(u.max(v));
+            }
+            t0 <= t1
+        };
+        let mut best: Option<f64> = None;
+        let mut stack = vec![0u32];
+        while let Some(i) = stack.pop() {
+            let Some(node) = self.nodes.get(i as usize) else { continue };
+            if !meets(node) {
+                continue;
+            }
+            if node.count == 0 {
+                stack.extend([node.first, node.first + 1]);
+                continue;
+            }
+            let range = node.first as usize..(node.first + node.count) as usize;
+            for &t in self.order.get(range).unwrap_or_default() {
+                let Some([p0, p1, p2]) = self.triangles.get(t as usize) else { continue };
+                let (e1, e2) = (sub(*p1, *p0), sub(*p2, *p0));
+                let h = [d[1] * e2[2] - d[2] * e2[1], d[2] * e2[0] - d[0] * e2[2], d[0] * e2[1] - d[1] * e2[0]];
+                let det = dot(e1, h);
+                if det.abs() <= 1e-300 {
+                    continue;
+                }
+                let s = sub(a, *p0);
+                let u = dot(s, h) / det;
+                if !(0.0..=1.0).contains(&u) {
+                    continue;
+                }
+                let qv = [s[1] * e1[2] - s[2] * e1[1], s[2] * e1[0] - s[0] * e1[2], s[0] * e1[1] - s[1] * e1[0]];
+                let v = dot(d, qv) / det;
+                if v < 0.0 || u + v > 1.0 {
+                    continue;
+                }
+                let f = dot(e2, qv) / det;
+                if (0.0..=1.0).contains(&f) && best.is_none_or(|b| f < b) {
+                    best = Some(f);
+                }
+            }
+        }
+        best
+    }
 }
 
 #[cfg(test)]
@@ -449,5 +511,21 @@ mod tests {
                 .unwrap();
             assert_eq!(tree.nearest(p), Some(brute), "{p:?}");
         }
+    }
+
+    #[test]
+    fn a_segment_crosses_the_surface_where_it_meets_it() {
+        let tree = TriangleTree::new(&cube([0.0; 3], [1.0; 3]));
+        // From outside, through the −x side at x = 0: 0.3 of the way from −0.3 to 0.7.
+        let f = tree.crossing([-0.3, 0.4, 0.6], [0.7, 0.4, 0.6]).unwrap();
+        assert!((f - 0.3).abs() < 1e-12, "{f}");
+        // From inside out through +z, diagonally: z goes 0.9 → 1.3, the side at 0.25.
+        let f = tree.crossing([0.5, 0.5, 0.9], [0.6, 0.7, 1.3]).unwrap();
+        assert!((f - 0.25).abs() < 1e-12, "{f}");
+        // The nearer of two crossings, and none where the segment stays outside or inside.
+        let f = tree.crossing([-0.5, 0.5, 0.5], [1.5, 0.5, 0.5]).unwrap();
+        assert!((f - 0.25).abs() < 1e-12, "{f}");
+        assert_eq!(tree.crossing([-0.5, 2.0, 0.5], [1.5, 2.0, 0.5]), None);
+        assert_eq!(tree.crossing([0.2, 0.2, 0.2], [0.8, 0.8, 0.8]), None);
     }
 }

@@ -453,6 +453,28 @@ pub struct FluidDomain {
     /// Heat in the fluid (a temperature field, buoyancy); `None` for an isothermal flow.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thermal: Option<FluidThermal>,
+    /// Where the obstacles' walls lie between the cells ([`Walls`]).
+    #[serde(default, skip_serializing_if = "Walls::is_halfway")]
+    pub walls: Walls,
+}
+
+/// How the lattice places an obstacle's wall on the links that cross it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Walls {
+    /// Halfway between the fluid cell and the solid one (bounce-back): a curved wall becomes a
+    /// staircase of cell faces.
+    #[default]
+    Halfway,
+    /// Where the surface actually crosses each link (Bouzidi, Firdaouss & Lallemand's linear
+    /// interpolated bounce-back): curved walls keep their shape between the cells.
+    Interpolated,
+}
+
+impl Walls {
+    pub fn is_halfway(&self) -> bool {
+        *self == Walls::Halfway
+    }
 }
 
 fn is_zero(v: &[f64; 3]) -> bool {
@@ -684,6 +706,7 @@ mod tests {
             acceleration: [0.0; 3],
             tolerance: None,
             thermal: None,
+            walls: Walls::Halfway,
         }
     }
 

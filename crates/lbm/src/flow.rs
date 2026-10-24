@@ -50,7 +50,7 @@
 //! only its own populations; the wall forces are summed in link order. There are no parallel
 //! reductions, so the result is the same bit for bit on any number of threads and platform.
 
-use fieldcraft_model::{BoxFace, FaceCondition, Profile, ThermalCondition};
+use fieldcraft_model::{BoxFace, FaceCondition, Profile, ThermalCondition, Walls};
 
 use fieldcraft_parallel as parallel;
 
@@ -67,6 +67,12 @@ pub enum Rule {
     Pull { from: u32 },
     /// Bounce-back at a wall of force group `group`; `du` is the moving-wall term.
     Bounce { group: u32, du: f64 },
+    /// Interpolated bounce-back (Bouzidi, Firdaouss & Lallemand, *Momentum transfer of a
+    /// Boltzmann-lattice fluid with boundaries*, Phys. Fluids 13:3452, 2001) at a wall that crosses
+    /// the link a fraction `qw` (0..1] of a spacing from the fluid cell: the population leaving
+    /// toward the wall, interpolated with the one leaving the cell `far` at `+c_q` behind it
+    /// (`qw < ½`) or with the cell's own population of direction `q` (`qw ≥ ½`).
+    Interp { group: u32, du: f64, qw: f64, far: u32 },
     /// Specular reflection at a slip face: direction `q` from cell `from`.
     Reflect { from: u32, q: u8, group: u32 },
     /// From outside an inlet or outlet: set by the open boundary after streaming.
@@ -224,6 +230,26 @@ fn cell_blocks(data: &mut [f64], stride: usize, n: usize) -> Vec<Vec<&mut [f64]>
     blocks
 }
 
+/// The population of direction `q` streaming into fluid cell `cell` off a wall a fraction `qw` of
+/// the link away ([`Rule::Interp`]), from the post-collision populations `f` (direction stride
+/// `s`): the one leaving the cell toward the wall and, for `qw < ½`, the same direction of the
+/// cell `far` behind it, or for `qw ≥ ½` the cell's own population leaving the wall. Without a
+/// fluid cell behind (a gap one cell wide) the wall is taken halfway.
+#[inline(always)]
+fn interpolated_bounce(f: &[f64], s: usize, cell: usize, q: usize, qw: f64, far: u32, du: f64) -> f64 {
+    let toward = opposite(q) * s;
+    let out = f.get(toward + cell).copied().unwrap_or(0.0);
+    if qw < 0.5 {
+        match f.get(toward + far as usize) {
+            Some(behind) if far != NONE => 2.0 * qw * out + (1.0 - 2.0 * qw) * behind + du,
+            _ => out + du,
+        }
+    } else {
+        let away = f.get(q * s + cell).copied().unwrap_or(0.0);
+        (out + (2.0 * qw - 1.0) * away + du) / (2.0 * qw)
+    }
+}
+
 /// A vector allocated without aborting when memory runs out.
 fn filled<T: Clone>(len: usize, value: T, what: &str) -> Result<Vec<T>> {
     let mut v = Vec::new();
@@ -292,6 +318,7 @@ impl Flow {
 
         // The group and moving-wall term of a link into fluid cell `cell` (direction q) from the
         // obstacle cell `solid`: the face of the triangle nearest the link's midpoint.
+        let interpolated = domain.walls == Walls::Interpolated;
         let obstacle_link = |cell: usize, solid: u32, q: usize| -> Rule {
             let k = owner.get(solid as usize).copied().unwrap_or(NONE) as usize;
             let (Some((tree, tags)), Some(faces), Some(&first)) = (trees.get(k), setup.obstacles.get(k), base.get(k)) else {
@@ -301,7 +328,26 @@ impl Flow {
             let mid = [0, 1, 2].map(|a| centre[a] - 0.5 * cq[a] * grid.spacing);
             let tag = tree.nearest(mid).and_then(|t| tags.get(t as usize).copied()).unwrap_or(0);
             let u = faces.velocities.get(tag as usize).copied().unwrap_or([0.0; 3]);
-            Rule::Bounce { group: first + tag, du: moving_wall(q, u) }
+            let (group, du) = (first + tag, moving_wall(q, u));
+            if !interpolated {
+                return Rule::Bounce { group, du };
+            }
+            // The wall between the cell's centre and the solid neighbour's; a link the surface
+            // doesn't cross within the spacing (a cell whose centre is a hair inside) keeps halfway.
+            let solid_centre = [0, 1, 2].map(|a| centre[a] - cq[a] * grid.spacing);
+            let Some(qw) = tree.crossing(centre, solid_centre).filter(|qw| *qw > 0.0) else {
+                return Rule::Bounce { group, du };
+            };
+            // The fluid cell behind, at +c_q, inside the box (no periodic image) and fluid.
+            let ijk = grid.coords(cell);
+            let behind = [0, 1, 2].map(|a| ijk[a] as i64 + i64::from(C[q][a]));
+            let far = if (0..3).all(|a| behind[a] >= 0 && behind[a] < dims[a]) {
+                let b = index(behind);
+                if fluid.get(b as usize).copied().unwrap_or(false) { b } else { NONE }
+            } else {
+                NONE
+            };
+            Rule::Interp { group, du, qw, far }
         };
 
         // The links that do not stream from the neighbour the shifted copies read.
@@ -769,7 +815,7 @@ impl Flow {
             if q >= QT {
                 continue;
             }
-            if let (Rule::Bounce { group, .. } | Rule::Reflect { group, .. }, Some(back)) =
+            if let (Rule::Bounce { group, .. } | Rule::Interp { group, .. } | Rule::Reflect { group, .. }, Some(back)) =
                 (link.rule, thermal_rule(g, s, groups, cell, q, link.rule))
             {
                 let out = g.get(opposite(q) * s + cell).copied().unwrap_or(0.0);
@@ -955,6 +1001,7 @@ impl Flow {
                 let v = match link.rule {
                     Rule::Pull { from } => f.get(q * s + from as usize).copied(),
                     Rule::Bounce { du, .. } => f.get(opposite(q) * s + cell).map(|out| out + du),
+                    Rule::Interp { du, qw, far, .. } => Some(interpolated_bounce(f, s, cell, q, qw, far, du)),
                     Rule::Reflect { from, q: q2, .. } => f.get(q2 as usize * s + from as usize).copied(),
                     // A placeholder the open boundary replaces.
                     Rule::Open => f.get(opposite(q) * s + cell).copied(),
@@ -974,6 +1021,15 @@ impl Flow {
                     let back = out + du;
                     if let Some(force) = self.forces.get_mut(group as usize) {
                         // c_out f* − c_in f' with c_out = −c_q.
+                        for a in 0..3 {
+                            force[a] -= cq[a] * (out + back);
+                        }
+                    }
+                }
+                Rule::Interp { group, du, qw, far } => {
+                    let out = self.f[opposite(q) * s + cell];
+                    let back = interpolated_bounce(&self.f, s, cell, q, qw, far, du);
+                    if let Some(force) = self.forces.get_mut(group as usize) {
                         for a in 0..3 {
                             force[a] -= cq[a] * (out + back);
                         }
@@ -1055,7 +1111,8 @@ fn thermal_rule(g: &[f64], s: usize, groups: &[ThermalCondition], cell: usize, q
     let back = g.get(opposite(q) * s + cell).copied()?;
     match rule {
         Rule::Pull { from } => g.get(q * s + from as usize).copied(),
-        Rule::Bounce { group, .. } | Rule::Reflect { group, .. } => Some(match groups.get(group as usize).copied().unwrap_or_default() {
+        // Heat takes an interpolated wall halfway, as it does a plain one.
+        Rule::Bounce { group, .. } | Rule::Interp { group, .. } | Rule::Reflect { group, .. } => Some(match groups.get(group as usize).copied().unwrap_or_default() {
             ThermalCondition::Adiabatic {} => back,
             ThermalCondition::Temperature { value } => -back + 2.0 * WT.get(q).copied().unwrap_or(0.0) * value,
             ThermalCondition::Flux { value } => back + value,

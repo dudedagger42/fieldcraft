@@ -17,6 +17,7 @@ const KIND_PULL: u32 = 0;
 const KIND_BOUNCE: u32 = 1;
 const KIND_REFLECT: u32 = 2;
 const KIND_OPEN: u32 = 3;
+const KIND_INTERP: u32 = 4;
 /// The scalar lattice's directions (the first seven of D3Q19) and weights.
 const QT: usize = 7;
 const WT: [f64; QT] = [0.25, 0.125, 0.125, 0.125, 0.125, 0.125, 0.125];
@@ -252,14 +253,18 @@ impl GpuFlow {
                 Rule::Bounce { group, du } => (KIND_BOUNCE, 0, group, 0, du),
                 Rule::Reflect { from, q, group } => (KIND_REFLECT, from, group, u32::from(q), 0.0),
                 Rule::Open => (KIND_OPEN, 0, 0, 0, 0.0),
+                // The wall's fraction of the link in the upper 16 bits (to 1/65535 of a spacing),
+                // the cell behind as the source.
+                Rule::Interp { group, du, qw, far } => (KIND_INTERP, far, group, (qw.clamp(0.0, 1.0) * 65535.0).round() as u32, du),
             };
             // What the weights add to the link's exchange (see `link_forces`).
             let weight = match link.rule {
-                Rule::Bounce { .. } => c(u32::from(link.q)).map(|x| -2.0 * w(u32::from(link.q)) * x),
+                // An interpolated wall's populations are weighted to sum like a plain bounce's.
+                Rule::Bounce { .. } | Rule::Interp { .. } => c(u32::from(link.q)).map(|x| -2.0 * w(u32::from(link.q)) * x),
                 Rule::Reflect { .. } => std::array::from_fn(|a| (c(q2)[a] - c(u32::from(link.q))[a]) * w(q2)),
                 _ => [0.0; 3],
             };
-            if matches!(link.rule, Rule::Bounce { .. } | Rule::Reflect { .. }) {
+            if matches!(link.rule, Rule::Bounce { .. } | Rule::Interp { .. } | Rule::Reflect { .. }) {
                 by_group.push((group, l as u32));
                 if let Some(g) = weight_forces.get_mut(group as usize) {
                     for (s, x) in g.iter_mut().zip(weight) {
