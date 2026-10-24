@@ -81,12 +81,12 @@ fn schafer_turek_2d1_cylinder_drag_and_lift() {
 #[test]
 #[ignore]
 fn schafer_turek_2d1_with_interpolated_walls() {
-    for dx in [0.01, 0.005, 0.0025] {
+    for (dx, walls) in [(0.01, Walls::Interpolated), (0.005, Walls::Interpolated), (0.01, Walls::Quadratic), (0.005, Walls::Quadratic)] {
         let dt = 0.025 * dx / 0.3 * (dx / 0.01);
-        let (cd, cl, dp) = schafer_turek_2d1(dx, Some(dt), Walls::Interpolated);
+        let (cd, cl, dp) = schafer_turek_2d1(dx, Some(dt), walls);
         let (ecd, ecl, edp) = (cd / 5.58 - 1.0, cl / 0.0107 - 1.0, dp / 0.1174 - 1.0);
         println!(
-            "interpolated Schäfer–Turek 2D-1, D/Δx = {}: c_D = {cd:.4} ({:+.2}%), c_L = {cl:.5} ({:+.1}%), Δp = {dp:.4} ({:+.2}%)",
+            "{walls:?} Schäfer–Turek 2D-1, D/Δx = {}: c_D = {cd:.4} ({:+.2}%), c_L = {cl:.5} ({:+.1}%), Δp = {dp:.4} ({:+.2}%)",
             0.1 / dx,
             100.0 * ecd,
             100.0 * ecl,

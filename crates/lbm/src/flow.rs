@@ -73,6 +73,9 @@ pub enum Rule {
     /// toward the wall, interpolated with the one leaving the cell `far` at `+c_q` behind it
     /// (`qw < ½`) or with the cell's own population of direction `q` (`qw ≥ ½`).
     Interp { group: u32, du: f64, qw: f64, far: u32 },
+    /// The same interpolated quadratically (Bouzidi et al. 2001), also from the cell `far2` at
+    /// `+2c_q` (`qw < ½`) or `far` (`qw ≥ ½`); linear where those aren't fluid.
+    Quad { group: u32, du: f64, qw: f64, far: u32, far2: u32 },
     /// Specular reflection at a slip face: direction `q` from cell `from`.
     Reflect { from: u32, q: u8, group: u32 },
     /// From outside an inlet or outlet: set by the open boundary after streaming.
@@ -250,6 +253,34 @@ fn interpolated_bounce(f: &[f64], s: usize, cell: usize, q: usize, qw: f64, far:
     }
 }
 
+/// [`Rule::Quad`]: Bouzidi et al.'s quadratic interpolation. With `i` the direction toward the
+/// wall (opp(q)) and `ī = q` the one away from it, all post-collision:
+/// `qw < ½`: q(1+2q) f_i(x) + (1−4q²) f_i(x+c_ī) − q(1−2q) f_i(x+2c_ī);
+/// `qw ≥ ½`: f_i(x) / (q(2q+1)) + (2q−1)/q f_ī(x) − (2q−1)/(2q+1) f_ī(x+c_ī).
+/// The weights add up to one either way. Linear ([`interpolated_bounce`]) where the farther cell
+/// isn't fluid. The moving wall's term is taken as the linear scheme takes it.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn quadratic_bounce(f: &[f64], s: usize, cell: usize, q: usize, qw: f64, far: u32, far2: u32, du: f64) -> f64 {
+    let toward = opposite(q) * s;
+    let at = |base: usize, c: u32| if c == NONE { None } else { f.get(base + c as usize).copied() };
+    let out = f.get(toward + cell).copied().unwrap_or(0.0);
+    if qw < 0.5 {
+        match (at(toward, far), at(toward, far2)) {
+            (Some(b1), Some(b2)) => qw * (1.0 + 2.0 * qw) * out + (1.0 - 4.0 * qw * qw) * b1 - qw * (1.0 - 2.0 * qw) * b2 + du,
+            _ => interpolated_bounce(f, s, cell, q, qw, far, du),
+        }
+    } else {
+        let away = f.get(q * s + cell).copied().unwrap_or(0.0);
+        match at(q * s, far) {
+            Some(away_far) => {
+                out / (qw * (2.0 * qw + 1.0)) + (2.0 * qw - 1.0) / qw * away - (2.0 * qw - 1.0) / (2.0 * qw + 1.0) * away_far + du / (2.0 * qw)
+            }
+            None => interpolated_bounce(f, s, cell, q, qw, far, du),
+        }
+    }
+}
+
 /// A vector allocated without aborting when memory runs out.
 fn filled<T: Clone>(len: usize, value: T, what: &str) -> Result<Vec<T>> {
     let mut v = Vec::new();
@@ -318,7 +349,8 @@ impl Flow {
 
         // The group and moving-wall term of a link into fluid cell `cell` (direction q) from the
         // obstacle cell `solid`: the face of the triangle nearest the link's midpoint.
-        let interpolated = domain.walls == Walls::Interpolated;
+        let interpolated = matches!(domain.walls, Walls::Interpolated | Walls::Quadratic);
+        let quadratic = domain.walls == Walls::Quadratic;
         let obstacle_link = |cell: usize, solid: u32, q: usize| -> Rule {
             let k = owner.get(solid as usize).copied().unwrap_or(NONE) as usize;
             let (Some((tree, tags)), Some(faces), Some(&first)) = (trees.get(k), setup.obstacles.get(k), base.get(k)) else {
@@ -340,13 +372,28 @@ impl Flow {
             };
             // The fluid cell behind, at +c_q, inside the box (no periodic image) and fluid.
             let ijk = grid.coords(cell);
-            let behind = [0, 1, 2].map(|a| ijk[a] as i64 + i64::from(C[q][a]));
-            let far = if (0..3).all(|a| behind[a] >= 0 && behind[a] < dims[a]) {
-                let b = index(behind);
+            // The cell `steps` links behind along +c_q: wrapped across periodic faces (a periodic
+            // axis one cell deep has its own cell there), none past another face or in a wall.
+            let behind = |steps: i64| -> u32 {
+                let mut p = [0i64; 3];
+                for a in 0..3 {
+                    let v = ijk[a] as i64 + steps * i64::from(C[q][a]);
+                    p[a] = if v >= 0 && v < dims[a] {
+                        v
+                    } else if periodic[a] {
+                        v.rem_euclid(dims[a])
+                    } else {
+                        return NONE;
+                    };
+                }
+                let b = index(p);
                 if fluid.get(b as usize).copied().unwrap_or(false) { b } else { NONE }
-            } else {
-                NONE
             };
+            let far = behind(1);
+            if quadratic {
+                let far2 = if far != NONE { behind(2) } else { NONE };
+                return Rule::Quad { group, du, qw, far, far2 };
+            }
             Rule::Interp { group, du, qw, far }
         };
 
@@ -815,7 +862,7 @@ impl Flow {
             if q >= QT {
                 continue;
             }
-            if let (Rule::Bounce { group, .. } | Rule::Interp { group, .. } | Rule::Reflect { group, .. }, Some(back)) =
+            if let (Rule::Bounce { group, .. } | Rule::Interp { group, .. } | Rule::Quad { group, .. } | Rule::Reflect { group, .. }, Some(back)) =
                 (link.rule, thermal_rule(g, s, groups, cell, q, link.rule))
             {
                 let out = g.get(opposite(q) * s + cell).copied().unwrap_or(0.0);
@@ -1002,6 +1049,7 @@ impl Flow {
                     Rule::Pull { from } => f.get(q * s + from as usize).copied(),
                     Rule::Bounce { du, .. } => f.get(opposite(q) * s + cell).map(|out| out + du),
                     Rule::Interp { du, qw, far, .. } => Some(interpolated_bounce(f, s, cell, q, qw, far, du)),
+                    Rule::Quad { du, qw, far, far2, .. } => Some(quadratic_bounce(f, s, cell, q, qw, far, far2, du)),
                     Rule::Reflect { from, q: q2, .. } => f.get(q2 as usize * s + from as usize).copied(),
                     // A placeholder the open boundary replaces.
                     Rule::Open => f.get(opposite(q) * s + cell).copied(),
@@ -1026,9 +1074,18 @@ impl Flow {
                         }
                     }
                 }
-                Rule::Interp { group, du, qw, far } => {
+                Rule::Interp { group, du, qw, far } | Rule::Quad { group, du, qw, far, far2: NONE } => {
                     let out = self.f[opposite(q) * s + cell];
                     let back = interpolated_bounce(&self.f, s, cell, q, qw, far, du);
+                    if let Some(force) = self.forces.get_mut(group as usize) {
+                        for a in 0..3 {
+                            force[a] -= cq[a] * (out + back);
+                        }
+                    }
+                }
+                Rule::Quad { group, du, qw, far, far2 } => {
+                    let out = self.f[opposite(q) * s + cell];
+                    let back = quadratic_bounce(&self.f, s, cell, q, qw, far, far2, du);
                     if let Some(force) = self.forces.get_mut(group as usize) {
                         for a in 0..3 {
                             force[a] -= cq[a] * (out + back);
@@ -1112,11 +1169,13 @@ fn thermal_rule(g: &[f64], s: usize, groups: &[ThermalCondition], cell: usize, q
     match rule {
         Rule::Pull { from } => g.get(q * s + from as usize).copied(),
         // Heat takes an interpolated wall halfway, as it does a plain one.
-        Rule::Bounce { group, .. } | Rule::Interp { group, .. } | Rule::Reflect { group, .. } => Some(match groups.get(group as usize).copied().unwrap_or_default() {
-            ThermalCondition::Adiabatic {} => back,
-            ThermalCondition::Temperature { value } => -back + 2.0 * WT.get(q).copied().unwrap_or(0.0) * value,
-            ThermalCondition::Flux { value } => back + value,
-        }),
+        Rule::Bounce { group, .. } | Rule::Interp { group, .. } | Rule::Quad { group, .. } | Rule::Reflect { group, .. } => {
+            Some(match groups.get(group as usize).copied().unwrap_or_default() {
+                ThermalCondition::Adiabatic {} => back,
+                ThermalCondition::Temperature { value } => -back + 2.0 * WT.get(q).copied().unwrap_or(0.0) * value,
+                ThermalCondition::Flux { value } => back + value,
+            })
+        }
         Rule::Open => Some(back),
     }
 }

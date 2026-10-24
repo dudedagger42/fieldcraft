@@ -469,6 +469,9 @@ pub enum Walls {
     /// Where the surface actually crosses each link (Bouzidi, Firdaouss & Lallemand's linear
     /// interpolated bounce-back): curved walls keep their shape between the cells.
     Interpolated,
+    /// The same with their quadratic interpolation, from one more cell into the fluid: second
+    /// order, so a parabolic profile between plates is exact wherever the plates lie. On the CPU.
+    Quadratic,
 }
 
 impl Walls {

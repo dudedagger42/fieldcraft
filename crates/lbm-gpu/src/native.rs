@@ -255,16 +255,19 @@ impl GpuFlow {
                 Rule::Open => (KIND_OPEN, 0, 0, 0, 0.0),
                 // The wall's fraction of the link in the upper 16 bits (to 1/65535 of a spacing),
                 // the cell behind as the source.
-                Rule::Interp { group, du, qw, far } => (KIND_INTERP, far, group, (qw.clamp(0.0, 1.0) * 65535.0).round() as u32, du),
+                // The GPU interpolates linearly: a quadratic link runs as a linear one there.
+                Rule::Interp { group, du, qw, far } | Rule::Quad { group, du, qw, far, .. } => {
+                    (KIND_INTERP, far, group, (qw.clamp(0.0, 1.0) * 65535.0).round() as u32, du)
+                }
             };
             // What the weights add to the link's exchange (see `link_forces`).
             let weight = match link.rule {
                 // An interpolated wall's populations are weighted to sum like a plain bounce's.
-                Rule::Bounce { .. } | Rule::Interp { .. } => c(u32::from(link.q)).map(|x| -2.0 * w(u32::from(link.q)) * x),
+                Rule::Bounce { .. } | Rule::Interp { .. } | Rule::Quad { .. } => c(u32::from(link.q)).map(|x| -2.0 * w(u32::from(link.q)) * x),
                 Rule::Reflect { .. } => std::array::from_fn(|a| (c(q2)[a] - c(u32::from(link.q))[a]) * w(q2)),
                 _ => [0.0; 3],
             };
-            if matches!(link.rule, Rule::Bounce { .. } | Rule::Interp { .. } | Rule::Reflect { .. }) {
+            if matches!(link.rule, Rule::Bounce { .. } | Rule::Interp { .. } | Rule::Quad { .. } | Rule::Reflect { .. }) {
                 by_group.push((group, l as u32));
                 if let Some(g) = weight_forces.get_mut(group as usize) {
                     for (s, x) in g.iter_mut().zip(weight) {

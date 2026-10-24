@@ -10,7 +10,7 @@ mod common;
 
 use common::*;
 use fieldcraft_lbm::{Error, Limits, Setup, solve_fluid};
-use fieldcraft_model::{FaceCondition, Profile};
+use fieldcraft_model::{FaceCondition, Profile, Walls};
 
 const PERIODIC: FaceCondition = FaceCondition::Periodic {};
 
@@ -157,7 +157,7 @@ fn taylor_green_vortex_decays_at_the_viscous_rate_to_second_order_and_conserves_
 /// Poiseuille flow in a pipe of radius 1 along x (a tube obstacle, staircase wall), driven by a
 /// body force; `k` cells per radius. Returns the relative L2 error of the velocity over the pipe's
 /// cross-section and the relative error of the flow rate.
-fn pipe(k: usize) -> (f64, f64) {
+fn pipe(k: usize, walls: Walls) -> (f64, f64) {
     let (r, nu, umax) = (1.0, 1.0 / 6.0, 0.1);
     let dx = r / k as f64;
     let half = r + 2.0 * dx;
@@ -167,6 +167,7 @@ fn pipe(k: usize) -> (f64, f64) {
     let a = 4.0 * nu * umax / (r * r);
     d.acceleration = [a, 0.0, 0.0];
     d.obstacles = vec!["Tube".into()];
+    d.walls = walls;
     let tube = obstacle("Tube", tube(-1.0, dx + 1.0, [0.0, 0.0], r, 3.0 * half, 512), &["inner", "outer", "start", "end"]);
     let m = model(1.0, nu, d, step(5.0 * r * r / nu, dx * dx, None));
     let (setup, mut flow) = prepare(&m, std::slice::from_ref(&tube));
@@ -186,14 +187,17 @@ fn pipe(k: usize) -> (f64, f64) {
     // Momentum balance: the wall takes the whole driving force.
     let wall: f64 = flow.groups().iter().zip(flow.forces()).filter(|(g, _)| g.body.is_some()).map(|(_, f)| f[0]).sum::<f64>() * setup.force_scale();
     let drive = a * flow.fluid_cells() as f64 * dx.powi(3);
-    assert!((wall - drive).abs() < 1e-6 * drive, "{wall} vs {drive}");
+    // Exactly with half-way walls; interpolated ones don't conserve momentum exactly (the
+    // populations they mix come from different cells), so the balance holds to a few percent.
+    let tolerance = if walls == Walls::Halfway { 1e-6 } else { 0.05 };
+    assert!((wall - drive).abs() < tolerance * drive, "{walls:?}: wall {wall} vs drive {drive} ({:+.2e})", wall / drive - 1.0);
     ((e2 / u2).sqrt(), (q / q_exact - 1.0).abs())
 }
 
 #[test]
 #[ignore = "heavy: cargo xtask test --heavy (CI heavy job)"]
 fn pipe_poiseuille_on_a_staircase_wall_converges() {
-    let runs: Vec<(f64, f64)> = [4, 8, 16].iter().map(|&k| pipe(k)).collect();
+    let runs: Vec<(f64, f64)> = [4, 8, 16].iter().map(|&k| pipe(k, Walls::Halfway)).collect();
     let l2: Vec<f64> = runs.iter().map(|r| r.0).collect();
     let flow: Vec<f64> = runs.iter().map(|r| r.1).collect();
     println!(
@@ -204,6 +208,35 @@ fn pipe_poiseuille_on_a_staircase_wall_converges() {
         orders(&flow, 2.0)
     );
     assert!(l2[2] < l2[0] && l2[2] < 0.05, "{l2:?}");
+}
+
+/// The same pipe with its wall where the surface is: both interpolations are an order of magnitude
+/// closer than the staircase on the same grid. (Before the cells behind a link wrapped across
+/// periodic faces, a pipe one cell deep took half its links half-way and came out worse.)
+#[test]
+#[ignore = "heavy: cargo xtask test --heavy (CI heavy job)"]
+fn pipe_poiseuille_with_its_wall_where_the_surface_is() {
+    let mut table = Vec::new();
+    for walls in [Walls::Halfway, Walls::Interpolated, Walls::Quadratic] {
+        let runs: Vec<(f64, f64)> = [4, 8, 16].iter().map(|&k| pipe(k, walls)).collect();
+        let l2: Vec<f64> = runs.iter().map(|r| r.0).collect();
+        let flow: Vec<f64> = runs.iter().map(|r| r.1).collect();
+        println!(
+            "Poiseuille pipe, {walls:?}, 4 → 16 cells per radius: L2 errors {}, flow-rate errors {} (orders {:.2?})",
+            sci(&l2),
+            sci(&flow),
+            orders(&l2, 2.0)
+        );
+        table.push(l2);
+    }
+    let (half, lin, quad) = (&table[0], &table[1], &table[2]);
+    // Measured: half-way 4.5e-2, 4.2e-2, 9.5e-3; linear 6.6e-3, 5.7e-3, 6.5e-4; quadratic 3.4e-3,
+    // 4.8e-3, 7.7e-4: both interpolations an order of magnitude closer than the staircase, the
+    // quadratic one ahead on the coarsest grid and level with the linear one after.
+    for k in 0..3 {
+        assert!(lin[k] < 0.25 * half[k] && quad[k] < 0.25 * half[k], "{half:?} {lin:?} {quad:?}");
+    }
+    assert!(lin[2] < 1e-3 && quad[2] < 1e-3, "{lin:?} {quad:?}");
 }
 
 /// The Stokes drag coefficient K = F / (6 π μ R U) of a simple cubic array of spheres at volume
@@ -383,4 +416,42 @@ fn results_are_bit_for_bit_reproducible() {
     assert!(a.solid.iter().any(|s| *s));
     let probe = a.probe(3, [1.8, 0.5, 0.5]).unwrap();
     assert!(probe.1[0] > 0.0);
+}
+
+/// Every wall link of a pipe knows where the round wall crosses it: the fraction each
+/// interpolated link holds is the exact one for the circle (to the 512-gon's sagitta).
+#[test]
+fn a_pipe_s_wall_links_hold_where_the_circle_crosses_them() {
+    let (r, k) = (1.0, 6usize);
+    let dx = r / k as f64;
+    let half = r + 2.0 * dx;
+    let mut d = domain([0.0, -half, -half], [dx, half, half], dx);
+    d.faces.x_min = PERIODIC;
+    d.faces.x_max = PERIODIC;
+    d.obstacles = vec!["Tube".into()];
+    d.walls = Walls::Interpolated;
+    let t = obstacle("Tube", tube(-1.0, dx + 1.0, [0.0, 0.0], r, 3.0 * half, 512), &["inner", "outer", "start", "end"]);
+    let m = model(1.0, 1.0 / 6.0, d, step(1.0, dx * dx, None));
+    let (_, flow) = prepare(&m, std::slice::from_ref(&t));
+    let grid = *flow.grid();
+    let (mut worst, mut count, mut out_of_range) = (0.0f64, 0, 0);
+    for link in flow.links() {
+        let fieldcraft_lbm::Rule::Interp { qw, .. } = link.rule else { continue };
+        let c = fieldcraft_lbm::lattice::C[link.q as usize];
+        let p = grid.centre(link.cell as usize);
+        // From the fluid centre toward the solid one (−c_q): the circle y² + z² = r² along it.
+        let (y, z, dy, dz) = (p[1], p[2], -f64::from(c[1]) * dx, -f64::from(c[2]) * dx);
+        let (a, b, cc) = (dy * dy + dz * dz, 2.0 * (y * dy + z * dz), y * y + z * z - r * r);
+        if a == 0.0 {
+            continue;
+        }
+        let exact = (-b + (b * b - 4.0 * a * cc).sqrt()) / (2.0 * a);
+        if !(0.0..=1.0).contains(&exact) {
+            out_of_range += 1;
+        }
+        worst = worst.max((qw - exact).abs());
+        count += 1;
+    }
+    println!("{count} interpolated links: worst |q − exact| {worst:.2e}, {out_of_range} with the exact crossing outside the link");
+    assert!(count > 0 && worst < 1e-3, "{worst}");
 }
