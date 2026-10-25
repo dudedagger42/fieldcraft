@@ -282,7 +282,8 @@ fn solid_data(solid: &fieldcraft_lbm::conduction::SolidHeat, t0: f64) -> Result<
 }
 
 /// The entry points of `lbm.wgsl` a flow dispatches.
-const KERNELS: [&str; 23] = [
+const KERNELS: [&str; 24] = [
+    "clear_eddy",
     "collide",
     "stream",
     "stream_links",
@@ -1054,8 +1055,11 @@ impl GpuFlow {
     /// One submission of `steps` (≤ MAX_CHUNK) time steps, then the stability check.
     fn advance_chunk(&mut self, steps: u64) -> Result<()> {
         self.queue.write_buffer(&self.stats, 0, &bytes_u32(&[0, 0, 0, 0]));
-        let mut commands = Vec::with_capacity(self.dispatches_per_step() * steps as usize + 6);
+        let mut commands = Vec::with_capacity(self.dispatches_per_step() * steps as usize + 7);
         for step in 0..steps {
+            if step + 1 == steps {
+                commands.push((self.current, "clear_eddy", (1, 1)));
+            }
             commands.push((self.current, "collide", self.cells));
             if !self.aa {
                 commands.push((self.current, "stream", self.cells));
@@ -1132,7 +1136,7 @@ impl GpuFlow {
                 self.steps_done
             )));
         }
-        // The chunk's largest eddy viscosity (the CPU reports its last step's).
+        // The last step's largest eddy viscosity, as on the CPU.
         if self.nu0 > 0.0 {
             self.eddy_ratio = f64::from(f32::from_bits(word(3))) / self.nu0;
         }

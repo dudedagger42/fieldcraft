@@ -40,7 +40,7 @@
 // keeping Λ). It is local, so it needs no neighbour and no buffer. With heat the scalar lattice
 // needs the cell's ν_t too: the momentum collision leaves it in `moments`' w (the density there
 // is only read after `cell_moments` has rewritten it), so it costs no memory and no binding.
-// The chunk's largest ν_t goes to stats[3].
+// The last step's largest ν_t goes to stats[3] (cleared by clear_eddy).
 
 override AA_MODE: bool = true;
 // The recursive regularised collision instead of the two-relaxation-time one
@@ -117,7 +117,7 @@ struct Params {
 // Per cell: velocity (with the half force) and density, from the moments kernel.
 @group(0) @binding(9) var<storage, read_write> moments: array<vec4<f32>>;
 // [0]: the largest squared lattice speed of the chunk (as f32 bits); [1]: a density was not positive;
-// [2]: a temperature was not a number; [3]: the chunk's largest eddy viscosity (f32 bits).
+// [2]: a temperature was not a number; [3]: the last step's largest eddy viscosity (f32 bits).
 @group(0) @binding(10) var<storage, read_write> stats: array<atomic<u32>>;
 // Per link, the momentum it transferred to its group in the last step.
 @group(0) @binding(11) var<storage, read_write> contrib: array<vec4<f32>>;
@@ -964,6 +964,13 @@ fn open_thermal(@builtin(local_invocation_index) lid: u32, @builtin(workgroup_id
             t2[q * n + cell] = t2[q * n + src];
         }
     }
+}
+
+// Clears the largest eddy viscosity before a chunk's last step, so stats[3] holds that step's
+// alone, as the CPU reports it.
+@compute @workgroup_size(1)
+fn clear_eddy() {
+    atomicStore(&stats[3], 0u);
 }
 
 // Flags a temperature that stopped being a number.
