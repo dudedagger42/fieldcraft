@@ -540,3 +540,19 @@ wall treatment or spatial resolution. Grid, domain, Mach and model sensitivity
 and agreement with independent references remain separate gates. The reported
 field profiles may include additional samples beyond the paired-block window;
 the acceptance report's mean refers only to that explicitly bounded window.
+
+## Requested, applied and carried stress
+
+The channel studies distinguish the wall model's requested stress, the traction
+applied through momentum exchange, and the drag carried by the flow. The model's
+inferred stress is not a substitute for the reported wall force or an independent
+drag reference. Displayed wall velocities can contain reconstruction targets;
+they do not measure the momentum stored in the populations.
+
+The original Re_τ 950 N10 case still fails carried-drag validation: requested/
+carried stress is about 1.245, and carried C_f is 0.0043803 versus DNS 0.00509.
+Reproducing the paper's inferred C_f or profile measure does not establish accurate
+drag. The diagnostics do not repair the wall model, and completion of a study
+does not certify physical validation. See the
+[wall-stress verification contract](../../verification.md#requested-applied-and-carried-wall-stress)
+for test thresholds, scope and the known-failure regression.
