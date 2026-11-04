@@ -146,13 +146,14 @@ struct Shape {
     zone_count: u64,
     conducting: bool,
     open_faces: [bool; 6],
+    inlets: bool,
     surface: bool,
 }
 
 impl Shape {
     /// The shape of a run over `domain` keeping `frames` frames after the initial one, with or
     /// without a turbulence model, its wall damping and its wall model.
-    fn new(domain: &FluidDomain, frames: u64, turbulence: bool, damping: bool, wall_model: bool, spalart_allmaras: bool) -> Result<Shape> {
+    fn new(domain: &FluidDomain, frames: u64, turbulence: bool, damping: bool, wall_model: bool, spalart_allmaras: bool, trt: bool) -> Result<Shape> {
         let thermal = domain.thermal.as_ref();
         Ok(Shape {
             cells: domain.cells()?,
@@ -174,6 +175,9 @@ impl Shape {
                 * F32,
             conducting: thermal.is_some_and(|t| !t.solids.is_empty()),
             open_faces: fieldcraft_model::BoxFace::ALL.map(|f| is_open(domain.faces.get(f))),
+            inlets: trt
+                && domain.free_surface.is_none()
+                && fieldcraft_model::BoxFace::ALL.iter().any(|face| matches!(domain.faces.get(*face), FaceCondition::Velocity { .. })),
             surface: domain.free_surface.is_some(),
         })
     }
@@ -189,6 +193,7 @@ impl Memory {
             setup.van_driest.is_some(),
             setup.wall_model.is_some(),
             setup.spalart_allmaras.is_some(),
+            setup.collision == Collision::Trt,
         )?;
         let gradients = setup.collision == Collision::Hrr || setup.vreman > 0.0 || setup.spalart_allmaras.is_some();
         Ok(Memory::from_shape(&Shape { gradients, ..shape }, backend))
@@ -205,7 +210,8 @@ impl Memory {
         let (damping, wall_model) = turbulence.map_or((false, false), |t| (t.van_driest().is_some(), t.wall_model().is_some()));
         let sa = matches!(turbulence, Some(fieldcraft_model::Turbulence::SpalartAllmaras { .. }));
         let gradients = *collision == Some(Collision::Hrr) || matches!(turbulence, Some(fieldcraft_model::Turbulence::Vreman { .. })) || sa;
-        let shape = Shape::new(domain, u64::from(*frames), turbulence.is_some(), damping, wall_model, sa)?;
+        let trt = collision.unwrap_or(Collision::Trt) == Collision::Trt;
+        let shape = Shape::new(domain, u64::from(*frames), turbulence.is_some(), damping, wall_model, sa, trt)?;
         Ok(Memory::from_shape(&Shape { gradients, ..shape }, backend))
     }
 
@@ -221,7 +227,11 @@ impl Memory {
             .map(|(c, open)| {
                 c.saturating_mul(
                     FACE_LINKS * size_of::<Link>() as u64
-                        + if open { (size_of::<OpenCell>() + size_of::<[f64; crate::lattice::Q]>()) as u64 } else { 0 },
+                        + if open {
+                            (size_of::<OpenCell>() + size_of::<[f64; crate::lattice::Q]>()) as u64
+                                // Stencils, corrections/filter scratch and construction lookup.
+                                + if s.inlets { (size_of::<crate::inlet::Stencil>() + size_of::<[f64; 3]>() + size_of::<(u32, u32)>()) as u64 } else { 0 }
+                        } else { 0 },
                 )
             })
             .fold(0, u64::saturating_add);
@@ -267,6 +277,17 @@ impl Memory {
             .fold(0u64, |sum, (cells, _)| sum.saturating_add(*cells))
             .saturating_mul(2 * DEVICE_OUTLET_WORDS as u64 * F32);
         let zone_cells = if s.zones { per_cell(DEVICE_ZONE_CELL) } else { 0 };
+        // Appended GPU stencil words and one 16-float scratch row, including upload copies.
+        let inlet_staging = if s.inlets {
+            face_cells
+                .iter()
+                .zip(s.open_faces)
+                .filter(|(_, open)| *open)
+                .map(|(cells, _)| cells.saturating_mul(3 * (12 + 16) * F32))
+                .fold(0, u64::saturating_add)
+        } else {
+            0
+        };
         let (setup, state, readback) = match backend {
             // The CPU flow allocates its streaming targets on the first step and keeps
             // everything to the end.
@@ -279,6 +300,7 @@ impl Memory {
                 prepared
                     .saturating_add(outlet_staging)
                     .saturating_add(per_cell(DEVICE_STAGING + if s.damping { DEVICE_DAMPING } else { 0 }))
+                    .saturating_add(inlet_staging)
                     .saturating_add(s.zone_data.saturating_add(zone_cells).saturating_mul(3)),
                 per_cell(2 * RESULT).saturating_add(s.zone_data).saturating_add(zone_cells),
                 per_cell(READBACK + DEVICE_READBACK + if s.heat { READBACK_HEAT + DEVICE_READBACK_HEAT } else { 0 })

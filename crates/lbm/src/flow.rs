@@ -34,6 +34,9 @@
 //!   uniform 4×1×1 stream (#819). Every pressure cell reads the pre-boundary streamed state,
 //!   including at intersecting open faces. Without a fluid cell immediately inside, the
 //!   legacy local closure is used: Zou–He for TRT/MRT, equilibrium for RR/HRR.
+//!   TRT velocity inlets then replace the non-equilibrium stress trace and high-frequency
+//!   density residual from two inner cells ([`crate::inlet`]), suppressing the alternating
+//!   boundary mode without changing the prescribed velocity or deviatoric stress.
 //!   A convective outlet ([`crate::outlet`]) updates the unknown populations by a convective
 //!   outflow condition instead, holds each cell at the face's density, and falls back to Zou–He
 //!   where the flow comes back in. A cell on the edge of two open faces belongs to one of them.
@@ -593,6 +596,7 @@ pub struct Flow {
     pub(crate) block: usize,
     /// Each open cell's populations after its boundary, in the step (kept for its capacity).
     open_scratch: Vec<[f64; Q]>,
+    inlets: crate::inlet::Inlets,
     /// The free surface: which fluid cells hold liquid, with a free surface.
     pub(crate) surface: Option<Surface>,
 }
@@ -1241,9 +1245,14 @@ impl Flow {
             outlets: Outlets::default(),
             block: block_cells(n),
             open_scratch: Vec::new(),
+            inlets: crate::inlet::Inlets::default(),
             surface,
         };
         flow.outlets = Outlets::new(&flow.open, &View { flow: &flow, f: &flow.f });
+        // A moving liquid/gas interface does not provide two fixed inner fluid samples.
+        if setup.collision == Collision::Trt && flow.surface.is_none() && flow.open.iter().any(|oc| matches!(oc.target, Target::Velocity(_))) {
+            flow.inlets = crate::inlet::Inlets::new(&grid, &flow.open, periodic, &flow.fluid)?;
+        }
         if let Some(s) = &mut flow.surface {
             s.initial_mass = s.total_mass(&flow.f, flow.stride);
         }
@@ -1253,6 +1262,11 @@ impl Flow {
     /// What the convective outlet cells keep between steps.
     pub fn outlets(&self) -> &Outlets {
         &self.outlets
+    }
+
+    /// Geometry-derived reconstruction stencils for TRT velocity inlets, shared with the GPU.
+    pub fn inlet_stencils(&self) -> &[crate::inlet::Stencil] {
+        self.inlets.stencils()
     }
 
     /// The free surface, when the flow has one.
@@ -1456,7 +1470,8 @@ impl Flow {
             + bytes(&self.zone_of)
             + bytes(&self.open_scratch)
             + self.zone_cells.iter().map(bytes).sum::<u64>()
-            + self.outlets.heap_bytes();
+            + self.outlets.heap_bytes()
+            + self.inlets.heap_bytes();
         if let Some(t) = &self.thermal {
             total += bytes(&t.g) + bytes(&t.g2) + bytes(&t.temperature) + bytes(&t.open) + bytes(&t.reset);
             total += t.phase.as_ref().map_or(0, |p| bytes(&p.liquid));
@@ -2590,7 +2605,8 @@ impl Flow {
     }
 
     /// Zou–He velocity, extrapolated pressure and convective boundaries. Every inner-cell read
-    /// uses the streamed populations before any open cell is changed, so cells are worked out
+    /// uses the streamed populations before any open cell is changed (TRT inlet residuals are
+    /// staged likewise, [`crate::inlet`]), so cells are worked out
     /// in parallel (blocks of [`OPEN_BLOCK`]) and
     /// stored afterwards in cell order: done one after another they were a tenth of a step on
     /// one thread, which capped the speed-up of many (#643).
@@ -2600,6 +2616,8 @@ impl Flow {
         let mut outlets = std::mem::take(&mut self.outlets);
         let [nx, ny, _] = self.grid.cells;
         outlets.convect(&self.open, &View { flow: self, f: &self.g }, [1, nx, nx * ny]);
+        let mut inlets = std::mem::take(&mut self.inlets);
+        inlets.stage(&self.open, &View { flow: self, f: &self.g });
         let mut done = std::mem::take(&mut self.open_scratch);
         done.clear();
         done.resize(self.open.len(), [0.0; Q]);
@@ -2654,6 +2672,9 @@ impl Flow {
                         (Target::Convective(rho), Action::Hold) => zou_he(p, 1, 0, axis, sign, a_half, crate::outlet::backflow(rho), regularized),
                         (target, _) => zou_he(p, 1, 0, axis, sign, a_half, target, regularized),
                     }
+                    if let Target::Velocity(u) = oc.target {
+                        inlets.apply(k, p, std::array::from_fn(|a| u[a] - a_half[a]));
+                    }
                 }
             });
         }
@@ -2675,6 +2696,7 @@ impl Flow {
         }
         self.open_scratch = done;
         self.outlets = outlets;
+        self.inlets = inlets;
         if let Some(surface) = &mut self.surface {
             surface.injected += injected;
         }
@@ -2853,6 +2875,7 @@ impl crate::backend::Backend for Flow {
             block: _,
             // Overwritten before use; its capacity is not state.
             open_scratch: _,
+            inlets: _,
             surface,
         } = self;
         let n = *n;
