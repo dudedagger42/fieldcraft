@@ -556,3 +556,36 @@ drag. The diagnostics do not repair the wall model, and completion of a study
 does not certify physical validation. See the
 [wall-stress verification contract](../../verification.md#requested-applied-and-carried-wall-stress)
 for test thresholds, scope and the known-failure regression.
+
+## Sampled runtime validity
+
+`solve.fluid` returns `validity` separately from execution status and steady-state
+convergence: `execution` says `completed` or `diverged`, while `validation` is
+`not_assessed`. It samples the initial field, every ceil(steps/256) steps (at least
+one), and the sound final or early-stop field. The report retains at most 258
+records, 14,448 bytes of sample payload, and reports both field and force sampling
+cadences in steps. It measures full-precision backend fields, including inlet and
+outlet cells; solid and fully gaseous cells are excluded. It cannot detect an
+excursion between samples. The records can be filtered to a study's burn-in window.
+Unusable fields are marked explicitly and leave the envelope unassessed; the
+existing backend guard and steady monitor continue to handle divergence.
+
+Density extrema are ratios to the material's reference density (lattice density
+one), with maximum absolute departure and minimum/maximum local Mach. The proposed
+low-Mach study envelope is departure <=0.02 and Mach <=0.2; crossing it adds a
+warning, without changing the existing blow-up guard. Intended pressure-driven
+density gradients are **not** subtracted by the runtime report: a study must state
+and justify its reference profile or case-specific envelope. The library's
+`validity::measure` accepts a spatial reference for that purpose.
+
+Each wall group's existing force history supplies peak-magnitude / magnitude-of-
+signed-mean and largest-consecutive-jump / magnitude-of-signed-mean indicators.
+The ratios are null for zero means. A force spike is a diagnostic, not a universal
+invalidity criterion; signed force histories remain necessary to detect negative
+mean drag. Passing the sampled field envelope does not establish statistical
+convergence, grid independence or agreement with experiment.
+
+Diagnostics survive a CPU checkpoint/resume bit for bit. This extends the restart
+layout to FCRST5; older checkpoint layouts are refused. Runtime validity is not
+stored in the legacy result encoding (like other runtime-only statistics); an
+older or reloaded result has no validity report rather than a fabricated pass.
