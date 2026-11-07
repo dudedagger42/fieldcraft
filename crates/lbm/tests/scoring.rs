@@ -132,14 +132,29 @@ fn the_reattachment_refuses_none_several_and_bad_samples() {
     }
 }
 
+/// The board's settling rule (cfd-board.md, notes/cfd-c4-laminar-settling.md): 2 flow-throughs,
+/// then a time-mean drift under 0.1 %. A change here is a change of the board's acceptance.
+#[test]
+fn the_gated_settling_rule_is_the_boards() {
+    assert_eq!(GATED, Settling { min_flow_throughs: 2.0, drift: 1e-3 });
+}
+
 #[test]
 fn settling_and_the_gate_table() {
-    let mut h: Vec<Vec<f64>> = (0..20).map(|k| vec![1.0 + 0.01 * k as f64, 2.0]).collect();
-    assert!(!settled(&h, 2, 1e-3));
-    h.extend((0..5).map(|_| vec![1.0, 2.0]));
-    assert!(settled(&h, 2, 1e-3));
-    assert!(!settled(&h, 30, 1e-3), "a window longer than the history is not settled");
-    assert!(!settled(&[vec![f64::NAN], vec![f64::NAN]], 1, 1e-3));
+    // A stationary oscillation settles once each window holds whole periods of it.
+    let h: Vec<Vec<f64>> = (0..40).map(|k| vec![1.0 + 0.05 * (std::f64::consts::TAU * k as f64 / 4.0).sin(), 2.0]).collect();
+    assert!(means_settled(&h, 8, 1e-12));
+    assert!(!means_settled(&h, 6, 1e-3), "windows of 1.5 periods see the oscillation");
+    // A creep does not.
+    let creep: Vec<Vec<f64>> = (0..40).map(|k| vec![1.0 + 1e-3 * k as f64]).collect();
+    assert!(!means_settled(&creep, 10, 1e-3));
+    assert!(means_settled(&creep, 10, 1e-2));
+    assert!(!means_settled(&h, 21, 1.0), "two windows longer than the history are not settled");
+    assert!(!means_settled(&h, 0, 1.0));
+    assert!(!means_settled(&[vec![f64::NAN], vec![f64::NAN]], 1, 1.0));
+    assert!(!means_settled(&[vec![1.0], vec![1.0, 2.0]], 1, 1.0), "ragged rows");
+    assert!(!GATED.settled(&h, 8, 1.9), "too few flow-throughs");
+    assert!(GATED.settled(&h, 8, 2.0));
 
     let mut s = Score::default();
     assert!(!s.passes(), "no gates is not a pass");
