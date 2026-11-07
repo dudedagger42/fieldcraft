@@ -385,6 +385,17 @@ impl Walls {
         });
     }
 
+    /// The wall model's friction velocity at each modelled wall cell, as [`Walls::sample`] takes
+    /// it from `velocity(cell)` (the second cell's fluid velocity, lattice units, with the half
+    /// force): each one's cell, its distance to its wall and u_τ (lattice units), in cell order.
+    /// Read only: recomputed, nothing stored (the Spalart–Allmaras wall function reads it).
+    pub fn friction_velocities<'a>(&'a self, velocity: impl Fn(usize) -> [f64; 3] + 'a) -> impl Iterator<Item = (usize, f64, f64)> + 'a {
+        self.walls.iter().filter(|w| w.second != NONE).map(move |w| {
+            let speed = w.tangential_speed(velocity(w.second as usize));
+            (w.cell as usize, w.distance, musker_friction(speed, 3.0 * w.distance, self.nu))
+        })
+    }
+
     /// The wall-function bounce's sample before a collision (Han, Ooka and Kikumoto, their eqs.
     /// 16–17): from `moments(cell)`, each wall cell's own density and velocity (lattice units,
     /// with the half force), the stress ρ u_τ² along its velocity parallel to the wall, u_τ from
