@@ -266,7 +266,7 @@ fn cell_state(fq: &mut [f64; Q], cell: usize, a: [f64; 3], walls: Option<&Walls>
 /// periodic face its periodic image, as streaming pulls; `None` when that cell is not a fluid
 /// cell or lies outside a face that is not periodic.
 #[inline(always)]
-fn neighbour(grid: &Grid, periodic: [bool; 3], fluid: &[bool], p: [usize; 3], axis: usize, up: bool) -> Option<usize> {
+pub(crate) fn neighbour(grid: &Grid, periodic: [bool; 3], fluid: &[bool], p: [usize; 3], axis: usize, up: bool) -> Option<usize> {
     let n = *grid.cells.get(axis)?;
     let i = *p.get(axis)?;
     let periodic = periodic.get(axis).copied().unwrap_or(false);
