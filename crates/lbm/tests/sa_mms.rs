@@ -10,16 +10,20 @@
 //! computational simulation*, J. Comput. Phys. 205(1):131–156, 2005,
 //! doi:10.1016/j.jcp.2004.10.036).
 //!
-//! The harness is checked here on two toy schemes whose orders are known, before it is pointed at
-//! `SaField::advance` (task R3): first-order upwind advection (order 1) and conservative central
-//! diffusion (order 2), each on a periodic line with an explicit Euler step at a fixed CFL or
-//! diffusion number, so the time error scales with the space error.
+//! The harness is checked first on two toy schemes whose orders are known: first-order upwind
+//! advection (order 1) and conservative central diffusion (order 2), each on a periodic line with
+//! an explicit Euler step at a fixed CFL or diffusion number, so the time error scales with the
+//! space error.
 //!
-//! For SA itself (R3's acceptance: advection–diffusion–source order in [0.9, 1.2], pure diffusion
-//! in [1.8, 2.2], the same order for a field crossing zero), the manufactured ν̃ is applied to
-//! R2's closure on a frozen analytic velocity, and its source is written out by hand in this file
-//! when the closure lands, term by term (advection, the σ-scaled diffusion and c_b2 term,
-//! production, destruction, SA-neg branch).
+//! Then it is pointed at `SaField::advance` through the faces the plate and step cases lean on: a
+//! no-slip wall (ν̃ = 0 half a cell out) and an inflow face (ν̃ the inflow value half a cell out),
+//! each with an open face opposite, in a non-periodic box. The manufactured fields, their
+//! derivatives and the source are written out by hand below (`wall_g`, `inflow_g`,
+//! `Manufactured::source`), and a fast test checks the derivatives against finite differences.
+//! The model's production and destruction are off: these cases check the transport (advection,
+//! the σ-scaled diffusion with ν + ν̃, the c_b2 term) and its boundary faces. Acceptance, on the
+//! finest pair of N = 16, 32, 64: advection–diffusion order in [0.9, 1.2], diffusion alone in
+//! [1.8, 2.2], in L2 and L∞.
 
 /// Errors of one grid against the manufactured field.
 #[derive(Debug, Clone, Copy)]
@@ -148,4 +152,159 @@ fn the_harness_exposes_an_inconsistent_scheme() {
     // first-order error).
     let (l2, linf) = p[1];
     assert!(l2 < 0.5 && linf < 0.5, "{p:?}");
+}
+
+// ---------------------------------------------------------------------------------------------
+// SaField's transport through its wall and inflow faces.
+// ---------------------------------------------------------------------------------------------
+
+use fieldcraft_lbm::sa::{BoxFace, C_B2, SIGMA, SaField, SaInput};
+
+/// A manufactured ν̃ on the unit square (X along x, Z along z), F = F₀ + A e^(−τ) G(X, Z), and the
+/// first and second derivatives of G, written out by hand.
+struct Manufactured {
+    f0: f64,
+    g: fn(f64, f64) -> [f64; 5],
+}
+
+/// The amplitude A, the lattice viscosity ν and the advection speed a (unit-square units).
+const AMPLITUDE: f64 = 0.05;
+const NU: f64 = 0.05;
+const SPEED: f64 = 1.0;
+const PI: f64 = std::f64::consts::PI;
+
+/// Next to a wall: G = (1 + ½ sin 2πX) sin(πZ/2), periodic in X, zero at the wall Z = 0 and with
+/// zero slope at the open face Z = 1. Returns [G, G_X, G_Z, G_XX, G_ZZ]:
+/// G_X = π cos 2πX sin(πZ/2), G_Z = (π/2)(1 + ½ sin 2πX) cos(πZ/2),
+/// G_XX = −2π² sin 2πX sin(πZ/2), G_ZZ = −(π²/4)(1 + ½ sin 2πX) sin(πZ/2).
+fn wall_g(x: f64, z: f64) -> [f64; 5] {
+    let (s, c) = ((TAU * x).sin(), (TAU * x).cos());
+    let (sz, cz) = ((0.5 * PI * z).sin(), (0.5 * PI * z).cos());
+    let w = 1.0 + 0.5 * s;
+    [w * sz, PI * c * sz, 0.5 * PI * w * cz, -2.0 * PI * PI * s * sz, -0.25 * PI * PI * w * sz]
+}
+
+/// Behind an inflow face: G = sin(πX/2)(1 + ½ sin 2πZ), zero at the inflow X = 0 (so ν̃ is the
+/// inflow value F₀ there), zero slope at the open outlet X = 1, periodic in Z. Returns
+/// [G, G_X, G_Z, G_XX, G_ZZ]: G_X = (π/2) cos(πX/2)(1 + ½ sin 2πZ), G_Z = π sin(πX/2) cos 2πZ,
+/// G_XX = −(π²/4) sin(πX/2)(1 + ½ sin 2πZ), G_ZZ = −2π² sin(πX/2) sin 2πZ.
+fn inflow_g(x: f64, z: f64) -> [f64; 5] {
+    let (sx, cx) = ((0.5 * PI * x).sin(), (0.5 * PI * x).cos());
+    let (s, c) = ((TAU * z).sin(), (TAU * z).cos());
+    let w = 1.0 + 0.5 * s;
+    [sx * w, 0.5 * PI * cx * w, PI * sx * c, -0.25 * PI * PI * sx * w, -2.0 * PI * PI * sx * s]
+}
+
+impl Manufactured {
+    fn value(&self, x: f64, z: f64, t: f64) -> f64 {
+        self.f0 + AMPLITUDE * (-t).exp() * (self.g)(x, z)[0]
+    }
+
+    /// The source that makes F exact. SA's transport with the model off, on the unit square in
+    /// the diffusive time τ:
+    /// ∂F/∂τ + a ∂F/∂X = (1/σ)[∇·((ν + F)∇F) + c_b2 |∇F|²] + S,
+    /// and ∇·((ν + F)∇F) = (ν + F)∇²F + |∇F|², so
+    /// S = ∂F/∂τ + a F_X − (1/σ)[(ν + F)(F_XX + F_ZZ) + (1 + c_b2)(F_X² + F_Z²)],
+    /// with ∂F/∂τ = −A e^(−τ) G and every other derivative A e^(−τ) times G's.
+    fn source(&self, x: f64, z: f64, t: f64, speed: f64) -> f64 {
+        let e = AMPLITUDE * (-t).exp();
+        let [g, gx, gz, gxx, gzz] = (self.g)(x, z);
+        let f = self.f0 + e * g;
+        let (fx, fz) = (e * gx, e * gz);
+        -e * g + speed * fx - ((NU + f) * e * (gxx + gzz) + (1.0 + C_B2) * (fx * fx + fz * fz)) / SIGMA
+    }
+}
+
+/// Run `field` on an N × 1 × N box with the given faces to τ = 1/8 and measure it against `m`.
+///
+/// Lattice units, Δx = 1: the cell (i, k) is at X = (i + ½)/N, Z = (k + ½)/N; one lattice step is
+/// Δτ = 1/N² (diffusive scaling, so ν̃ and ν are the same lattice numbers on every grid and the
+/// time error, O(Δτ), falls as fast as the second-order space error); the lattice velocity is
+/// a/N and the source per lattice step S/N².
+fn run_box(m: &Manufactured, faces: [BoxFace; 6], speed: f64, n: usize) -> Errors {
+    let cells = n * n;
+    let at = |c: usize| (((c % n) as f64 + 0.5) / n as f64, ((c / n) as f64 + 0.5) / n as f64);
+    let mut field = SaField::boxed([n, 1, n], &vec![true; cells], faces, m.f0, 0.0).unwrap();
+    let initial: Vec<f64> = (0..cells).map(|c| { let (x, z) = at(c); m.value(x, z, 0.0) }).collect();
+    field.set_nu_tilde(&initial).unwrap();
+    let u = vec![[speed / n as f64, 0.0, 0.0]; cells];
+    let zeros = vec![0.0; cells];
+    let steps = n * n / 8;
+    let dt = 1.0 / (n * n) as f64;
+    for s in 0..steps {
+        let t = s as f64 * dt;
+        let source: Vec<f64> = (0..cells).map(|c| { let (x, z) = at(c); m.source(x, z, t, speed) * dt }).collect();
+        let input = SaInput { u: &u, vorticity: &zeros, length: &zeros, nu: NU, model: false, source: Some(&source) };
+        field.advance(&input).unwrap();
+    }
+    let t = steps as f64 * dt;
+    let (mut sum, mut max) = (0.0f64, 0.0f64);
+    for (c, v) in field.nu_tilde().iter().enumerate() {
+        let (x, z) = at(c);
+        let e = v - m.value(x, z, t);
+        sum += e * e;
+        max = max.max(e.abs());
+    }
+    Errors { l2: (sum / cells as f64).sqrt(), linf: max }
+}
+
+const WALL: Manufactured = Manufactured { f0: 0.0, g: wall_g };
+const INFLOW: Manufactured = Manufactured { f0: 0.02, g: inflow_g };
+/// x periodic, a wall at z = 0 and an open face at z = 1 (y one periodic cell).
+const WALL_FACES: [BoxFace; 6] = [BoxFace::Periodic, BoxFace::Periodic, BoxFace::Periodic, BoxFace::Periodic, BoxFace::Wall, BoxFace::Open];
+/// An inflow face at x = 0, an open outlet at x = 1, z periodic.
+const INFLOW_FACES: [BoxFace; 6] = [BoxFace::Inflow, BoxFace::Open, BoxFace::Periodic, BoxFace::Periodic, BoxFace::Periodic, BoxFace::Periodic];
+
+/// The hand-written derivatives agree with central differences of G (h = 1e-4, so the check
+/// holds to about 1e-6 of the derivative's scale).
+#[test]
+fn the_manufactured_derivatives_are_right() {
+    let h = 1e-4;
+    for g in [wall_g as fn(f64, f64) -> [f64; 5], inflow_g] {
+        for &(x, z) in &[(0.1, 0.2), (0.37, 0.81), (0.9, 0.55), (0.5, 0.05)] {
+            let [g0, gx, gz, gxx, gzz] = g(x, z);
+            let numeric = [
+                (g(x + h, z)[0] - g(x - h, z)[0]) / (2.0 * h),
+                (g(x, z + h)[0] - g(x, z - h)[0]) / (2.0 * h),
+                (g(x + h, z)[0] - 2.0 * g0 + g(x - h, z)[0]) / (h * h),
+                (g(x, z + h)[0] - 2.0 * g0 + g(x, z - h)[0]) / (h * h),
+            ];
+            for (want, got) in numeric.iter().zip([gx, gz, gxx, gzz]) {
+                assert!((want - got).abs() < 1e-5 * (1.0 + got.abs()), "({x}, {z}): {want} vs {got}");
+            }
+        }
+    }
+}
+
+/// Advection, diffusion and the c_b2 term through a wall face: first order (upwind advection).
+#[test]
+fn sa_transport_next_to_a_wall_is_first_order() {
+    let p = study("SaField, wall face, advection + diffusion + c_b2", &GRIDS, |n| run_box(&WALL, WALL_FACES, SPEED, n));
+    let (l2, linf) = p[1];
+    assert!((0.9..=1.2).contains(&l2) && (0.9..=1.2).contains(&linf), "{p:?}");
+}
+
+/// Diffusion and the c_b2 term alone through a wall face: second order.
+#[test]
+fn sa_diffusion_next_to_a_wall_is_second_order() {
+    let p = study("SaField, wall face, diffusion + c_b2", &GRIDS, |n| run_box(&WALL, WALL_FACES, 0.0, n));
+    let (l2, linf) = p[1];
+    assert!((1.8..=2.2).contains(&l2) && (1.8..=2.2).contains(&linf), "{p:?}");
+}
+
+/// Advection, diffusion and the c_b2 term behind an inflow face (ν̃ = 0.02 there) to an open
+/// outlet: first order.
+#[test]
+fn sa_transport_behind_an_inflow_is_first_order() {
+    let p = study("SaField, inflow face, advection + diffusion + c_b2", &GRIDS, |n| run_box(&INFLOW, INFLOW_FACES, SPEED, n));
+    let (l2, linf) = p[1];
+    assert!((0.9..=1.2).contains(&l2) && (0.9..=1.2).contains(&linf), "{p:?}");
+}
+
+/// Diffusion and the c_b2 term alone behind an inflow face: second order.
+#[test]
+fn sa_diffusion_behind_an_inflow_is_second_order() {
+    let p = study("SaField, inflow face, diffusion + c_b2", &GRIDS, |n| run_box(&INFLOW, INFLOW_FACES, 0.0, n));
+    let (l2, linf) = p[1];
+    assert!((1.8..=2.2).contains(&l2) && (1.8..=2.2).contains(&linf), "{p:?}");
 }
