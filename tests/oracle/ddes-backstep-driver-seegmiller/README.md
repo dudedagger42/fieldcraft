@@ -47,6 +47,6 @@ from negative to positive after the shear's minimum, by linear interpolation bet
 centres, divided by H. C_f and C_p are formed with ρ and U_ref at x/H = −4 (the centre-channel
 speed there) for comparison with `experiment.json`.
 
-**Statistics.** The hybrid run is unsteady: its time means use block means (≥ 20 blocks, 95 %
-half-width below 1 %, lag-1 correlation of the block means within ±0.5), the stop rule of the
-existing channel studies; otherwise the result is reported inconclusive.
+**Statistics.** The hybrid run is unsteady: the reattachment's block means must pass the shared
+acceptance of the LES studies (`fieldcraft_lbm::statistics`, #796); otherwise the result is
+reported inconclusive.
