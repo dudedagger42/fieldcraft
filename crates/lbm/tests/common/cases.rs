@@ -92,14 +92,49 @@ pub fn reattachment(xs: &[f64], tau: &[f64]) -> Result<f64, NoReattachment> {
     }
 }
 
-/// Whether a sampled history has settled: every channel's latest value differs from its value
-/// `window` samples earlier by less than `relative` of its magnitude. `history` holds one row of
-/// channels per sample. Too short a history is not settled.
-pub fn settled(history: &[Vec<f64>], window: usize, relative: f64) -> bool {
-    let (Some(last), Some(then)) = (history.last(), history.len().checked_sub(window + 1).and_then(|k| history.get(k))) else {
+/// When a gated case has settled: after at least `min_flow_throughs` flow-throughs, the time
+/// mean of every gated quantity over the last averaging window differs from its mean over the
+/// window before by less than `drift` of its magnitude. Each case sets its averaging window to
+/// whole periods of its slowest oscillation (on the plate, the domain's acoustic quarter wave), so
+/// a stationary oscillation does not read as drift.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Settling {
+    pub min_flow_throughs: f64,
+    pub drift: f64,
+}
+
+/// The board's settling rule for the gated benchmark cases: 2DZP, the Driver & Seegmiller step
+/// and the SA channel use this, never their own numbers.
+pub const GATED: Settling = Settling { min_flow_throughs: 2.0, drift: 1e-3 };
+
+impl Settling {
+    /// Whether `history` (one row of quantities per sample) has settled after `flow_throughs`,
+    /// with averaging windows of `window` samples.
+    pub fn settled(&self, history: &[Vec<f64>], window: usize, flow_throughs: f64) -> bool {
+        flow_throughs >= self.min_flow_throughs && means_settled(history, window, self.drift)
+    }
+}
+
+/// The mean of each column of `rows` (`None` for no rows or rows of different lengths).
+pub fn column_means(rows: &[Vec<f64>]) -> Option<Vec<f64>> {
+    let first = rows.first()?;
+    if rows.iter().any(|r| r.len() != first.len()) {
+        return None;
+    }
+    Some((0..first.len()).map(|c| rows.iter().map(|r| r[c]).sum::<f64>() / rows.len() as f64).collect())
+}
+
+/// Whether the means of the last `window` rows of `history` differ from the means of the `window`
+/// rows before them by less than `relative` of their magnitude in every column. Too short a
+/// history, or a non-finite mean, is not settled.
+pub fn means_settled(history: &[Vec<f64>], window: usize, relative: f64) -> bool {
+    let Some(start) = history.len().checked_sub(2 * window) else {
         return false;
     };
-    window > 0 && last.len() == then.len() && last.iter().zip(then).all(|(a, b)| a.is_finite() && (a - b).abs() <= relative * a.abs())
+    let (Some(then), Some(now)) = (column_means(&history[start..start + window]), column_means(&history[start + window..])) else {
+        return false;
+    };
+    window > 0 && now.len() == then.len() && now.iter().zip(&then).all(|(a, b)| a.is_finite() && b.is_finite() && (a - b).abs() <= relative * a.abs())
 }
 
 /// The force groups of every face of obstacle `body`. A wall strip's shear is the sum: a wall
