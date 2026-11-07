@@ -1179,8 +1179,11 @@ impl Flow {
                         BoxFace::ALL.iter().map(|f| wall_velocity(*f).is_some()).chain(obstacle_walls.iter().map(Option::is_some)).collect();
                     crate::distance::WallSurface::from_links(&grid, &links, &no_slip)?
                 };
-                // The setup checked the grid against the run's caps and the memory estimate
-                // counts the distance's working memory, so its own caps are the solver's widest.
+                // The run's own Limits do not reach Flow::new, and need not: Setup::new checks the
+                // grid against them and the solve checks them against the memory estimate
+                // (Memory::of(..).check), which counts the distance's working memory, before the
+                // flow is built. The transform's own caps here are only the solver's widest
+                // (every addressable cell, the default memory cap).
                 let caps = crate::Limits { max_cells: crate::Limits::MAX_ADDRESSABLE_CELLS, ..crate::Limits::default() };
                 let distance = crate::distance::WallDistance::new(&grid, mask, &surface, periodic, &caps)?;
                 let inflow = sa.inflow_ratio * nu;
