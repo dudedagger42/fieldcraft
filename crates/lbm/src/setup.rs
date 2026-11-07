@@ -46,9 +46,10 @@ pub const AUTO_TAU_MAX: f64 = 1.0;
 pub const MAX_MACH: f64 = 0.3;
 /// The smallest symmetric relaxation time τ⁺.
 pub const MIN_TAU: f64 = 0.505;
-/// The smallest τ⁺ of the fluid itself with a turbulence model: the eddy viscosity raises each
+/// The smallest τ⁺ of the fluid itself with an algebraic turbulence model: the eddy viscosity raises each
 /// sheared cell's own relaxation time above it, which is what lets a coarse grid hold a fast
-/// flow (a cell Reynolds number of 90 is τ⁺ ≈ 0.503 at lattice speed 0.1).
+/// flow (a cell Reynolds number of 90 is τ⁺ ≈ 0.503 at lattice speed 0.1). The Spalart–Allmaras model
+/// does not get it: its eddy viscosity is zero at the walls, and where ν̃ is, so it keeps [`MIN_TAU`].
 pub const MIN_TAU_TURBULENT: f64 = 0.5001;
 /// The largest lattice acceleration `a Δt² / Δx`.
 pub const MAX_LATTICE_ACCELERATION: f64 = 0.01;
@@ -275,6 +276,11 @@ pub struct Setup {
     /// Vreman's model constant c = 2.5 C_s² of its eddy viscosity ([`crate::vreman`]; 0: none).
     /// At most one of `smagorinsky` and `vreman` is above 0.
     pub vreman: f64,
+    /// The Spalart–Allmaras model, when the step takes it ([`crate::sa`]): its eddy viscosity
+    /// then comes from the transported ν̃. Neither `smagorinsky` nor `vreman` is set with it.
+    pub spalart_allmaras: Option<SaSetup>,
+    /// The limits the setup was checked against: the wall distance's transform (Spalart–Allmaras) is built under them too.
+    pub limits: Limits,
     /// Van Driest's damping constant A⁺ of the length scale near walls (none: no damping).
     pub van_driest: Option<f64>,
     /// The wall model of the fluid cells next to no-slip walls (none: the bounce-back alone).
@@ -304,6 +310,13 @@ pub struct Setup {
     /// the cells' range, and that range.
     pub shear_dependent_tau: Option<crate::solve::ShearDependentTau>,
     pub warnings: Vec<String>,
+}
+
+/// The Spalart–Allmaras model's settings ([`crate::sa`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SaSetup {
+    /// ν̃/ν at inflows and in the initial field.
+    pub inflow_ratio: f64,
 }
 
 /// What a zone of the domain does, in lattice units.
@@ -642,11 +655,14 @@ impl Setup {
             if domain.free_surface.is_some() {
                 return refuse("with a free surface (`free_surface`)".into());
             }
+            if matches!(turbulence, Some(Turbulence::SpalartAllmaras { .. })) {
+                return refuse("with the Spalart–Allmaras model (`spalart_allmaras`)".into());
+            }
         }
         let walls = *walls;
         let domain = domain.clone();
-        let (smagorinsky, vreman, turbulent_prandtl, van_driest, wall_model) = match turbulence {
-            None => (0.0, 0.0, 0.9, None, None),
+        let (smagorinsky, vreman, spalart_allmaras, turbulent_prandtl, van_driest, wall_model) = match turbulence {
+            None => (0.0, 0.0, None, 0.9, None, None),
             Some(t) => {
                 let (prandtl, van_driest) = (t.prandtl(), t.van_driest());
                 if !(prandtl.is_finite() && TURBULENT_PRANDTL.contains(&prandtl)) {
@@ -656,15 +672,31 @@ impl Setup {
                         TURBULENT_PRANDTL.end()
                     )));
                 }
-                let (smagorinsky, vreman, constant, what, usual) = match *t {
-                    Turbulence::Smagorinsky { constant, .. } => (constant, 0.0, constant, "the Smagorinsky constant", "0.1 to 0.2"),
-                    Turbulence::Vreman { constant, .. } => (
+                let subgrid = |smagorinsky: f64, vreman: f64, constant: f64, what: &str, usual: &str| {
+                    if !(constant.is_finite() && constant > 0.0 && constant <= MAX_SMAGORINSKY) {
+                        return Err(Error::Invalid(format!(
+                            "{what} is {constant}: give one above 0 and at most {MAX_SMAGORINSKY} ({usual} is usual)"
+                        )));
+                    }
+                    if let Some(a_plus) = van_driest.filter(|a| !(a.is_finite() && VAN_DRIEST.contains(a))) {
+                        return Err(Error::Invalid(format!(
+                            "Van Driest's damping constant A⁺ is {a_plus}: give one from {} to {} (26 is usual)",
+                            VAN_DRIEST.start(),
+                            VAN_DRIEST.end()
+                        )));
+                    }
+                    Ok((smagorinsky, vreman, None, prandtl, van_driest, t.wall_model()))
+                };
+                match *t {
+                    Turbulence::Smagorinsky { constant, .. } => subgrid(constant, 0.0, constant, "the Smagorinsky constant", "0.1 to 0.2")?,
+                    Turbulence::Vreman { constant, .. } => subgrid(
                         0.0,
                         crate::vreman::model_constant(constant),
                         constant,
                         "the constant of Vreman's model (the Smagorinsky-equivalent C_s of c = 2.5 C_s²)",
                         "0.17 to 0.18",
-                    ),
+                    )?,
+                    // No subgrid constant and no Van Driest damping (the variant has no such field).
                     Turbulence::SpalartAllmaras { inflow_ratio, .. } => {
                         if !(inflow_ratio.is_finite() && SA_INFLOW_RATIO.contains(&inflow_ratio)) {
                             return Err(Error::Invalid(format!(
@@ -673,22 +705,16 @@ impl Setup {
                                 SA_INFLOW_RATIO.end()
                             )));
                         }
-                        return Err(Error::Invalid(
-                            "not supported yet: the Spalart–Allmaras model (`spalart_allmaras`) is not coupled to the flow solver yet; use `smagorinsky` or `vreman`".into(),
-                        ));
+                        // A wall law replaces ν_t at the wall cell while ν̃ keeps its ν̃ = 0 condition and a wall distance of half a cell there,
+                        // at a cell meant for y⁺ 30 to 100: the two are inconsistent until one law is chosen with SA's own verification case.
+                        if let Some(law) = t.wall_model() {
+                            return Err(Error::Invalid(format!(
+                                "not supported yet: the wall model {law:?} with `spalart_allmaras`: the model resolves the wall (ν̃ = 0 there) and a wall function would replace its eddy viscosity; use a grid whose first cell is at y⁺ near 1, without `wall_model`"
+                            )));
+                        }
+                        (0.0, 0.0, Some(SaSetup { inflow_ratio }), prandtl, None, None)
                     }
-                };
-                if !(constant.is_finite() && constant > 0.0 && constant <= MAX_SMAGORINSKY) {
-                    return Err(Error::Invalid(format!("{what} is {constant}: give one above 0 and at most {MAX_SMAGORINSKY} ({usual} is usual)")));
                 }
-                if let Some(a_plus) = van_driest.filter(|a| !(a.is_finite() && VAN_DRIEST.contains(a))) {
-                    return Err(Error::Invalid(format!(
-                        "Van Driest's damping constant A⁺ is {a_plus}: give one from {} to {} (26 is usual)",
-                        VAN_DRIEST.start(),
-                        VAN_DRIEST.end()
-                    )));
-                }
-                (smagorinsky, vreman, prandtl, van_driest, t.wall_model())
             }
         };
         let material = model.material(&domain.material);
@@ -959,7 +985,11 @@ impl Setup {
             shear_dependent_floor(r, &domain, initial_kelvin, tau_plus, &mut warnings)?;
             tau_plus.clamp(r.tau[0], r.tau[1])
         } else {
-            let min_tau = if turbulence.is_some() { MIN_TAU_TURBULENT } else { MIN_TAU };
+            // The Spalart–Allmaras model keeps the laminar floor: its eddy viscosity goes to zero at a wall and is zero wherever
+            // ν̃ is, so a sheared cell is not raised above the fluid's own τ⁺ as an algebraic model's is.
+            let sa = matches!(turbulence, Some(Turbulence::SpalartAllmaras { .. }));
+            let eddy = turbulence.is_some() && !sa;
+            let min_tau = if eddy { MIN_TAU_TURBULENT } else { MIN_TAU };
             if !(tau_plus >= min_tau) {
                 let model = if turbulence.is_some() { "" } else { ", or add a turbulence model (`turbulence`)" };
                 return Err(Error::Invalid(format!(
@@ -1162,6 +1192,11 @@ impl Setup {
                 "dynamic σ needs a subgrid model's eddy viscosity: add `turbulence` (Vreman's or Smagorinsky's model)".into(),
             ));
         }
+        if dynamic_sigma && spalart_allmaras.is_some() {
+            return Err(Error::Invalid(
+                "not supported yet: dynamic σ with the Spalart–Allmaras model, whose Reynolds-averaged eddy viscosity is not a subgrid one; give a fixed `sigma`".into(),
+            ));
+        }
         let hybrid_sigma = HrrSigma::fixed(*sigma);
         if collision != Collision::Hrr && sigma.is_some() {
             warnings.push(format!("the hybrid collision's σ (`sigma`) has no effect with the {} collision", collision.name()));
@@ -1210,6 +1245,8 @@ impl Setup {
             dynamic_sigma,
             smagorinsky,
             vreman,
+            spalart_allmaras,
+            limits: *limits,
             van_driest,
             wall_model,
             walls,
@@ -1236,9 +1273,10 @@ impl Setup {
         self.grid.spacing.powi(3) / self.time_step
     }
 
-    /// Whether a subgrid model (Smagorinsky's or Vreman's) gives the cells an eddy viscosity.
+    /// Whether a turbulence model (Smagorinsky's, Vreman's or Spalart–Allmaras) gives the cells
+    /// an eddy viscosity.
     pub fn turbulent(&self) -> bool {
-        self.smagorinsky > 0.0 || self.vreman > 0.0
+        self.smagorinsky > 0.0 || self.vreman > 0.0 || self.spalart_allmaras.is_some()
     }
 
     /// Model units per lattice unit of velocity, pressure and force.
