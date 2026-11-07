@@ -13,6 +13,7 @@
 //!   (Darcy–Forchheimer resistance) as body forces.
 //! - [`distance`]: every fluid cell's exact distance to the nearest no-slip wall, for
 //!   turbulence models that read it.
+//! - [`ddes`]: delayed detached-eddy simulation's shielding function and length scale.
 //! - [`bounce`]: Han, Ooka and Kikumoto's on-node wall-function bounce (their eq. 14).
 //! - [`outlet`]: convective pressure outlets, which carry a wake or vortices out of the box.
 //! - [`solve`]: the time loop, output frames and force histories in model units.
@@ -66,6 +67,7 @@ pub mod backend;
 pub mod bounce;
 pub mod checkpoint;
 pub mod conduction;
+pub mod ddes;
 pub mod distance;
 pub mod flow;
 pub mod hrr;
