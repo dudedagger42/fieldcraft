@@ -225,7 +225,12 @@ fn run_box(m: &Manufactured, faces: [BoxFace; 6], speed: f64, n: usize) -> Error
     let cells = n * n;
     let at = |c: usize| (((c % n) as f64 + 0.5) / n as f64, ((c / n) as f64 + 0.5) / n as f64);
     let mut field = SaField::boxed([n, 1, n], &vec![true; cells], faces, m.f0, 0.0).unwrap();
-    let initial: Vec<f64> = (0..cells).map(|c| { let (x, z) = at(c); m.value(x, z, 0.0) }).collect();
+    let initial: Vec<f64> = (0..cells)
+        .map(|c| {
+            let (x, z) = at(c);
+            m.value(x, z, 0.0)
+        })
+        .collect();
     field.set_nu_tilde(&initial).unwrap();
     let u = vec![[speed / n as f64, 0.0, 0.0]; cells];
     let zeros = vec![0.0; cells];
@@ -233,7 +238,12 @@ fn run_box(m: &Manufactured, faces: [BoxFace; 6], speed: f64, n: usize) -> Error
     let dt = 1.0 / (n * n) as f64;
     for s in 0..steps {
         let t = s as f64 * dt;
-        let source: Vec<f64> = (0..cells).map(|c| { let (x, z) = at(c); m.source(x, z, t, speed) * dt }).collect();
+        let source: Vec<f64> = (0..cells)
+            .map(|c| {
+                let (x, z) = at(c);
+                m.source(x, z, t, speed) * dt
+            })
+            .collect();
         let input = SaInput { u: &u, vorticity: &zeros, length: &zeros, nu: NU, model: false, source: Some(&source) };
         field.advance(&input).unwrap();
     }
