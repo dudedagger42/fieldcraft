@@ -28,12 +28,21 @@
 //! filter with a model viscosity, and Spalart–Allmaras' ν_t would let the filter's dissipation grow
 //! with the RANS eddy viscosity inside the boundary layer.
 //!
-//! These are pure functions of a cell's values; every one stays finite and in range for any
-//! input, hostile included (see each).
+//! [`r_d`], [`f_d`] and [`length`] are pure functions of a cell's values; every one stays finite
+//! and in range for any input, hostile included (see each). [`length_field`] applies them to every
+//! cell of a grid, with each cell's velocity gradient from its neighbours' velocities.
 //!
 //! No code of any flow solver was read; this is written from the paper.
 
-/// Kármán's constant in `r_d`, the paper's.
+use fieldcraft_parallel as parallel;
+
+use crate::distance::WallDistance;
+use crate::flow::neighbour;
+use crate::voxel::Grid;
+use crate::{Error, Result};
+
+/// Kármán's constant in `r_d`, the paper's. It becomes Spalart–Allmaras' own (`sa::KAPPA`, the same
+/// 0.41) when that model lands, so that the model, DDES and the wall coupling read one κ.
 pub const KAPPA: f64 = 0.41;
 
 /// The DDES constant C_DES of the paper, for Spalart–Allmaras.
@@ -84,9 +93,99 @@ pub fn length(d: f64, delta: f64, f_d: f64, c_des: f64) -> f64 {
     (d - f * (d - les)).clamp(les, d)
 }
 
+/// The cells of one parallel task of [`length_field`]: fixed, so the result does not depend on the
+/// number of threads.
+const BLOCK: usize = 4096;
+
+/// What [`length_field`] found: the share of fluid cells in LES mode (`f_d > 0.5`) and the largest
+/// `f_d` of any fluid cell (both 0 without fluid cells).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct DdesStats {
+    pub les_fraction: f64,
+    pub max_f_d: f64,
+}
+
+/// Every cell's DDES length `d̃` into `out` (0 in cells that are not fluid), from the wall distance
+/// `d`, each cell's `nu_total` = ν + ν_t and the cell velocities `velocity` (the pass before the
+/// collision, the field the hybrid collision and Vreman's model read), on `grid` with `fluid` cells
+/// and the `periodic` axes; `delta` is the filter width Δ (the cell size: 1 in lattice units on a
+/// uniform grid, each level's own under refinement) and `c_des` C_DES. Run by fixed blocks of cells
+/// in parallel: the same result on any number of threads.
+///
+/// Each cell's velocity gradient is [`crate::hrr::gradient`]'s, from the velocities of its six
+/// neighbours (centred differences, one-sided where a neighbour is not fluid, across periodic
+/// faces): `g[a][b] = ∂_a u_b`, the transpose of the paper's `U_ij = ∂u_i/∂x_j`; `r_d` reads only
+/// its norm `√(g_ab g_ab)`, which the transpose does not change.
+///
+/// Refused when a slice's length differs from the grid's cell count, or `delta` or `c_des` is not a
+/// finite number ≥ 0. Hostile cell values stay in range ([`r_d`], [`f_d`], [`length`]).
+#[allow(clippy::too_many_arguments)]
+pub fn length_field(
+    d: &WallDistance,
+    nu_total: &[f64],
+    velocity: &[[f64; 3]],
+    grid: &Grid,
+    fluid: &[bool],
+    periodic: [bool; 3],
+    delta: f64,
+    c_des: f64,
+    out: &mut [f64],
+) -> Result<DdesStats> {
+    let [nx, ny, nz] = grid.cells;
+    let n =
+        nx.checked_mul(ny).and_then(|v| v.checked_mul(nz)).ok_or_else(|| Error::Limit(format!("{nx} × {ny} × {nz} cells cannot be addressed")))?;
+    let distance = d.as_slice();
+    let lengths = [
+        ("wall distances", distance.len()),
+        ("viscosities", nu_total.len()),
+        ("velocities", velocity.len()),
+        ("fluid flags", fluid.len()),
+        ("lengths", out.len()),
+    ];
+    if let Some((what, len)) = lengths.iter().find(|(_, len)| *len != n) {
+        return Err(Error::Invalid(format!("{len} {what} for a grid of {n} cells")));
+    }
+    if !(delta.is_finite() && delta >= 0.0 && c_des.is_finite() && c_des >= 0.0) {
+        return Err(Error::Invalid(format!("the DDES filter width {delta} and constant {c_des} must be finite numbers ≥ 0")));
+    }
+    // Each block: its lengths, its fluid and LES cell counts and its largest f_d.
+    let mut parts: Vec<(&mut [f64], [usize; 2], f64)> = out.chunks_mut(BLOCK).map(|c| (c, [0; 2], 0.0)).collect();
+    parallel::for_each_mut(&mut parts, |b, (chunk, counts, max)| {
+        for (i, slot) in chunk.iter_mut().enumerate() {
+            let cell = b * BLOCK + i;
+            *slot = 0.0;
+            if !fluid.get(cell).copied().unwrap_or(false) {
+                continue;
+            }
+            let dc = distance.get(cell).copied().unwrap_or(0.0);
+            let nu = nu_total.get(cell).copied().unwrap_or(0.0);
+            let f = f_d(r_d(nu, &cell_gradient(grid, periodic, fluid, velocity, cell), dc));
+            *slot = length(dc, delta, f, c_des);
+            counts[0] += 1;
+            counts[1] += usize::from(f > 0.5);
+            *max = max.max(f);
+        }
+    });
+    let (cells, les, max) = parts.iter().fold((0usize, 0usize, 0.0f64), |(c, l, m), (_, k, x)| (c + k[0], l + k[1], m.max(*x)));
+    Ok(DdesStats { les_fraction: if cells > 0 { les as f64 / cells as f64 } else { 0.0 }, max_f_d: max })
+}
+
+/// Cell `cell`'s velocity gradient `g[a][b] = ∂_a u_b` ([`crate::hrr::gradient`]) from the
+/// velocities of its fluid neighbours. Kept apart so that one pass can later give the gradient to
+/// both Spalart–Allmaras and DDES.
+fn cell_gradient(grid: &Grid, periodic: [bool; 3], fluid: &[bool], velocity: &[[f64; 3]], cell: usize) -> [[f64; 3]; 3] {
+    let p = grid.coords(cell);
+    let u = velocity.get(cell).copied().unwrap_or([0.0; 3]);
+    let nb: crate::hrr::Neighbours =
+        [0, 1, 2].map(|axis| [false, true].map(|up| neighbour(grid, periodic, fluid, p, axis, up).and_then(|c| velocity.get(c).copied())));
+    crate::hrr::gradient(u, &nb)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Limits;
+    use crate::distance::WallSurface;
 
     /// (ν + ν_t, ∂u_i/∂x_j row by row, d, r_d, f_d, d̃ with Δ = 1 and C_DES = 0.65), the last
     /// three evaluated from the paper's formulae in 50-digit decimal arithmetic.
@@ -179,5 +278,145 @@ mod tests {
         assert_eq!(length(5.0, -1.0, 1.0, C_DES), 5.0);
         assert_eq!(f_d(f64::NAN), 0.0);
         assert_eq!(f_d(-3.0), 1.0);
+    }
+
+    fn grid(cells: [usize; 3]) -> Grid {
+        Grid { origin: [0.0; 3], spacing: 1.0, cells }
+    }
+
+    /// A wall plane at y = −½ under a grid periodic along x and z.
+    fn floor(g: &Grid, fluid: &[bool]) -> WallDistance {
+        let [nx, _, nz] = g.cells;
+        let pts: Vec<[f64; 3]> = (0..nz).flat_map(|k| (0..nx).map(move |i| [i as f64, -0.5, k as f64])).collect();
+        WallDistance::new(g, fluid, &WallSurface::from_points(&pts).unwrap(), [true, false, true], &Limits::default()).unwrap()
+    }
+
+    /// A deterministic field: velocities and viscosities that vary from cell to cell.
+    fn field(g: &Grid) -> (Vec<f64>, Vec<[f64; 3]>) {
+        let nu = (0..g.len()).map(|c| 1e-3 * (1.0 + (c % 7) as f64)).collect();
+        let u = (0..g.len())
+            .map(|c| {
+                let [i, j, k] = g.coords(c).map(|v| v as f64);
+                [0.01 * j + 0.002 * (i * 0.7).sin(), 0.001 * (k * 0.3).cos(), 0.0005 * i]
+            })
+            .collect();
+        (nu, u)
+    }
+
+    #[test]
+    fn rans_where_the_les_length_exceeds_every_distance() {
+        let g = grid([6, 9, 5]);
+        let mut fluid = vec![true; g.len()];
+        fluid[17] = false;
+        let d = floor(&g, &fluid);
+        let (nu, u) = field(&g);
+        let max = d.as_slice().iter().copied().fold(0.0, f64::max);
+        let mut out = vec![-1.0; g.len()];
+        length_field(&d, &nu, &u, &g, &fluid, [true, false, true], max / C_DES + 1.0, C_DES, &mut out).unwrap();
+        assert!(out.iter().zip(d.as_slice()).all(|(a, b)| a.to_bits() == b.to_bits()));
+        // At C_DES Δ = max d exactly too.
+        length_field(&d, &nu, &u, &g, &fluid, [true, false, true], max, 1.0, &mut out).unwrap();
+        assert!(out.iter().zip(d.as_slice()).all(|(a, b)| a.to_bits() == b.to_bits()));
+    }
+
+    #[test]
+    fn same_on_any_number_of_threads() {
+        let g = grid([24, 20, 24]);
+        let fluid = vec![true; g.len()];
+        let d = floor(&g, &fluid);
+        let (nu, u) = field(&g);
+        let run = |t| {
+            parallel::with_threads(t, || {
+                let mut out = vec![0.0; g.len()];
+                let s = length_field(&d, &nu, &u, &g, &fluid, [true, false, true], 1.0, C_DES, &mut out).unwrap();
+                (out, s)
+            })
+        };
+        let one = run(1);
+        assert!(one.1.les_fraction > 0.0 && one.1.les_fraction < 1.0, "{:?}", one.1);
+        for t in [2, 7] {
+            let other = run(t);
+            assert!(one.0.iter().zip(&other.0).all(|(a, b)| a.to_bits() == b.to_bits()) && one.1 == other.1, "{t} threads");
+        }
+    }
+
+    #[test]
+    fn stats_equal_a_hand_count() {
+        // At rest the gradient norm is floored: ν_total = 0 gives r_d = 0 (f_d = 1), any
+        // ν_total > 0 a huge r_d (f_d = 0).
+        let g = grid([4, 4, 4]);
+        let mut fluid = vec![true; 64];
+        fluid[0] = false;
+        let d = floor(&g, &fluid);
+        let u = vec![[0.0; 3]; 64];
+        let mut nu = vec![1e-3; 64];
+        for c in [0, 5, 9, 22, 31, 40, 41, 63] {
+            nu[c] = 0.0;
+        }
+        let mut out = vec![0.0; 64];
+        let s = length_field(&d, &nu, &u, &g, &fluid, [true, false, true], 1.0, C_DES, &mut out).unwrap();
+        // Seven LES cells (cell 0 is solid) of 63 fluid cells.
+        assert_eq!(s, DdesStats { les_fraction: 7.0 / 63.0, max_f_d: 1.0 });
+        let s = length_field(&d, &[1e-3; 64], &u, &g, &fluid, [true, false, true], 1.0, C_DES, &mut out).unwrap();
+        assert_eq!(s, DdesStats { les_fraction: 0.0, max_f_d: 0.0 });
+        let s = length_field(&d, &nu, &u, &g, &[false; 64], [true, false, true], 1.0, C_DES, &mut out).unwrap();
+        assert_eq!(s, DdesStats::default());
+        assert!(out.iter().all(|v| *v == 0.0));
+    }
+
+    #[test]
+    fn linear_shear_gives_the_hand_r_d() {
+        // u = (γ y, 0, 0), γ = 2⁻¹⁰, ν_total = 0.01, a wall at y = −½: r_d = ν / (γ κ² (j + ½)²),
+        // evaluated in 50-digit decimal arithmetic for the interior rows j = 1 … 6.
+        const HAND: [f64; 6] = [27.073831713926896, 9.746579417013683, 4.972744600517185, 3.008203523769655, 2.013756077895389, 1.4418016889073495];
+        let gamma = 1.0 / 1024.0;
+        let g = grid([5, 8, 4]);
+        let fluid = vec![true; g.len()];
+        let d = floor(&g, &fluid);
+        let u: Vec<[f64; 3]> = (0..g.len()).map(|c| [gamma * g.coords(c)[1] as f64, 0.0, 0.0]).collect();
+        let nu = vec![0.01; g.len()];
+        let mut out = vec![0.0; g.len()];
+        length_field(&d, &nu, &u, &g, &fluid, [true, false, true], 1.0, C_DES, &mut out).unwrap();
+        for c in 0..g.len() {
+            let j = g.coords(c)[1];
+            let r = r_d(0.01, &cell_gradient(&g, [true, false, true], &fluid, &u, c), d.as_slice()[c]);
+            if (1..=6).contains(&j) {
+                let hand = HAND[j - 1];
+                assert!((r - hand).abs() <= 1e-15 * hand, "row {j}: r_d {r} vs {hand}");
+            }
+            assert_eq!(out[c].to_bits(), length(d.as_slice()[c], 1.0, f_d(r), C_DES).to_bits());
+        }
+    }
+
+    #[test]
+    fn refuses_mismatched_input_and_stays_in_range_on_hostile_values() {
+        let g = grid([4, 5, 4]);
+        let n = g.len();
+        let fluid = vec![true; n];
+        let d = floor(&g, &fluid);
+        let (nu, u) = field(&g);
+        let mut out = vec![0.0; n];
+        let p = [true, false, true];
+        assert!(length_field(&d, &nu[1..], &u, &g, &fluid, p, 1.0, C_DES, &mut out).is_err());
+        assert!(length_field(&d, &nu, &u[1..], &g, &fluid, p, 1.0, C_DES, &mut out).is_err());
+        assert!(length_field(&d, &nu, &u, &g, &fluid[1..], p, 1.0, C_DES, &mut out).is_err());
+        assert!(length_field(&d, &nu, &u, &g, &fluid, p, 1.0, C_DES, &mut out[1..]).is_err());
+        assert!(length_field(&d, &nu, &u, &grid([4, 5, 5]), &fluid, p, 1.0, C_DES, &mut out).is_err());
+        assert!(length_field(&d, &nu, &u, &grid([usize::MAX, 3, 3]), &fluid, p, 1.0, C_DES, &mut out).is_err());
+        for (delta, c) in [(f64::NAN, C_DES), (-1.0, C_DES), (1.0, f64::INFINITY), (1.0, -0.1)] {
+            assert!(length_field(&d, &nu, &u, &g, &fluid, p, delta, c, &mut out).is_err(), "{delta} {c}");
+        }
+        // W2's hostile values in every cell's viscosity and velocity.
+        let values =
+            [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1e300, -1.0, -1e-300, 0.0, 1e-300, 1e-12, 1e-3, 0.5, 1.0, 7.0, 1e6, 1e300, f64::MAX];
+        let nu: Vec<f64> = (0..n).map(|c| values[c % 16]).collect();
+        let u: Vec<[f64; 3]> = (0..n).map(|c| [values[(3 * c) % 16], values[(5 * c + 1) % 16], values[(7 * c + 2) % 16]]).collect();
+        for delta in [0.0, 0.5, 1.0, 10.0] {
+            let s = length_field(&d, &nu, &u, &g, &fluid, p, delta, C_DES, &mut out).unwrap();
+            assert!((0.0..=1.0).contains(&s.les_fraction) && (0.0..=1.0).contains(&s.max_f_d), "{s:?}");
+            for (l, dc) in out.iter().zip(d.as_slice()) {
+                assert!(*l >= dc.min(C_DES * delta) && l <= dc, "d̃ {l} for d {dc}");
+            }
+        }
     }
 }
