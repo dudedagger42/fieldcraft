@@ -42,9 +42,11 @@ becomes active.
 | Roof | no-slip box face |
 | Outlet, x_max | pressure, convective outflow |
 
-**Reading x_r.** The time-mean floor shear per strip; x_r is the last downstream sign change
-from negative to positive after the shear's minimum, by linear interpolation between strip
-centres, divided by H. C_f and C_p are formed with ρ and U_ref at x/H = −4 (the centre-channel
+**Reading x_r.** The time-mean carried floor shear per strip (its momentum exchange per area,
+averaged through `fieldcraft_lbm::statistics::Blocks`); x_r is its one change of sign from
+negative to non-negative, by linear interpolation between strip centres, divided by H. No such
+change, or more than one (a second bubble, or a mean not yet converged), is refused and
+reported rather than picked from. C_f and C_p are formed with ρ and U_ref at x/H = −4 (the centre-channel
 speed there) for comparison with `experiment.json`.
 
 **Statistics.** The hybrid run is unsteady: the reattachment's block means must pass the shared

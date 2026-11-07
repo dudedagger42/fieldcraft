@@ -40,16 +40,56 @@ pub fn interpolate(xs: &[f64], ys: &[f64], x: f64) -> Option<f64> {
     Some(if x1 > x0 { y0 + (y1 - y0) * (x - x0) / (x1 - x0) } else { y0 })
 }
 
-/// The reattachment point of a separated floor: from the wall shear's minimum downstream, the
-/// first change of sign from negative to non-negative, by linear interpolation between the
-/// samples (`xs` increasing). `None` when the shear never goes negative or never comes back.
-pub fn reattachment(xs: &[f64], tau: &[f64]) -> Option<f64> {
-    let n = xs.len().min(tau.len());
-    let lowest = (0..n).min_by(|&a, &b| tau[a].total_cmp(&tau[b]))?;
-    if tau[lowest] >= 0.0 {
-        return None;
+/// Why a floor shear profile gives no reattachment point.
+#[derive(Debug, Clone, PartialEq)]
+pub enum NoReattachment {
+    /// The samples cannot be read: the lengths differ, there are fewer than two, `xs` is not
+    /// strictly increasing, or a value is not finite.
+    Input(String),
+    /// The shear never changes from negative to non-negative. `lowest` is its smallest value:
+    /// ≥ 0 means attached everywhere, < 0 means it never reattached inside the samples.
+    None { lowest: f64 },
+    /// It does so more than once, at these x: a secondary bubble, or a mean that has not
+    /// converged. Which one is the reattachment cannot be decided, so none is returned.
+    Several(Vec<f64>),
+}
+
+/// Every place where the floor shear `tau`, sampled at `xs` (strictly increasing), changes from
+/// negative to non-negative, in order. Between samples k and k + 1 with τ_k < 0 ≤ τ_{k+1}, the
+/// crossing is the zero of the straight line through them,
+/// x = x_k − τ_k (x_{k+1} − x_k) / (τ_{k+1} − τ_k),
+/// which is exact when τ is linear on that interval. For a smooth τ the error is at most
+/// Δx² max|τ''| / (8 min|τ'|) over the interval (the linear interpolation error, Δx²/8 · max|τ''|,
+/// divided by the slope). A change from positive to negative (separation, such as the edge of
+/// the corner eddy under the step) is not a crossing here.
+pub fn crossings(xs: &[f64], tau: &[f64]) -> Result<Vec<f64>, NoReattachment> {
+    if xs.len() != tau.len() || xs.len() < 2 {
+        return Err(NoReattachment::Input(format!("{} stations and {} shear values: two or more of each, as many", xs.len(), tau.len())));
     }
-    (lowest..n.saturating_sub(1)).find(|&k| tau[k] < 0.0 && tau[k + 1] >= 0.0).map(|k| xs[k] - tau[k] * (xs[k + 1] - xs[k]) / (tau[k + 1] - tau[k]))
+    if let Some(v) = xs.iter().chain(tau).find(|v| !v.is_finite()) {
+        return Err(NoReattachment::Input(format!("a station or shear value is {v}")));
+    }
+    if let Some(w) = xs.windows(2).find(|w| w[1] <= w[0]) {
+        return Err(NoReattachment::Input(format!("the stations are not increasing: {} then {}", w[0], w[1])));
+    }
+    Ok(xs
+        .windows(2)
+        .zip(tau.windows(2))
+        .filter(|(_, t)| t[0] < 0.0 && t[1] >= 0.0)
+        .map(|(x, t)| x[0] - t[0] * (x[1] - x[0]) / (t[1] - t[0]))
+        .collect())
+}
+
+/// The reattachment point of a separated floor: the one place where the time-mean floor shear
+/// changes from negative to non-negative ([`crossings`], linear interpolation). Refused, with
+/// what was found, when there is no such crossing or more than one.
+pub fn reattachment(xs: &[f64], tau: &[f64]) -> Result<f64, NoReattachment> {
+    let at = crossings(xs, tau)?;
+    match at.as_slice() {
+        [x] => Ok(*x),
+        [] => Err(NoReattachment::None { lowest: tau.iter().copied().fold(f64::INFINITY, f64::min) }),
+        _ => Err(NoReattachment::Several(at)),
+    }
 }
 
 /// Whether a sampled history has settled: every channel's latest value differs from its value

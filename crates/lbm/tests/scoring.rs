@@ -43,22 +43,93 @@ fn thicknesses_of_known_profiles() {
 }
 
 #[test]
-fn interpolation_and_reattachment() {
+fn interpolation() {
     let xs = [0.0, 1.0, 2.0, 4.0];
     let ys = [0.0, 10.0, 20.0, 0.0];
     assert_eq!(interpolate(&xs, &ys, 0.5), Some(5.0));
     assert_eq!(interpolate(&xs, &ys, 3.0), Some(10.0));
     assert_eq!(interpolate(&xs, &ys, 4.5), None);
     assert_eq!(interpolate(&xs, &ys, -0.1), None);
+}
 
-    // A small corner bubble (−, +) before the main one: the reattachment is the crossing after
-    // the minimum, 6.25 here.
-    let x = [0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 6.0, 6.5, 7.0];
-    let tau = [-0.1, 0.05, -0.2, -0.5, -1.0, -0.8, -0.4, -0.1, 0.1, 0.4];
-    assert!((reattachment(&x, &tau).unwrap() - 6.25).abs() < 1e-12);
-    // Attached everywhere, or never reattached.
-    assert_eq!(reattachment(&x, &[1.0; 10]), None);
-    assert_eq!(reattachment(&x, &[-1.0; 10]), None);
+/// The step's floor strip centres, H/8 apart over 0 … 30 H (`ddes_backstep`'s floor), or `per_h`
+/// strips per H.
+fn stations(per_h: usize) -> Vec<f64> {
+    (0..30 * per_h).map(|k| (k as f64 + 0.5) / per_h as f64).collect()
+}
+
+/// A shear linear in x through a known zero: the crossing is exact. At 6.25 H (a strip boundary,
+/// all values dyadic) bit for bit; at the measured 6.26 H to round-off.
+#[test]
+fn the_reattachment_of_a_linear_shear_is_exact() {
+    let x = stations(8);
+    let tau: Vec<f64> = x.iter().map(|&x| (x - 6.25) / 1024.0).collect();
+    assert_eq!(reattachment(&x, &tau), Ok(6.25));
+    let tau: Vec<f64> = x.iter().map(|&x| 3e-3 * (x - 6.26)).collect();
+    let r = reattachment(&x, &tau).unwrap();
+    assert!((r - 6.26).abs() <= 4.0 * f64::EPSILON * 6.26, "{r}");
+    // A zero exactly on a station is that station.
+    let tau: Vec<f64> = x.iter().map(|&x| x - 6.1875).collect();
+    assert_eq!(reattachment(&x, &tau), Ok(6.1875));
+}
+
+/// A curved shear, τ = (x − ½)(x − 6.26): positive in a corner eddy under the step, negative in
+/// the bubble, positive after it. The edge of the corner eddy (+ to −) is not a crossing; the
+/// reattachment's error stays within the documented bound Δx² max|τ''| / (8 min|τ'|) and falls
+/// at least threefold each time the strips halve (second order; the constant depends on where
+/// 6.26 falls between two stations).
+#[test]
+fn the_reattachment_of_a_curved_shear_is_within_its_interpolation_bound() {
+    let (a, b) = (0.5, 6.26);
+    let mut errors = Vec::new();
+    for per_h in [8, 16, 32] {
+        let x = stations(per_h);
+        let tau: Vec<f64> = x.iter().map(|&x| (x - a) * (x - b)).collect();
+        assert_eq!(crossings(&x, &tau).unwrap().len(), 1, "the corner eddy's edge is not a crossing");
+        let error = (reattachment(&x, &tau).unwrap() - b).abs();
+        let dx = 1.0 / per_h as f64;
+        // τ'' = 2; |τ'| = |2x − a − b| ≥ b − a − 2 Δx on the bracketing interval.
+        let bound = dx * dx * 2.0 / (8.0 * (b - a - 2.0 * dx));
+        assert!(error > 0.0 && error <= bound, "{per_h} per H: error {error:.3e}, bound {bound:.3e}");
+        errors.push(error);
+    }
+    assert!(errors.windows(2).all(|w| w[1] < w[0] / 3.0), "{errors:?}");
+}
+
+/// No crossing (attached everywhere, or never reattached) or several (a second bubble) are
+/// refused, with what was found; so are samples that cannot be read.
+#[test]
+fn the_reattachment_refuses_none_several_and_bad_samples() {
+    let x = stations(8);
+    assert_eq!(reattachment(&x, &vec![1e-3; x.len()]), Err(NoReattachment::None { lowest: 1e-3 }));
+    assert_eq!(reattachment(&x, &vec![-2e-3; x.len()]), Err(NoReattachment::None { lowest: -2e-3 }));
+    // Two bubbles: reattaching at 3.25 H and at 10.25 H.
+    let tau: Vec<f64> = x
+        .iter()
+        .map(|&x| {
+            if x < 6.0 {
+                (x - 3.25) / 64.0
+            } else if x < 8.0 {
+                -1.0 / 64.0
+            } else {
+                (x - 10.25) / 64.0
+            }
+        })
+        .collect();
+    assert_eq!(reattachment(&x, &tau), Err(NoReattachment::Several(vec![3.25, 10.25])));
+    // A mean that touches zero and separates again counts twice too.
+    let tau = [-1.0, 0.0, -1.0, 1.0];
+    assert_eq!(reattachment(&[0.0, 1.0, 2.0, 3.0], &tau), Err(NoReattachment::Several(vec![1.0, 2.5])));
+    for (xs, tau) in [
+        (vec![0.0, 1.0, 2.0], vec![-1.0, 1.0]),
+        (vec![0.0], vec![-1.0]),
+        (vec![0.0, 1.0, 1.0], vec![-1.0, 1.0, 2.0]),
+        (vec![0.0, 2.0, 1.0], vec![-1.0, 1.0, 2.0]),
+        (vec![0.0, 1.0, 2.0], vec![-1.0, f64::NAN, 2.0]),
+        (vec![0.0, f64::INFINITY, 2.0], vec![-1.0, 1.0, 2.0]),
+    ] {
+        assert!(matches!(reattachment(&xs, &tau), Err(NoReattachment::Input(_))), "{xs:?} {tau:?}");
+    }
 }
 
 #[test]
