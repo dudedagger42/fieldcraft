@@ -1,5 +1,5 @@
 //! Every fluid cell's distance to the nearest no-slip wall, for turbulence models that read it
-//! (Spalart–Allmaras' destruction term and DDES' shielding).
+//! (Spalart–Allmaras' destruction term).
 //!
 //! **The wall.** The wall is where the solver puts it, not the body's surface: a halfway
 //! bounce-back link puts the wall at the link's midpoint, half way between the fluid cell's
