@@ -1,0 +1,11 @@
+{
+ "title": "Backward-facing step, Driver & Seegmiller (1985), zero upper-wall angle: reattachment length",
+ "kind": "experiment",
+ "source": "D. M. Driver and H. L. Seegmiller, Features of a reattaching turbulent shear layer in divergent channel flow, AIAA Journal 23(2):163–171, 1985, doi:10.2514/3.8890; the values as published with the NASA Turbulence Modeling Resource's 2D backward facing step validation case, https://tmbwg.github.io/turbmodels/backstep_val.html (Re_H ≈ 36 000 after the correction noted there, reattachment x/H = 6.26 ± 0.10)",
+ "status": "pending",
+ "requires": "shielded hybrid RANS/LES switching (DDES on Spalart–Allmaras, slice 15b); until then crates/lbm/tests/ddes_backstep.rs (heavy) runs the case per model",
+ "quantities": [
+  {"id": "reattachment", "quantity": "reattachment length x_r / H (zero crossing of the time-mean floor shear)", "value": 6.26, "tolerance": {"relative": 0.1}, "reason": "15b gate: reattachment within 10 % of the experiment (slice 15b of the LES roadmap, #785); the measurement's own uncertainty is ±0.10 H (1.6 %)"},
+  {"id": "cf_inflow", "quantity": "floor skin friction at x/H = −3.956 (inflow boundary-layer check)", "value": 0.00288, "tolerance": {"relative": 0.1}, "reason": "the incoming boundary layer must match the experiment's before the reattachment means anything; ±0.202e-3 (7 %) measured uncertainty plus margin"}
+ ]
+}

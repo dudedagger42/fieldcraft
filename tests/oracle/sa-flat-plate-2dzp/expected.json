@@ -1,0 +1,14 @@
+{
+ "title": "Turbulent flat plate at zero pressure gradient (NASA TMR 2DZP), skin friction against Kármán–Schoenherr",
+ "kind": "theory",
+ "source": "NASA Turbulence Modeling Resource, 2D zero pressure gradient flat plate validation case, https://tmbwg.github.io/turbmodels/flatplate_val.html (Re = 5 million per unit length, plate 0 ≤ x ≤ 2, theory comparison for 4000 < Re_θ < 13000); Kármán–Schoenherr's correlation as that page states it, c_f = 1 / (17.08 (log₁₀ Re_θ)² + 25.11 log₁₀ Re_θ + 6.012); T. von Kármán, Mechanical similitude and turbulence, NACA TM 611, 1931; K. E. Schoenherr, Resistance of flat surfaces moving through a fluid, Trans. SNAME 40:279–313, 1932",
+ "status": "pending",
+ "requires": "a RANS transport model in the lattice Boltzmann solver (Spalart–Allmaras, slice 15a); until then crates/lbm/tests/sa_flat_plate.rs (heavy) runs the case per model",
+ "quantities": [
+  {"id": "cf_re4000", "quantity": "skin friction coefficient at Re_θ = 4000", "value": 0.0031440, "tolerance": {"relative": 0.05}, "reason": "15a gate: C_f within 5 % of Kármán–Schoenherr over Re_θ 4000–13000 (slice 15a of the LES roadmap, #785)"},
+  {"id": "cf_re6000", "quantity": "skin friction coefficient at Re_θ = 6000", "value": 0.0029012, "tolerance": {"relative": 0.05}, "reason": "15a gate, as cf_re4000"},
+  {"id": "cf_re8000", "quantity": "skin friction coefficient at Re_θ = 8000", "value": 0.0027456, "tolerance": {"relative": 0.05}, "reason": "15a gate, as cf_re4000"},
+  {"id": "cf_re10000", "quantity": "skin friction coefficient at Re_θ = 10000", "value": 0.0026334, "tolerance": {"relative": 0.05}, "reason": "15a gate, as cf_re4000"},
+  {"id": "cf_re13000", "quantity": "skin friction coefficient at Re_θ = 13000", "value": 0.0025101, "tolerance": {"relative": 0.05}, "reason": "15a gate, as cf_re4000"}
+ ]
+}
