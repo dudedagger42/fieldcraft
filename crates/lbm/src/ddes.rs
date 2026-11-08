@@ -41,9 +41,10 @@ use crate::flow::neighbour;
 use crate::voxel::Grid;
 use crate::{Error, Result};
 
-/// Kármán's constant in `r_d`, the paper's. It becomes Spalart–Allmaras' own (`sa::KAPPA`, the same
-/// 0.41) when that model lands, so that the model, DDES and the wall coupling read one κ.
-pub const KAPPA: f64 = 0.41;
+/// Kármán's constant in `r_d`: Spalart–Allmaras' own ([`crate::sa::KAPPA`], the wall coupling's
+/// [`crate::wall::BOUNCE_KAPPA`], 0.41 as the paper takes it), so that the model, DDES and the wall
+/// coupling read one κ.
+pub const KAPPA: f64 = crate::sa::KAPPA;
 
 /// The DDES constant C_DES of the paper, for Spalart–Allmaras.
 pub const C_DES: f64 = 0.65;
@@ -68,8 +69,14 @@ pub fn r_d(nu_total: f64, gradient: &[[f64; 3]; 3], d: f64) -> f64 {
     if r.is_nan() { f64::INFINITY } else { r }
 }
 
+/// The largest argument `f_d` passes to tanh. tanh(20) is exactly 1 in double precision (1 − tanh x
+/// ≈ 2 e^(−2x) is below half an ulp of 1 from x ≈ 18.7), so the cap changes no CPU result; it keeps
+/// a device backend's tanh, which some shader compilers evaluate as sinh/cosh and turn into NaN
+/// once cosh overflows single precision (x ≳ 89), on a finite argument (the GPU note, G0).
+pub const TANH_ARGUMENT_CAP: f64 = 20.0;
+
 /// The shielding function `f_d = 1 − tanh((8 r_d)³)`, in [0, 1]: 0 (RANS) for a not-a-number
-/// `r_d`, 1 for `r_d ≤ 0`.
+/// `r_d`, 1 for `r_d ≤ 0`. The argument of tanh is capped at [`TANH_ARGUMENT_CAP`].
 pub fn f_d(r_d: f64) -> f64 {
     if r_d.is_nan() {
         return 0.0;
@@ -77,7 +84,7 @@ pub fn f_d(r_d: f64) -> f64 {
     if r_d <= 0.0 {
         return 1.0;
     }
-    (1.0 - (8.0 * r_d).powi(3).tanh()).clamp(0.0, 1.0)
+    (1.0 - (8.0 * r_d).powi(3).min(TANH_ARGUMENT_CAP).tanh()).clamp(0.0, 1.0)
 }
 
 /// The DDES length `d̃ = d − f_d max(0, d − c_des Δ)`, in `[min(d, c_des Δ), d]` for a finite
@@ -93,6 +100,16 @@ pub fn length(d: f64, delta: f64, f_d: f64, c_des: f64) -> f64 {
     (d - f * (d - les)).clamp(les, d)
 }
 
+/// One fluid cell's DDES length `d̃` and shielding `f_d`, from its `nu_total` = ν + ν_t, velocity
+/// gradient `gradient` (`g[a][b] = ∂_a u_b`; [`r_d`] reads only its norm), wall distance `d`,
+/// filter width `delta` and `c_des`: [`length`] of [`f_d`] of [`r_d`]. What [`length_field`] and the
+/// flow's Spalart–Allmaras step both apply per cell, the flow with the gradient it already takes
+/// for the vorticity.
+pub fn cell(nu_total: f64, gradient: &[[f64; 3]; 3], d: f64, delta: f64, c_des: f64) -> (f64, f64) {
+    let f = f_d(r_d(nu_total, gradient, d));
+    (length(d, delta, f, c_des), f)
+}
+
 /// The cells of one parallel task of [`length_field`]: fixed, so the result does not depend on the
 /// number of threads.
 const BLOCK: usize = 4096;
@@ -103,6 +120,15 @@ const BLOCK: usize = 4096;
 pub struct DdesStats {
     pub les_fraction: f64,
     pub max_f_d: f64,
+}
+
+impl DdesStats {
+    /// The statistics of per-block `([fluid cells, LES cells], largest f_d)`, summed in block order
+    /// (the same on any number of threads).
+    pub(crate) fn of_blocks(blocks: impl Iterator<Item = ([usize; 2], f64)>) -> DdesStats {
+        let (cells, les, max) = blocks.fold((0usize, 0usize, 0.0f64), |(c, l, m), (k, x)| (c + k[0], l + k[1], m.max(x)));
+        DdesStats { les_fraction: if cells > 0 { les as f64 / cells as f64 } else { 0.0 }, max_f_d: max }
+    }
 }
 
 /// Every cell's DDES length `d̃` into `out` (0 in cells that are not fluid), from the wall distance
@@ -159,21 +185,20 @@ pub fn length_field(
             }
             let dc = distance.get(cell).copied().unwrap_or(0.0);
             let nu = nu_total.get(cell).copied().unwrap_or(0.0);
-            let f = f_d(r_d(nu, &cell_gradient(grid, periodic, fluid, velocity, cell), dc));
-            *slot = length(dc, delta, f, c_des);
+            let (l, f) = self::cell(nu, &cell_gradient(grid, periodic, fluid, velocity, cell), dc, delta, c_des);
+            *slot = l;
             counts[0] += 1;
             counts[1] += usize::from(f > 0.5);
             *max = max.max(f);
         }
     });
-    let (cells, les, max) = parts.iter().fold((0usize, 0usize, 0.0f64), |(c, l, m), (_, k, x)| (c + k[0], l + k[1], m.max(*x)));
-    Ok(DdesStats { les_fraction: if cells > 0 { les as f64 / cells as f64 } else { 0.0 }, max_f_d: max })
+    Ok(DdesStats::of_blocks(parts.iter().map(|(_, counts, max)| (*counts, *max))))
 }
 
 /// Cell `cell`'s velocity gradient `g[a][b] = ∂_a u_b` ([`crate::hrr::gradient`]) from the
-/// velocities of its fluid neighbours. Kept apart so that one pass can later give the gradient to
-/// both Spalart–Allmaras and DDES.
-fn cell_gradient(grid: &Grid, periodic: [bool; 3], fluid: &[bool], velocity: &[[f64; 3]], cell: usize) -> [[f64; 3]; 3] {
+/// velocities of its fluid neighbours: the one gradient the flow's Spalart–Allmaras step takes per
+/// cell for both its vorticity and DDES.
+pub(crate) fn cell_gradient(grid: &Grid, periodic: [bool; 3], fluid: &[bool], velocity: &[[f64; 3]], cell: usize) -> [[f64; 3]; 3] {
     let p = grid.coords(cell);
     let u = velocity.get(cell).copied().unwrap_or([0.0; 3]);
     let nb: crate::hrr::Neighbours =
@@ -183,6 +208,23 @@ fn cell_gradient(grid: &Grid, periodic: [bool; 3], fluid: &[bool], velocity: &[[
 
 #[cfg(test)]
 mod tests {
+
+    /// The cap on tanh's argument changes no value: below it f_d is the uncapped formula bit for
+    /// bit, and from it on (where double-precision tanh is already exactly 1) f_d is exactly 0,
+    /// up to the largest finite r_d.
+    #[test]
+    fn the_tanh_cap_changes_no_value() {
+        assert_eq!(TANH_ARGUMENT_CAP.tanh(), 1.0);
+        let uncapped = |r: f64| (1.0 - (8.0 * r).powi(3).tanh()).clamp(0.0, 1.0);
+        let mut r = 1e-6;
+        while r < 1e300 {
+            assert_eq!(f_d(r).to_bits(), uncapped(r).to_bits(), "r_d {r}");
+            r *= 1.01;
+        }
+        for r in [0.35, 1.0, 1e10, f64::MAX, f64::INFINITY] {
+            assert_eq!(f_d(r), 0.0, "r_d {r}");
+        }
+    }
     use super::*;
     use crate::Limits;
     use crate::distance::WallSurface;
