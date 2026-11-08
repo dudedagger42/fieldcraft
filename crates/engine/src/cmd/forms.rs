@@ -887,8 +887,8 @@ const ABSORBING: Field = group(
     "Absorbing layer",
     &[
         positive("thickness", "Thickness", D::Length)
-            .help("How far the layer reaches into the box from each velocity or pressure face; keep it clear of where you measure.")
-            .req(),
+            .help("How far the layer reaches into the box from each velocity or pressure face; keep it clear of where you measure. Left out, 10 cells whatever the spacing, which also steadies a velocity inlet at small viscosity.")
+            .hint("10 cells"),
         range("strength", "Strength", D::None, 0.0, fieldcraft_model::fluids::MAX_ABSORBING_STRENGTH)
             .help("Relative to the matched strength, whose damping rate times the thickness is the speed of sound.")
             .hint("1"),

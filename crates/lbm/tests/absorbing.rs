@@ -131,7 +131,7 @@ fn unsteady_density(flow: &mut Flow, steps: u64) -> f64 {
 fn the_layer_drains_an_acoustic_pulse() {
     // 48 cells long: 8-cell layers at the inlet and the outlet (a sixth of the box each). The
     // quarter-wave period is 4 · 48 √3 ≈ 333 steps.
-    let layer = AbsorbingLayer { thickness: 8.0 / 12.0, strength: None, filter_time: None };
+    let layer = AbsorbingLayer { thickness: Some(8.0 / 12.0), strength: None, filter_time: None };
     for collision in [Collision::Trt, Collision::Mrt, Collision::Hrr] {
         let free = unsteady_density(&mut open_box(collision, Outflow::Uniform, None, 1200), 166);
         let damped = unsteady_density(&mut open_box_with(collision, Outflow::Uniform, None, Some(layer), 1200), 166);
@@ -145,7 +145,7 @@ fn the_layer_drains_an_acoustic_pulse() {
 #[test]
 fn the_layer_leaves_out_open_cells_and_wall_nodes() {
     let han = Turbulence::Smagorinsky { constant: 0.1, prandtl: 0.9, van_driest: None, wall_model: Some(WallModel::SpaldingBounce) };
-    let layer = AbsorbingLayer { thickness: 8.0 / 12.0, strength: None, filter_time: None };
+    let layer = AbsorbingLayer { thickness: Some(8.0 / 12.0), strength: None, filter_time: None };
     let flow = open_box_with(Collision::Trt, Outflow::Uniform, Some(han), Some(layer), 1);
     let grid = *flow.grid();
     let [nx, ny, _] = grid.cells;
@@ -177,7 +177,8 @@ fn hostile_layers_are_refused() {
         d.faces.z_max = FaceCondition::Periodic {};
         d
     };
-    let layer = |thickness: f64, strength: Option<f64>, filter_time: Option<f64>| AbsorbingLayer { thickness, strength, filter_time };
+    let layer =
+        |thickness: f64, strength: Option<f64>, filter_time: Option<f64>| AbsorbingLayer { thickness: Some(thickness), strength, filter_time };
     let dt = 0.05 * dx;
     let try_setup = |d: fieldcraft_model::FluidDomain| -> Result<(), String> {
         let mut m = fieldcraft_model::Model::default();
@@ -312,7 +313,7 @@ fn the_layer_drains_the_laminar_plate_s_quarter_wave() {
         });
         (0.5 * (a.1 - a.0), 0.5 * (b.1 - b.0))
     };
-    let layer = AbsorbingLayer { thickness: 20.0 * h, strength: None, filter_time: None };
+    let layer = AbsorbingLayer { thickness: Some(20.0 * h), strength: None, filter_time: None };
     let (on_early, on_late) = amplitude(Some(layer));
     let (off_early, off_late) = amplitude(None);
     println!(

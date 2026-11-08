@@ -58,11 +58,20 @@ inside the box at every velocity and pressure face:
 
 | Field | Default | Meaning |
 |---|---|---|
-| `thickness` | — | How far the layer reaches into the box from each velocity or pressure face. At least 2 cells; at most a fifth of the box along that face's axis. |
+| `thickness` | 10 cells | How far the layer reaches into the box from each velocity or pressure face. At least 2 cells; at most a fifth of the box along that face's axis. Left out, the layer is 10 cells thick whatever the spacing, or a fifth of a box too short for that. |
 | `strength` | 1 | Relative to the matched strength, whose damping rate times the thickness is the speed of sound. Above 0, at most 4. |
 | `filter_time` | twice the sound crossing time | The time constant of the low-pass filter that gives each layer cell its reference state. Only changes faster than it are damped. |
 
-It is refused with heat in the fluid, with a free surface, and on the GPU.
+`"absorbing": {}` gives the default layer. It is refused with heat in the fluid, with a free
+surface, and on the GPU.
+
+**Why the default is a cell count.** The layer also steadies a velocity inlet at small τ − ½ (about
+10⁻⁴, a high-Reynolds-number flow on a wall-function grid). There a density mode the width of a
+cell can grow along the inlet's first columns. The layer damps it only near the face. Since its
+strength falls with its cell count and its profile vanishes at the face, that damping falls about
+with the square of the cell count. Ten and sixteen cells held such an inlet; a layer of a fixed length that
+was 100 cells on a fine grid let it run away. A run that gives a thickness over 20 cells at
+τ − ½ below 10⁻² gets a warning saying so.
 
 ## Theory
 

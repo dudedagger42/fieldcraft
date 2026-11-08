@@ -192,7 +192,8 @@ impl Shape {
             open_faces: fieldcraft_model::BoxFace::ALL.map(|f| is_open(domain.faces.get(f))),
             surface: domain.free_surface.is_some(),
             absorbing_depth: domain.absorbing.map_or(0, |l| {
-                let cells = (l.thickness / domain.spacing).round();
+                // Without a thickness, the default cell count (or fewer in a short box).
+                let cells = l.thickness.map_or(fieldcraft_model::fluids::DEFAULT_ABSORBING_CELLS as f64, |t| (t / domain.spacing).round());
                 if cells.is_finite() && cells > 0.0 { cells.min(fieldcraft_model::fluids::MAX_CELLS_PER_SIDE as f64) as u64 } else { 0 }
             }),
         })

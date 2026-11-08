@@ -304,6 +304,15 @@ pub struct AbsorbingSetup {
 /// Most of the box along an open face's axis one face's absorbing layer may cover.
 pub const MAX_ABSORBING_SHARE: f64 = 0.2;
 
+/// A layer thicker than this many cells at τ − ½ below [`THICK_ABSORBING_TAU`] gets a warning:
+/// measured on a free stream at τ − ½ = 1.2 × 10⁻⁴ (hybrid collision σ 0.99), layers of 10 and
+/// 16 cells held the velocity inlet and one of 100 cells let its first columns run away.
+pub const THICK_ABSORBING_CELLS: usize = 20;
+
+/// The τ − ½ below which a thick layer is warned about: on the hybrid collision the inlet's
+/// grid-scale mode grew without a layer up to τ − ½ = 3 × 10⁻³ and not at 10⁻².
+pub const THICK_ABSORBING_TAU: f64 = 1e-2;
+
 /// The absorbing layer of `domain` in lattice units, or why it is refused.
 fn absorbing(domain: &FluidDomain, grid: &Grid, dt: f64) -> Result<Option<AbsorbingSetup>> {
     let Some(layer) = &domain.absorbing else { return Ok(None) };
@@ -321,11 +330,27 @@ fn absorbing(domain: &FluidDomain, grid: &Grid, dt: f64) -> Result<Option<Absorb
     if open.is_empty() {
         return refuse("needs a velocity or pressure face to sit at; the domain has none".into());
     }
-    let thickness = layer.thickness / grid.spacing;
-    if !(thickness.is_finite() && thickness.round() >= 2.0) {
-        return refuse(format!("is {thickness:.2} cells thick: give it at least 2 cells ({}), better 10 or more", 2.0 * grid.spacing));
-    }
-    let cells = thickness.round();
+    // The open faces' smallest box extent in cells: a layer may cover a fifth of it.
+    let shortest = open.iter().map(|f| grid.cells.get(f.axis()).copied().unwrap_or(0)).min().unwrap_or(0) as f64;
+    let cells = match layer.thickness {
+        Some(t) => {
+            let thickness = t / grid.spacing;
+            if !(thickness.is_finite() && thickness.round() >= 2.0) {
+                return refuse(format!("is {thickness:.2} cells thick: give it at least 2 cells ({}), better 10", 2.0 * grid.spacing));
+            }
+            thickness.round()
+        }
+        // The default: a fixed cell count, thinner in a box too short for it.
+        None => {
+            let cells = (fieldcraft_model::fluids::DEFAULT_ABSORBING_CELLS as f64).min((MAX_ABSORBING_SHARE * shortest).floor());
+            if cells < 2.0 {
+                return refuse(format!(
+                    "has no room: the box is {shortest} cells long along an open face's axis, and a layer of at least 2 cells may cover only a fifth of it; lengthen the box"
+                ));
+            }
+            cells
+        }
+    };
     for face in &open {
         let across = grid.cells.get(face.axis()).copied().unwrap_or(0) as f64;
         if cells > MAX_ABSORBING_SHARE * across {
@@ -1016,6 +1041,14 @@ impl Setup {
         }
         let zones = zones(&domain, &grid, viscosity, dt, density)?;
         let absorbing = absorbing(&domain, &grid, dt)?;
+        if let Some(a) = absorbing.filter(|a| a.cells > THICK_ABSORBING_CELLS && tau_plus - 0.5 < THICK_ABSORBING_TAU) {
+            warnings.push(format!(
+                "the absorbing layer is {} cells thick at τ − ½ = {:.1e}: its damping next to a face falls with the square of its cell count, and a velocity inlet's first columns can run away under a thick one (10 and 16 cells held at τ − ½ ≈ 10⁻⁴, 100 did not); leave `thickness` out for the default of {} cells",
+                a.cells,
+                tau_plus - 0.5,
+                fieldcraft_model::fluids::DEFAULT_ABSORBING_CELLS
+            ));
+        }
         let surface = match &domain.free_surface {
             None => None,
             Some(fs) => {

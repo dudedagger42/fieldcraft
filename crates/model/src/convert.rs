@@ -360,7 +360,9 @@ impl Quantities for FluidDomain {
             }
         }
         if let Some(AbsorbingLayer { thickness, strength: _, filter_time }) = absorbing {
-            f(Q::Length, thickness);
+            if let Some(t) = thickness {
+                f(Q::Length, t);
+            }
             if let Some(t) = filter_time {
                 f(Q::Time, t);
             }
