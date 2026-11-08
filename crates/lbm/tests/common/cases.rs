@@ -209,7 +209,7 @@ impl Score {
 /// A case's `expected.json` reference values: `(id, value, relative tolerance)` of each quantity.
 pub fn expected(case: &str) -> Vec<(String, f64, f64)> {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/oracle").join(case).join("expected.json");
-    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display())).unwrap();
     let v: serde_json::Value = serde_json::from_str(&text).unwrap();
     v["quantities"]
         .as_array()
