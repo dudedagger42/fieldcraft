@@ -61,6 +61,10 @@ struct Channel {
     /// The walls on lattice nodes (the on-node bounce: one boundary node layer more) rather than
     /// halfway between cells.
     on_node: bool,
+    /// The walls as two obstacle slabs one cell thick in a box periodic in y, one row more at each
+    /// end, rather than the y box faces (Han's on-node wall on obstacles, board WL1): the node rows
+    /// sit where the box faces' would.
+    slabs: bool,
     max_steps: u64,
     sample: u64,
     settling: Settling,
@@ -93,12 +97,30 @@ impl Channel {
         1.0 / self.cells as f64
     }
 
+    /// The obstacle slabs, with `slabs`.
+    fn obstacles(&self) -> Vec<fieldcraft_lbm::Obstacle> {
+        let dx = self.spacing();
+        let height = if self.on_node { 2.0 + dx } else { 2.0 };
+        if !self.slabs {
+            return Vec::new();
+        }
+        vec![
+            obstacle("Floor", cuboid([-1.0, -dx, -1.0], [1.0 + dx, 0.0, 1.0 + dx]), &CUBOID_FACES),
+            obstacle("Roof", cuboid([-1.0, height, -1.0], [1.0 + dx, height + dx, 1.0 + dx]), &CUBOID_FACES),
+        ]
+    }
+
     fn model(&self) -> fieldcraft_model::Model {
         let dx = self.spacing();
         let height = if self.on_node { 2.0 + dx } else { 2.0 };
-        let mut d = domain([0.0; 3], [dx, height, dx], dx);
+        let mut d = if self.slabs { domain([0.0, -dx, 0.0], [dx, height + dx, dx], dx) } else { domain([0.0; 3], [dx, height, dx], dx) };
         for f in [&mut d.faces.x_min, &mut d.faces.x_max, &mut d.faces.z_min, &mut d.faces.z_max] {
             *f = FaceCondition::Periodic {};
+        }
+        if self.slabs {
+            d.faces.y_min = FaceCondition::Periodic {};
+            d.faces.y_max = FaceCondition::Periodic {};
+            d.obstacles = self.obstacles().iter().map(|o| o.body.clone()).collect();
         }
         d.acceleration = [1.0, 0.0, 0.0];
         d.initial_velocity = [self.bulk_guess, 0.0, 0.0];
@@ -112,9 +134,11 @@ impl Channel {
 
     /// Run to settling or the step cap.
     fn run(&self) -> ChannelResult {
-        let (setup, mut flow) = prepare(&self.model(), &[]);
+        let (setup, mut flow) = prepare(&self.model(), &self.obstacles());
         let grid = *flow.grid();
-        let rows = grid.cells[1];
+        // The rows between the walls (the slabs' rows left out).
+        let first = usize::from(self.slabs);
+        let rows = grid.cells[1] - 2 * first;
         let a = flow.acceleration();
         let nu = (setup.tau_plus - 0.5) / 3.0;
         // Wall faces per wall: one cell in x and z.
@@ -126,7 +150,7 @@ impl Channel {
         let bulk = |flow: &Flow| {
             let row = |j: usize| {
                 (0..grid.cells[0] * grid.cells[2])
-                    .map(|k| flow.moments(grid.index([k % grid.cells[0], j, k / grid.cells[0]])).map_or(0.0, |(_, u)| u[0]))
+                    .map(|k| flow.moments(grid.index([k % grid.cells[0], j + first, k / grid.cells[0]])).map_or(0.0, |(_, u)| u[0]))
                     .sum::<f64>()
                     / (grid.cells[0] * grid.cells[2]) as f64
             };
@@ -254,6 +278,7 @@ fn a_laminar_channel_reads_poiseuille_friction() {
         collision: Collision::Trt,
         turbulence: None,
         on_node: false,
+        slabs: false,
         max_steps: 200_000,
         sample: 50,
         settling: GATED,
@@ -295,6 +320,7 @@ fn the_sa_wall_function_s_request_is_read() {
             collision: Collision::Mrt,
             turbulence: Some(sa(wall)),
             on_node,
+            slabs: false,
             max_steps: 400,
             sample: 100,
             settling: GATED,
@@ -312,6 +338,11 @@ fn the_sa_wall_function_s_request_is_read() {
 
 /// One run of the C7 pair at Re_τ 1000: SA on MRT under `wall`, `cells` per δ.
 fn c7(wall: WallModel, on_node: bool, cells: usize, max_steps: u64) -> ChannelResult {
+    c7_on(wall, on_node, false, cells, max_steps)
+}
+
+/// [`c7`], with the walls as obstacle slabs when `slabs`.
+fn c7_on(wall: WallModel, on_node: bool, slabs: bool, cells: usize, max_steps: u64) -> ChannelResult {
     Channel {
         re_tau: 1000.0,
         cells,
@@ -320,6 +351,7 @@ fn c7(wall: WallModel, on_node: bool, cells: usize, max_steps: u64) -> ChannelRe
         collision: Collision::Mrt,
         turbulence: Some(sa(wall)),
         on_node,
+        slabs,
         max_steps,
         sample: 100,
         settling: GATED,
@@ -385,5 +417,30 @@ fn sa_rans_channel_at_re_tau_1000_meets_lee_and_moser() {
     }
     println!("{}", score.table());
     assert!(failures.is_empty(), "{failures:?}");
+    assert!(score.passes());
+}
+
+/// Board task WL1: C7's SA channel at Re_τ 1000 on Han's on-node wall, its walls built from
+/// obstacle slabs instead of box faces (agent-hub notes/cfd-wall-obstacles.md §5 test 2). The
+/// gates: carried C_f within 1 % of the box-face run's, requested / carried within 1 %; the two
+/// runs are in fact the same run (the same steps, the same carried C_f to the bit), since the
+/// slabs' node rows are flat nodes at the box faces' heights (`han_obstacles.rs` checks every
+/// population over 200 steps).
+#[test]
+#[ignore = "heavy: cargo xtask test --heavy (CI heavy job)"]
+fn sa_rans_channel_on_obstacle_walls_is_the_box_face_channel() {
+    let cells = 20;
+    let boxed = c7_on(WallModel::SpaldingBounce, true, false, cells, 2_000_000);
+    let slabbed = c7_on(WallModel::SpaldingBounce, true, true, cells, 2_000_000);
+    report("SA Han on-node, box faces, 20 cells per δ", &boxed, LEE_MOSER_1000_BULK, LEE_MOSER_1000_CF);
+    report("SA Han on-node, obstacle slabs, 20 cells per δ", &slabbed, LEE_MOSER_1000_BULK, LEE_MOSER_1000_CF);
+    let ratio = slabbed.requested.unwrap_or(f64::NAN) / slabbed.carried;
+    let mut score = Score::default();
+    score.push(Gate::new("WL1 obstacle channel", "C_f carried, slabs vs box faces", slabbed.carried, boxed.carried, 0.01));
+    score.push(Gate::new("WL1 obstacle channel", "requested / carried, slabs", ratio, 1.0, 0.01));
+    println!("{}", score.table());
+    assert!(boxed.settled && slabbed.settled, "settled: box {} slabs {}", boxed.settled, slabbed.settled);
+    assert_eq!((boxed.steps, boxed.carried.to_bits()), (slabbed.steps, slabbed.carried.to_bits()), "the same run");
+    assert!(slabbed.min_nu_tilde.is_some_and(|v| v >= 0.0), "{:?}", slabbed.min_nu_tilde);
     assert!(score.passes());
 }
