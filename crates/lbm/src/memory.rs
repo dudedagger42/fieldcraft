@@ -52,6 +52,11 @@ const WALL_DISTANCE: u64 = F64 + 4;
 /// ν̃, faces, mask and scratch), wall distance and vorticity, and the distance transform's working
 /// memory (three passes of f64, counted throughout to stay on the safe side).
 const SPALART_ALLMARAS: u64 = crate::sa::BYTES_PER_CELL + 2 * F64 + 3 * F64;
+/// Per cell with the Spalart–Allmaras model on the device: ν̃, its transport rate and
+/// coefficient sum, and the vorticity with the wall distance (lbm-gpu's `nu_tilde`, `sa_rate`,
+/// `sa_cell`); while preparing, the distance and the initial ν̃ staged as f32.
+pub const DEVICE_SA: u64 = 5 * F32;
+const DEVICE_SA_STAGING: u64 = 2 * F32;
 /// Per cell with fans or porous zones, and with conducting obstacles: an index.
 const INDEX: u64 = 4;
 /// Per cell with a free surface: its kind, its mass and fill level, whether it is populated,
@@ -295,7 +300,9 @@ impl Memory {
             Choice::Device => (
                 prepared
                     .saturating_add(outlet_staging)
-                    .saturating_add(per_cell(DEVICE_STAGING + if s.damping { DEVICE_DAMPING } else { 0 }))
+                    .saturating_add(per_cell(
+                        DEVICE_STAGING + if s.damping { DEVICE_DAMPING } else { 0 } + if s.spalart_allmaras { DEVICE_SA_STAGING } else { 0 },
+                    ))
                     .saturating_add(s.zone_data.saturating_add(zone_cells).saturating_mul(3)),
                 per_cell(2 * RESULT).saturating_add(s.zone_data).saturating_add(zone_cells),
                 per_cell(READBACK + DEVICE_READBACK + if s.heat { READBACK_HEAT + DEVICE_READBACK_HEAT } else { 0 })
