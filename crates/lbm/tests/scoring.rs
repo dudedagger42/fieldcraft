@@ -132,8 +132,8 @@ fn the_reattachment_refuses_none_several_and_bad_samples() {
     }
 }
 
-/// The board's settling rule (cfd-board.md, notes/cfd-c4-laminar-settling.md): 2 flow-throughs,
-/// then a time-mean drift under 0.1 %. A change here is a change of the board's acceptance.
+/// The gated cases' settling rule: 2 flow-throughs, then a time-mean drift under 0.1 %. A change
+/// here is a change of the gated cases' acceptance.
 #[test]
 fn the_gated_settling_rule_is_the_boards() {
     assert_eq!(GATED, Settling { min_flow_throughs: 2.0, drift: 1e-3 });

@@ -1,5 +1,5 @@
 //! Han, Ooka and Kikumoto's on-node wall-function bounce (`spalding_bounce`) on obstacle walls and
-//! where a wall meets an inlet or outlet (agent-hub notes/cfd-wall-obstacles.md).
+//! where a wall meets an inlet or outlet.
 //!
 //! This file starts with the pin: box-face Han channels whose every population, wall force and
 //! wall-function sample after 200 steps hashes to the value the box-face-only code gave, so the
@@ -141,8 +141,7 @@ fn box_face_han_results_are_pinned_bit_for_bit() {
 
 /// A channel whose walls are obstacle slabs is the box-face channel, bit for bit: every
 /// population of every cell (the slabs' rows aside), each wall's force against its slab's, and
-/// with Spalart–Allmaras the wall function's (y, u_τ) at every first fluid node (board WL1, §5
-/// test 2 of agent-hub notes/cfd-wall-obstacles.md).
+/// with Spalart–Allmaras the wall function's (y, u_τ) at every first fluid node.
 #[test]
 fn an_obstacle_channel_is_the_box_face_channel_bit_for_bit() {
     let cases: [(&str, Collision, Turbulence); 4] = [
@@ -347,7 +346,7 @@ fn hostile_obstacle_geometry_is_refused_or_runs_without_panic() {
 }
 
 /// Where a wall meets an inlet, an outlet or a slip face, the cell in that face's layer keeps the
-/// face's rule and is no node (notes/cfd-wall-obstacles.md §3): a box-face channel with a velocity
+/// face's rule and is no node: a box-face channel with a velocity
 /// inlet and a pressure outlet, and a plate of obstacle strips on a slip floor running into the
 /// outlet (the 2DZP layout). Both run on TRT and MRT; the open layers hold no node; the nodes
 /// beside a junction keep their Han pairs and bounce towards the junction cell; every node's pairs

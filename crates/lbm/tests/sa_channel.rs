@@ -452,12 +452,12 @@ fn c7_with(collision: Collision, sigma: Option<f64>, wall: WallModel, on_node: b
 /// | Han on-node | 32 (31) | 218 900 | 19.78 (−1.0 %) | 5.110e-3 (+2.1 %) | 1.00000 |
 ///
 /// Those Han U_b⁺ took the interval between each on-node wall and its first node as a trapezoid
-/// from u = 0. Since board WL3 P1 the gate integrates it from the wall law
+/// from u = 0. The gate now integrates it from the wall law
 /// (common::cases::WallInterval) and reports the trapezoid beside it. Rerun (FIELDCRAFT_THREADS=4,
 /// 42 s with the obstacle pair): Han 20 cells per δ U_b⁺ 19.979 (−0.05 %), C_f 5.011e-3 (+0.11 %;
 /// trapezoid +1.99 %); 32 cells per δ U_b⁺ 19.868 (−0.61 %), C_f 5.067e-3 (+1.23 %; trapezoid
-/// +2.09 %); the same settling steps. SA's own error against Lee & Moser is +1.43 % (agent-hub
-/// notes/cfd-wall-accuracy.md): the 20-cell figure is nearer DNS than SA itself because the wall
+/// +2.09 %); the same settling steps. SA's own error against Lee & Moser is +1.43 % (a steady 1D
+/// wall-resolved SA channel at Re_τ 1000): the 20-cell figure is nearer DNS than SA itself because the wall
 /// law's and the first interval's errors still cancel in part.
 /// | Musker halfway | 10 (50) | 137 700 | 22.57 (+12.9 %) | 3.927e-3 (−21.5 %) | 1.383 |
 /// | Musker halfway | 16 (31) | 239 300 | 23.83 (+19.2 %) | 3.521e-3 (−29.6 %) | 1.541 |
@@ -508,8 +508,8 @@ fn sa_rans_channel_at_re_tau_1000_meets_lee_and_moser() {
     assert!(score.passes());
 }
 
-/// Board task WL1: C7's SA channel at Re_τ 1000 on Han's on-node wall, its walls built from
-/// obstacle slabs instead of box faces (agent-hub notes/cfd-wall-obstacles.md §5 test 2). The
+/// C7's SA channel at Re_τ 1000 on Han's on-node wall, its walls built from obstacle slabs instead
+/// of box faces. The
 /// gates: carried C_f within 1 % of the box-face run's, requested / carried within 1 %; the two
 /// runs are in fact the same run (the same steps, the same carried C_f to the bit), since the
 /// slabs' node rows are flat nodes at the box faces' heights (`han_obstacles.rs` checks every

@@ -102,7 +102,7 @@ impl Plate {
     /// velocity inlet (a closed end for sound) and the pressure outlet (an open end), 4 L_x / c_s
     /// with c_s = 1/√3, slowed by the mean flow by 1/(1 − Ma²). The laminar plate rings in it
     /// without visible decay (C_f ±3 %): measured 1785 steps on a 250-cell domain and 2500 on a
-    /// 350-cell one, against 1786 and 2500 from this formula (notes/cfd-c4-laminar-settling.md).
+    /// 350-cell one, against 1786 and 2500 from this formula.
     fn acoustic_period(&self) -> f64 {
         let cells = self.cells(self.upstream + self.length) as f64;
         let mach2 = 3.0 * self.lattice_velocity * self.lattice_velocity;
@@ -349,8 +349,7 @@ fn gate(case: &str, stations: &[Station], from: f64, refs: &[(f64, f64, f64)], s
 /// case: 4 flow-throughs, then a time-mean drift under 1 %, a fifth of its 5 % gate. The plate
 /// rings in its acoustic modes (±3 % in C_f, [`Plate::acoustic_period`]) and the two-period
 /// means of the gated C_f still move by 2–5 × 10⁻³ between windows as the modes beat, so
-/// [`GATED`]'s 0.1 % is out of reach here (measured over 30 000 steps,
-/// notes/cfd-c4-laminar-settling.md). Its mean C_f is steady: the two halves of steps
+/// [`GATED`]'s 0.1 % is out of reach here (measured over 30 000 steps). Its mean C_f is steady: the two halves of steps
 /// 10 000–30 000 agree to 0.3 %.
 const LAMINAR_PIPELINE: Settling = Settling { min_flow_throughs: 4.0, drift: 1e-2 };
 

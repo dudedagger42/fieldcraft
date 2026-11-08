@@ -51,8 +51,7 @@
 //! area `Δx²`), to round-off, whatever the normal flow; along the normal it is the bounce-back's
 //! `2 Σ f_q` of the populations arriving from the fluid (their pressure and normal momentum flux).
 //!
-//! **Obstacles, edges and corners** (FieldCraft's extension, not the paper's; agent-hub notes
-//! cfd-wall-obstacles.md). A fluid cell next to a wall along one of the six axes (a solid cell,
+//! **Obstacles, edges and corners** (FieldCraft's extension, not the paper's). A fluid cell next to a wall along one of the six axes (a solid cell,
 //! or outside the box through a wall face) is a boundary node, the wall through its centre: at a
 //! box face the outermost layer, as above; at an obstacle, the fluid layer next to it. Eq. 14
 //! is applied link pair by link pair ([`roles`], [`on_links`]): along the normal, and on each
@@ -176,7 +175,7 @@ pub enum Neighbour {
 }
 
 /// What a boundary node sends along one direction `q` (the population `f*_q` it streams to its
-/// neighbour along `c_q`): agent-hub notes/cfd-wall-obstacles.md §2.
+/// neighbour along `c_q`), from the kinds of its neighbours ([`roles`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
     /// Eq. 14a–c: the specular image across the wall of the population arriving from the fluid,
@@ -260,8 +259,7 @@ pub fn carries(roles: &[Role; Q], axis: usize, inward: i32, b: usize) -> bool {
     C.iter().position(|c| *c == v).is_some_and(|q| roles.get(q) == Some(&Role::Han))
 }
 
-/// Eq. 14 by link pairs on one boundary node of any shape (agent-hub notes/cfd-wall-obstacles.md
-/// §2): its streamed populations `fq` become its post-collision populations, by `roles`. The wall's
+/// Eq. 14 by link pairs on one boundary node of any shape: its streamed populations `fq` become its post-collision populations, by `roles`. The wall's
 /// normal is along `axis`; `stress` is the wall stress as in [`on_node`], and its
 /// component along a tangential axis must be zero unless the roles carry it ([`carries`]).
 ///

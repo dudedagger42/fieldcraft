@@ -37,8 +37,8 @@ pub fn displacement_thickness(u: &[f64], spacing: f64, edge: f64) -> f64 {
 /// the wall is `u1`: its integrals `∫₀^{y1} u dy` and `∫₀^{y1} u² dy`, from the wall law the wall
 /// applies (Spalding's, κ and B of [`fieldcraft_lbm::wall::BOUNCE_KAPPA`] and `BOUNCE_B`), and
 /// from the trapezoid between u = 0 at the wall and u1 (what a sum over the rows with the wall
-/// row at u = 0 gives). Board WL3 P1 (agent-hub notes/cfd-wall-accuracy.md): every reading that
-/// integrates a profile from the wall reports both, and gates on the law's.
+/// row at u = 0 gives). Every reading that integrates a profile from the wall reports both, and
+/// gates on the law's: the trapezoid misses the curvature of the law over the wall interval.
 ///
 /// Spalding's law gives y⁺(u⁺) explicitly, so the integrals are closed forms by parts:
 /// `∫₀^{y⁺₁} u⁺ dy⁺ = u⁺₁ y⁺₁ − ∫₀^{u⁺₁} y⁺ du⁺` and `∫₀^{y⁺₁} u⁺² dy⁺ = u⁺₁² y⁺₁ − 2 ∫₀^{u⁺₁} u⁺ y⁺ du⁺`;

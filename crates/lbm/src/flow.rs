@@ -784,8 +784,7 @@ impl Flow {
         // boundary node, the wall through its centre. On a box face that is the outermost cell
         // layer; at an obstacle, the fluid layer next to it. A node with one wall direction has a
         // normal; its links take their roles from its neighbours (`bounce::roles`): Han's eq. 14
-        // where its fluid side is whole, bounce-back on every other link to the fluid
-        // (agent-hub notes/cfd-wall-obstacles.md §1–2).
+        // where its fluid side is whole, bounce-back on every other link to the fluid.
         let on_node = setup.wall_model == Some(WallModel::SpaldingBounce);
         let mut node_list: Vec<WallNode> = Vec::new();
         let mut bulk = Vec::new();
@@ -864,7 +863,7 @@ impl Flow {
                 // Where a wall meets an inlet, outlet or slip face, the cell in that face's layer
                 // keeps that face's rule and is no node: one rule per cell, as at the edge of two
                 // open faces. Its links to the wall stay halfway bounce-back, and the node beside
-                // it treats it as fluid (notes/cfd-wall-obstacles.md §3).
+                // it treats it as fluid.
                 let junction = (0..3).filter(|a| !periodic[*a]).any(|a| {
                     [(p[a] == 0, BoxFace::of(a, false)), (p[a] + 1 == grid.cells[a], BoxFace::of(a, true))]
                         .iter()

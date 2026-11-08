@@ -1,5 +1,5 @@
-//! The Spalart–Allmaras model on the GPU (G1) against the CPU, with the tolerances proposed in
-//! the G0 note (agent-hub/notes/cfd-gpu-parity.md §3.2) and frozen here at their first
+//! The Spalart–Allmaras model on the GPU against the CPU, with the tolerances proposed before it
+//! was ported and frozen here at their first
 //! measurement: ν̃'s transport alone within 1e-5 of the largest CPU ν̃ after 200 steps, the
 //! coupled RANS channel within 5e-5 for ν̃, 1e-4 / 1e-5 for velocity / density (the LES bounds),
 //! 1e-3 for the largest ν_t/ν and the wall shear, SA-neg's smallest ν̃ within 1e-5 of ν; the wall

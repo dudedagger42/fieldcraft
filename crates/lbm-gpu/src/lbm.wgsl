@@ -93,7 +93,7 @@
 // Vreman's explicit-rate route (`eddy_nu`). The neighbour rule is `fd_neighbour`'s: a fluid
 // cell, a solid cell (a halfway wall) or, beyond a face that is not periodic, that face's kind
 // (2 bits each in `params.sa.x`); the host checks it against the CPU's faces before it runs.
-// f32 guards (G0, agent-hub notes): r = ν̃/(S̃ κ² d²) only where the denominator is positive,
+// f32 guards: r = ν̃/(S̃ κ² d²) only where the denominator is positive,
 // r⁶ and g⁶ by multiplication, pow only for the ^(1/6) of a positive argument.
 
 override AA_MODE: bool = true;
