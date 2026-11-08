@@ -54,6 +54,9 @@ const WALL_DISTANCE: u64 = F64 + 4;
 const SPALART_ALLMARAS: u64 = crate::sa::BYTES_PER_CELL + 2 * F64 + 3 * F64;
 /// Per cell with DDES on the Spalart–Allmaras model: its length d̃ ([`crate::ddes`]).
 const DDES: u64 = F64;
+/// Per absorbing-layer cell ([`crate::absorbing`]): its index, strength, filtered density and
+/// momentum, and its damped populations before they are stored.
+const ABSORBING: u64 = 4 + F64 + 4 * F64 + Q as u64 * F64;
 /// Per cell with the Spalart–Allmaras model on the device: ν̃, its transport rate and
 /// coefficient sum, and the vorticity, wall distance, destruction length and DDES's f_d
 /// (lbm-gpu's `nu_tilde`, `sa_rate`, `sa_cell`); while preparing, the distance and the initial ν̃
@@ -157,6 +160,8 @@ struct Shape {
     conducting: bool,
     open_faces: [bool; 6],
     surface: bool,
+    /// The absorbing layer's thickness in cells (0: none).
+    absorbing_depth: u64,
 }
 
 impl Shape {
@@ -186,6 +191,10 @@ impl Shape {
             conducting: thermal.is_some_and(|t| !t.solids.is_empty()),
             open_faces: fieldcraft_model::BoxFace::ALL.map(|f| is_open(domain.faces.get(f))),
             surface: domain.free_surface.is_some(),
+            absorbing_depth: domain.absorbing.map_or(0, |l| {
+                let cells = (l.thickness / domain.spacing).round();
+                if cells.is_finite() && cells > 0.0 { cells.min(fieldcraft_model::fluids::MAX_CELLS_PER_SIDE as f64) as u64 } else { 0 }
+            }),
         })
     }
 }
@@ -236,6 +245,7 @@ impl Memory {
                     FACE_LINKS * size_of::<Link>() as u64
                         + if open { (size_of::<OpenCell>() + size_of::<[f64; crate::lattice::Q]>()) as u64 } else { 0 },
                 )
+                .saturating_add(if open { c.saturating_mul(s.absorbing_depth).saturating_mul(ABSORBING) } else { 0 })
             })
             .fold(0, u64::saturating_add);
         let mut flow = POPULATIONS + FLAGS;

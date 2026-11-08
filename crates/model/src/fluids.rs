@@ -672,6 +672,51 @@ impl FreeSurface {
     }
 }
 
+/// The largest absorbing-layer strength, relative to the matched value.
+pub const MAX_ABSORBING_STRENGTH: f64 = 4.0;
+
+/// An absorbing layer inside the box at each velocity and pressure face. It drains the pressure
+/// waves those faces reflect (a box's quarter-wave acoustic mode, which otherwise rings for a
+/// long time), and it leaves a steady flow unchanged: each layer cell is pulled toward a slowly
+/// filtered copy of its own density and velocity, so only the unsteady part is damped.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AbsorbingLayer {
+    /// How far the layer reaches into the box from each velocity or pressure face.
+    pub thickness: f64,
+    /// Its strength relative to the matched value, whose damping rate times the thickness is the
+    /// speed of sound (default 1; at most [`MAX_ABSORBING_STRENGTH`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strength: Option<f64>,
+    /// The time constant of the filter that gives each layer cell its reference state (default:
+    /// the time sound takes to cross the box twice along the open faces' axis, half the
+    /// quarter-wave period).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter_time: Option<f64>,
+}
+
+impl AbsorbingLayer {
+    /// Check the numbers; `open` says whether the domain has a velocity or pressure face.
+    pub fn validate(&self, open: bool) -> Result<()> {
+        positive("absorbing layer thickness", self.thickness)?;
+        if let Some(s) = self.strength {
+            positive("absorbing layer strength", s)?;
+            if s > MAX_ABSORBING_STRENGTH {
+                return Err(Error::Invalid(format!(
+                    "the absorbing layer's strength {s} is above {MAX_ABSORBING_STRENGTH}: a stronger layer reflects like a hard face; 1 is matched"
+                )));
+            }
+        }
+        if let Some(t) = self.filter_time {
+            positive("absorbing layer filter time", t)?;
+        }
+        if !open {
+            return Err(Error::Invalid("the absorbing layer needs a velocity or pressure face to sit at; the domain has none".into()));
+        }
+        Ok(())
+    }
+}
+
 /// Where a boundary condition goes: a face of the box, or a named face of an obstacle.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -721,6 +766,10 @@ pub struct FluidDomain {
     /// box full of one fluid.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub free_surface: Option<FreeSurface>,
+    /// An absorbing layer at the velocity and pressure faces ([`AbsorbingLayer`]); `None` for
+    /// none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub absorbing: Option<AbsorbingLayer>,
 }
 
 fn is_zero(v: &[f64; 3]) -> bool {
@@ -823,6 +872,10 @@ impl FluidDomain {
         if let Some(fs) = &self.free_surface {
             let inlet = BoxFace::ALL.iter().any(|f| matches!(self.faces.get(*f), FaceCondition::Velocity { .. }));
             fs.validate(inlet).map_err(|e| context("free surface", "settings", e))?;
+        }
+        if let Some(layer) = &self.absorbing {
+            let open = BoxFace::ALL.iter().any(|f| matches!(self.faces.get(*f), FaceCondition::Velocity { .. } | FaceCondition::Pressure { .. }));
+            layer.validate(open).map_err(|e| context("absorbing layer", "settings", e))?;
         }
         Ok(())
     }
@@ -992,6 +1045,7 @@ mod tests {
             porous: vec![],
             fans: vec![],
             free_surface: None,
+            absorbing: None,
         }
     }
 

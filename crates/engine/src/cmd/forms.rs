@@ -882,6 +882,23 @@ const FREE_SURFACE: Field = group(
 )
 .help("Liquid in part of the box and gas elsewhere: the liquid moves through the gas (a filling cavity, a collapsing column, a wave). The gas is at rest at zero gauge pressure; surface tension is not modelled.");
 
+const ABSORBING: Field = group(
+    "absorbing",
+    "Absorbing layer",
+    &[
+        positive("thickness", "Thickness", D::Length)
+            .help("How far the layer reaches into the box from each velocity or pressure face; keep it clear of where you measure.")
+            .req(),
+        range("strength", "Strength", D::None, 0.0, fieldcraft_model::fluids::MAX_ABSORBING_STRENGTH)
+            .help("Relative to the matched strength, whose damping rate times the thickness is the speed of sound.")
+            .hint("1"),
+        positive("filter_time", "Filter time", D::Time)
+            .help("The time constant of the filtered reference each layer cell is pulled toward; only changes faster than it are damped.")
+            .hint("twice the sound crossing time"),
+    ],
+)
+.help("Drains the pressure waves the inlets and outlets reflect, so a flow settles sooner; a steady flow is unchanged. CPU only.");
+
 pub const FLUID_DOMAIN: &[Field] = &[
     NAME,
     reference("material", "Fluid", C::Material).help("The fluid material: needs a density and a viscosity.").req(),
@@ -924,6 +941,7 @@ pub const FLUID_DOMAIN: &[Field] = &[
         .help("Porous resistance zones: vents, grilles, filters and perforated plates without resolving every hole."),
     rows("fans", "Fans", FAN).help("Fans: zones that raise the pressure by their pressure–flow curve; the solve finds the operating point."),
     FREE_SURFACE,
+    ABSORBING,
 ];
 
 pub const FLUID_BOUNDARY: &[Field] = &[

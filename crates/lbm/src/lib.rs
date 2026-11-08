@@ -63,6 +63,7 @@
 // Population arrays are indexed by cell and direction counts fixed when they are allocated.
 #![allow(clippy::needless_range_loop)]
 
+pub mod absorbing;
 pub mod backend;
 pub mod bounce;
 pub mod checkpoint;

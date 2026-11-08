@@ -280,12 +280,77 @@ pub struct Setup {
     pub zones: Vec<ZoneSetup>,
     /// The free surface's liquid regions, when the domain has one.
     pub surface: Option<SurfaceSetup>,
+    /// The absorbing layer at the velocity and pressure faces, when the domain has one.
+    pub absorbing: Option<AbsorbingSetup>,
     /// A shear-dependent fluid: each cell's own relaxation time (`crate::rheology`).
     pub rheology: Option<Rheology>,
     /// With one: τ⁺ at the flow's characteristic shear rate, before `tau_plus` holds it within
     /// the cells' range, and that range.
     pub shear_dependent_tau: Option<crate::solve::ShearDependentTau>,
     pub warnings: Vec<String>,
+}
+
+/// The absorbing layer in lattice units ([`crate::absorbing`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AbsorbingSetup {
+    /// Its thickness in cells from each velocity or pressure face's own cell layer.
+    pub cells: usize,
+    /// The strength χ per step at the profile's peak.
+    pub strength: f64,
+    /// The reference filter's time constant N_f in steps.
+    pub filter_steps: f64,
+}
+
+/// Most of the box along an open face's axis one face's absorbing layer may cover.
+pub const MAX_ABSORBING_SHARE: f64 = 0.2;
+
+/// The absorbing layer of `domain` in lattice units, or why it is refused.
+fn absorbing(domain: &FluidDomain, grid: &Grid, dt: f64) -> Result<Option<AbsorbingSetup>> {
+    let Some(layer) = &domain.absorbing else { return Ok(None) };
+    let refuse = |what: String| Err(Error::Invalid(format!("the absorbing layer (`absorbing`) {what}")));
+    if domain.free_surface.is_some() {
+        return refuse("is not supported yet with a free surface".into());
+    }
+    if domain.thermal.is_some() {
+        return refuse("is not supported yet with heat in the fluid (`thermal`)".into());
+    }
+    let open: Vec<BoxFace> = BoxFace::ALL
+        .into_iter()
+        .filter(|f| matches!(domain.faces.get(*f), FaceCondition::Velocity { .. } | FaceCondition::Pressure { .. }))
+        .collect();
+    if open.is_empty() {
+        return refuse("needs a velocity or pressure face to sit at; the domain has none".into());
+    }
+    let thickness = layer.thickness / grid.spacing;
+    if !(thickness.is_finite() && thickness.round() >= 2.0) {
+        return refuse(format!("is {thickness:.2} cells thick: give it at least 2 cells ({}), better 10 or more", 2.0 * grid.spacing));
+    }
+    let cells = thickness.round();
+    for face in &open {
+        let across = grid.cells.get(face.axis()).copied().unwrap_or(0) as f64;
+        if cells > MAX_ABSORBING_SHARE * across {
+            return refuse(format!(
+                "is {cells} cells thick at box face `{}`, more than a fifth of the box's {across} cells along that axis: make it thinner, or the box longer, so it stays clear of the flow you measure",
+                face.name()
+            ));
+        }
+    }
+    let cs = crate::lattice::CS2.sqrt();
+    let strength = layer.strength.unwrap_or(1.0) * cs / cells;
+    if !(strength.is_finite() && strength > 0.0 && strength < crate::absorbing::MAX_STRENGTH) {
+        return refuse(format!("is {strength:.3} per step strong, outside (0, {}): lower `strength`", crate::absorbing::MAX_STRENGTH));
+    }
+    let filter_steps = match layer.filter_time {
+        Some(t) => t / dt,
+        None => {
+            let longest = open.iter().map(|f| grid.cells.get(f.axis()).copied().unwrap_or(0)).max().unwrap_or(0) as f64;
+            2.0 * longest / cs
+        }
+    };
+    if !(filter_steps.is_finite() && filter_steps >= 1.0) {
+        return refuse(format!("filter time is {filter_steps:.3} time steps: give at least one time step ({dt})"));
+    }
+    Ok(Some(AbsorbingSetup { cells: cells as usize, strength, filter_steps }))
 }
 
 /// The Spalart–Allmaras model's settings ([`crate::sa`]).
@@ -950,6 +1015,7 @@ impl Setup {
             }
         }
         let zones = zones(&domain, &grid, viscosity, dt, density)?;
+        let absorbing = absorbing(&domain, &grid, dt)?;
         let surface = match &domain.free_surface {
             None => None,
             Some(fs) => {
@@ -1033,6 +1099,7 @@ impl Setup {
             steady: steady.as_ref().map(|r| crate::steady::SteadySetup::new(r, n, dt)).transpose()?,
             zones,
             surface,
+            absorbing,
             rheology,
             shear_dependent_tau,
             warnings,

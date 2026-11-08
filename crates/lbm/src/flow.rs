@@ -594,6 +594,8 @@ pub struct Flow {
     pub(crate) block: usize,
     /// Each open cell's populations after its boundary, in the step (kept for its capacity).
     open_scratch: Vec<[f64; Q]>,
+    /// The absorbing layer at the velocity and pressure faces (empty without one).
+    absorbing: crate::absorbing::Layer,
     /// The free surface: which fluid cells hold liquid, with a free surface.
     pub(crate) surface: Option<Surface>,
 }
@@ -1060,6 +1062,40 @@ impl Flow {
             }
         }
 
+        // The absorbing layer ([`crate::absorbing`]): the fluid cells within its thickness of a
+        // velocity or pressure face, each weighted by the profile at its depth (the largest over
+        // the faces it is near). The open cells keep their face's rule alone, and boundary nodes
+        // their wall's, so the layer leaves both out.
+        let absorbing = match setup.absorbing {
+            None => crate::absorbing::Layer::default(),
+            Some(layer) => {
+                let open_faces: Vec<BoxFace> = BoxFace::ALL
+                    .into_iter()
+                    .filter(|f| matches!(domain.faces.get(*f), FaceCondition::Velocity { .. } | FaceCondition::Pressure { .. }))
+                    .collect();
+                let (mut cells, mut strength) = (Vec::new(), Vec::new());
+                for cell in 0..n {
+                    if !fluid.get(cell).copied().unwrap_or(false) || taken.get(cell).copied().unwrap_or(true) || is_node(cell) {
+                        continue;
+                    }
+                    let p = grid.coords(cell);
+                    let w = open_faces
+                        .iter()
+                        .map(|f| {
+                            let (a, at) = (f.axis(), p.get(f.axis()).copied().unwrap_or(0));
+                            let depth = if f.is_max() { grid.cells.get(a).copied().unwrap_or(0).saturating_sub(at + 1) } else { at };
+                            crate::absorbing::weight(depth, layer.cells)
+                        })
+                        .fold(0.0, f64::max);
+                    if w > 0.0 {
+                        cells.push(cell as u32);
+                        strength.push(w * layer.strength);
+                    }
+                }
+                crate::absorbing::Layer::new(cells, strength, 1.0 / layer.filter_steps)?
+            }
+        };
+
         // Fans and porous zones: their fluid cells (the first zone that contains a cell owns it),
         // kept off the inlet and outlet layers, whose boundary rule knows only the body force.
         let mut zone_of = if setup.zones.is_empty() { Vec::new() } else { filled(n, NONE, "zone cells")? };
@@ -1365,6 +1401,7 @@ impl Flow {
             outlets: Outlets::default(),
             block: block_cells(n),
             open_scratch: Vec::new(),
+            absorbing,
             surface,
         };
         flow.outlets = Outlets::new(&flow.open, &View { flow: &flow, f: &flow.f });
@@ -1387,6 +1424,11 @@ impl Flow {
     /// Whether the flow has a free surface.
     pub fn free_surface(&self) -> bool {
         self.surface.is_some()
+    }
+
+    /// The absorbing layer's cells, in increasing order (empty without one).
+    pub fn absorbing_cells(&self) -> &[u32] {
+        self.absorbing.cells()
     }
 
     /// With a free surface: how it fared so far ([`SurfaceReport`]).
@@ -1585,7 +1627,8 @@ impl Flow {
             + bytes(&self.zone_of)
             + bytes(&self.open_scratch)
             + self.zone_cells.iter().map(bytes).sum::<u64>()
-            + self.outlets.heap_bytes();
+            + self.outlets.heap_bytes()
+            + self.absorbing.heap_bytes();
         if let Some(t) = &self.thermal {
             total += bytes(&t.g) + bytes(&t.g2) + bytes(&t.temperature) + bytes(&t.open) + bytes(&t.reset);
             total += t.phase.as_ref().map_or(0, |p| bytes(&p.liquid));
@@ -1891,6 +1934,7 @@ impl Flow {
         self.advance_sa()?;
         let max_u2 = self.collide();
         self.collide_nodes();
+        self.absorbing.apply(&mut self.f, self.stride, self.block);
         if !(max_u2 <= MAX_LATTICE_SPEED * MAX_LATTICE_SPEED) {
             return Err(Error::Unstable(format!(
                 "the flow went unstable at time step {}: the lattice speed reached {:.3} (limit {MAX_LATTICE_SPEED}) or a density stopped being a positive number; lower the time step, refine the spacing or check the boundary conditions",
@@ -3107,6 +3151,7 @@ impl crate::backend::Backend for Flow {
             block: _,
             // Overwritten before use; its capacity is not state.
             open_scratch: _,
+            absorbing,
             surface,
         } = self;
         let n = *n;
@@ -3217,6 +3262,10 @@ impl crate::backend::Backend for Flow {
             f64(a, &mut action.beta)?;
         }
         outlets.checkpoint(a)?;
+        fixed(a, u64::from(!absorbing.is_empty()))?;
+        if !absorbing.is_empty() {
+            absorbing.checkpoint(a)?;
+        }
         fixed(a, u64::from(surface.is_some()))?;
         if let Some(s) = surface {
             s.checkpoint(a, n)?;

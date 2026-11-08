@@ -88,6 +88,22 @@ fn a_convective_outlet_and_relaxed_fan_resume_with_every_bit_and_history() {
     }
 }
 
+/// The absorbing layer's filtered references are part of the saved state: a run with the layer
+/// resumes bit for bit, on every collision.
+#[test]
+fn an_absorbing_layer_resumes_with_its_filtered_reference() {
+    for collision in [Collision::Trt, Collision::Mrt, Collision::Hrr] {
+        let mut d = domain([0.0; 3], [24.0, 2.0, 2.0], 1.0);
+        d.faces.x_min = FaceCondition::Velocity { velocity: [0.02, 0.0, 0.0], profile: fieldcraft_model::Profile::Uniform };
+        d.faces.x_max = FaceCondition::Pressure { pressure: 0.0, outflow: Outflow::Uniform };
+        for f in [&mut d.faces.y_min, &mut d.faces.y_max, &mut d.faces.z_min, &mut d.faces.z_max] {
+            *f = FaceCondition::Periodic {};
+        }
+        d.absorbing = Some(fieldcraft_model::AbsorbingLayer { thickness: 4.0, strength: Some(2.0), filter_time: Some(9.0) });
+        parity(&model(1.0, 0.1, d, collide(67.0, 1.0, None, collision)), &[]);
+    }
+}
+
 #[test]
 fn thermal_buoyancy_and_conducting_solid_state_resume_inside_a_steady_window() {
     let dx = 0.125;

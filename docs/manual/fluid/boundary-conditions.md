@@ -53,6 +53,17 @@ being the default. A face is named as in sets: `F2:top` also selects its split p
 each obstacle face has at most one condition. A box face that is an inlet or outlet needs at least
 2 cells across it.
 
+The domain's `absorbing` setting (`model.fluid_domain.create` and `.edit`) puts an absorbing layer
+inside the box at every velocity and pressure face:
+
+| Field | Default | Meaning |
+|---|---|---|
+| `thickness` | — | How far the layer reaches into the box from each velocity or pressure face. At least 2 cells; at most a fifth of the box along that face's axis. |
+| `strength` | 1 | Relative to the matched strength, whose damping rate times the thickness is the speed of sound. Above 0, at most 4. |
+| `filter_time` | twice the sound crossing time | The time constant of the low-pass filter that gives each layer cell its reference state. Only changes faster than it are damped. |
+
+It is refused with heat in the fluid, with a free surface, and on the GPU.
+
 ## Theory
 
 ### Walls: halfway bounce-back
@@ -150,6 +161,40 @@ normal and tangential, comes from the flow.
 fallback: Zou–He at the face's density, no tangential velocity, which stays stable with reversed
 outlet cells. The rule changes only the outlet cells' streamed populations, so it does not depend
 on the collision operator.
+
+### Absorbing layers
+
+A velocity inlet is acoustically a closed end and a pressure outlet an open one, so a box between
+them traps a quarter-wave pressure mode. Its period is 4 L / c_s along the box. Viscosity damps
+such a long wave only at ν k², which takes millions of steps. Its flow then rings around the mean
+for as long as the run lasts.
+
+The absorbing layer drains that mode. It is H. Xu and P. Sagaut's type II absorbing term (2013,
+eqs. 24–25). After the collision, each layer cell's populations get
+
+```text
+f_q += σ̃(ξ) χ [f^eq_q(ρ̄, ū) − f^eq_q(ρ, u)]
+```
+
+- **The term** moves the cell's density and momentum a share σ̃ χ toward the reference, and adds
+  no non-equilibrium part. The relaxation rate is unchanged, so the viscosity can't turn negative.
+- **The reference** (ρ̄, ū) is a low-pass filtered copy of the cell's own state: ρ̄ ← ρ̄ + (ρ − ρ̄)/N_f
+  per step. This is selective frequency damping (Åkervik et al. 2006). A steady state is a fixed
+  point, so the term vanishes there and the mean flow is unchanged. No target profile has to be
+  given, which matters at an outlet a boundary layer crosses.
+- **The profile** is Israeli and Orszag's polynomial σ̃(ξ) = 3125 (1 − ξ) ξ⁴ / 256. It peaks at 1
+  and is zero at the layer's inner edge (ξ = 0) and at the face's own cells (ξ = 1), so the face's
+  rule is unchanged. Han's wall nodes keep their wall's rule and are left out of the layer too.
+- **The strength.** The matched strength χ = c_s / d (d the thickness in cells) absorbs a long
+  wave without reflecting it from the layer like a hard face. The default filter is N_f = 2 L / c_s
+  steps, half the quarter-wave period.
+- **Stability.** The pair is stable when the two-by-two iteration of the damped mode and its
+  filtered copy contracts (Jordi, Cotter and Sherwin 2014, eqs. 10–11). On a 250-cell box the
+  defaults leave 3 × 10⁻⁴ of the mode's amplitude after five periods. Per cell the layer is
+  stable for χ < 2 per step, which the setup enforces, below Xu and Sagaut's bound 4/s.
+
+Measurements inside the layer are not of the physical flow: keep it clear of the regions you
+measure.
 
 ### Wall forces: momentum exchange
 
@@ -306,7 +351,8 @@ this resolution: c_D 3.4 % above).
 - A uniform pressure outlet distorts the last cell layer where an unrecovered wake reaches it. The
   reported speed extremes (`max_speed`, slice ranges) leave every inlet and outlet layer out for
   this reason, convective outlets included.
-- Inlets and outlets reflect pressure waves; there are no absorbing layers.
+- Inlets and outlets reflect pressure waves. The absorbing layer (`absorbing`) drains them, on the
+  CPU only, without heat or a free surface.
 - Fans and porous zones must stay at least one cell inside the inlet and outlet layers.
 
 ## Implementation
@@ -317,6 +363,7 @@ this resolution: c_D 3.4 % above).
 | `crates/lbm/src/lattice.rs` | `moving_wall`: Ladd's term. |
 | `crates/lbm/src/flow.rs` | `Rule`, `Link`, `OpenCell`, `Target`; `Flow::new` (links and open cells), `stream` (rules, momentum exchange), `open_boundaries`, `zou_he`, `hold_equilibrium`, `thermal_rule`. |
 | `crates/lbm/src/outlet.rs` | `Outlets::convect`, `record`, `unknowns`, `backflow`. |
+| `crates/lbm/src/absorbing.rs` | The absorbing layer: `profile`, `weight`, `damp`, `Layer`. |
 | `crates/lbm/src/voxel.rs` | `TriangleTree::nearest`: the face of each wall link. |
 | `crates/engine/src/cmd/define.rs` | `model.fluid_domain.boundary`. |
 
@@ -332,4 +379,8 @@ this resolution: c_D 3.4 % above).
 - T. Krüger et al. *The Lattice Boltzmann Method: Principles and Practice.* Springer, 2017. doi:[10.1007/978-3-319-44649-3](https://doi.org/10.1007/978-3-319-44649-3)
 - M. Schäfer, S. Turek. *Benchmark computations of laminar flow around a cylinder.* NNFM 52:547–566, 1996. doi:[10.1007/978-3-322-89849-4_39](https://doi.org/10.1007/978-3-322-89849-4_39)
 
+- H. Xu, P. Sagaut. *Analysis of the absorbing layers for the weakly-compressible lattice Boltzmann methods.* J. Comput. Phys. 245:14–42, 2013. arXiv:1203.6350.
+- E. Åkervik, L. Brandt, D. S. Henningson, J. Hœpffner, O. Marxen, P. Schlatter. *Steady solutions of the Navier–Stokes equations by selective frequency damping.* Phys. Fluids 18:068102, 2006. doi:[10.1063/1.2211705](https://doi.org/10.1063/1.2211705)
+- B. E. Jordi, C. J. Cotter, S. J. Sherwin. *An adaptive selective frequency damping method.* arXiv:1412.4372, 2014.
+- M. Israeli, S. A. Orszag. *Approximation of radiation boundary conditions.* J. Comput. Phys. 41:115–135, 1981.
 - Z. Guo, C. Zheng, B. Shi. *Non-equilibrium extrapolation method for velocity and pressure boundary conditions in the lattice Boltzmann method.* Chinese Physics 11:366–374, 2002. doi:[10.1088/1009-1963/11/4/310](https://doi.org/10.1088/1009-1963/11/4/310)

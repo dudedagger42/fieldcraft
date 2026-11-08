@@ -282,6 +282,7 @@ impl Quantities for FluidDomain {
             porous,
             fans,
             free_surface,
+            absorbing,
         } = self;
         each(min, Q::Length, f);
         each(max, Q::Length, f);
@@ -356,6 +357,12 @@ impl Quantities for FluidDomain {
             for LiquidRegion { min, max } in liquid {
                 each(min, Q::Length, f);
                 each(max, Q::Length, f);
+            }
+        }
+        if let Some(AbsorbingLayer { thickness, strength: _, filter_time }) = absorbing {
+            f(Q::Length, thickness);
+            if let Some(t) = filter_time {
+                f(Q::Time, t);
             }
         }
     }

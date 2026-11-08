@@ -665,6 +665,29 @@ JCP 232(1):100–117, 2013, DOI [10.1016/j.jcp.2012.07.023](https://doi.org/10.1
 - **Limits.** Holding each cell at the face's pressure still reflects part of a strong vortex's pressure field;
   a characteristic (non-reflecting) outlet would pass it.
 
+**C3.5 Xu & Sagaut 2013, absorbing layers for the LBM.** **Verdict: build on (the absorbing layer, `absorbing`).**
+- **Citation.** H. Xu, P. Sagaut, *Analysis of the absorbing layers for the weakly-compressible lattice Boltzmann
+  methods*, J. Comput. Phys. 245:14–42 (2013), arXiv:1203.6350.
+- **Method.** Three ways to add a damping term to the lattice Boltzmann equation. Type II adds
+  `χ [f^eq(ρ_ref, u_ref) − f^eq(ρ, u)]` after the collision and keeps the relaxation rate (eqs. 24–25). Type I
+  modifies the rate and can make the viscosity negative. Stable below `χ = 4/s`. The strength follows Israeli &
+  Orszag's n = 4 profile (eq. 34).
+- **Used as.** `crates/lbm/src/absorbing.rs`: type II on the cells within the layer's thickness of each velocity and
+  pressure face, applied after the collision on the post-collision moments. The reference is filtered in time (C3.6),
+  not a far field. Implementation is independent, from the paper.
+- **Limits.** Measurements inside the layer aren't of the physical flow.
+
+**C3.6 Åkervik et al. 2006, selective frequency damping.** **Verdict: build on (the absorbing layer's reference).**
+- **Citation.** E. Åkervik, L. Brandt, D. S. Henningson, J. Hœpffner, O. Marxen, P. Schlatter, *Steady solutions
+  of the Navier–Stokes equations by selective frequency damping*, Phys. Fluids 18:068102 (2006),
+  DOI [10.1063/1.2211705](https://doi.org/10.1063/1.2211705). The discrete, encapsulated form and its two-by-two
+  stability model: B. E. Jordi, C. J. Cotter, S. J. Sherwin, *An adaptive selective frequency damping method*,
+  arXiv:1412.4372 (2014), eqs. 2–5 and 10–11.
+- **Method.** Damp `q − q̄` toward a low-pass filtered copy `q̄`, with `dq̄/dt = (q − q̄)/Δ`. A steady state is a
+  fixed point.
+- **Used as.** Each layer cell's reference density and momentum, `q̄ ← q̄ + (q − q̄)/N_f` per step. So a steady flow
+  is unchanged by the layer, and no target state has to be given.
+
 ### C4. Grid refinement
 
 **C4.1 Filippova & Hänel 1998; Dupuis & Chopard 2003.** **Verdict: build on (Dupuis–Chopard cell-vertex refinement).**
