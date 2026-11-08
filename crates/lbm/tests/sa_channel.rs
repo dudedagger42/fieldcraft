@@ -48,6 +48,12 @@ use fieldcraft_model::{Collision, FaceCondition, Procedure, Turbulence, WallMode
 const LEE_MOSER_1000_BULK: f64 = 1.0 / 0.0500256;
 const LEE_MOSER_1000_CF: f64 = 2.0 * 0.0500256 * 0.0500256;
 
+/// Lee & Moser (2015), Re_τ = 182.088: u_τ = 0.0637309 at U_b = 1 (ν = 3.5 × 10⁻⁴, δ = 1), from
+/// the header of LM_Channel_0180_mean_prof.dat (same source as the Re_τ 1000 values).
+const LEE_MOSER_180_RE_TAU: f64 = 182.088;
+const LEE_MOSER_180_BULK: f64 = 1.0 / 0.0637309;
+const LEE_MOSER_180_CF: f64 = 2.0 * 0.0637309 * 0.0637309;
+
 /// A channel run's parameters.
 #[derive(Debug, Clone)]
 struct Channel {
@@ -370,6 +376,9 @@ fn the_wall_interval_integrates_the_law_the_wall_applies() {
 fn the_lee_moser_reference_is_their_published_bulk_and_friction_velocity() {
     assert!((LEE_MOSER_1000_BULK - 19.9898).abs() < 1e-4, "{LEE_MOSER_1000_BULK}");
     assert!((LEE_MOSER_1000_CF - 5.00512e-3).abs() < 1e-8, "{LEE_MOSER_1000_CF}");
+    assert!((LEE_MOSER_180_BULK - 15.6910).abs() < 1e-4, "{LEE_MOSER_180_BULK}");
+    assert!((LEE_MOSER_180_CF - 8.12326e-3).abs() < 1e-8, "{LEE_MOSER_180_CF}");
+    assert!((LEE_MOSER_180_RE_TAU * 3.5e-4 - 0.0637309).abs() < 1e-6, "Re_τ ν = u_τ δ");
 }
 
 /// The model with wall model `wall`, inflow ν̃/ν 3 (the initial field).
@@ -495,6 +504,86 @@ fn sa_rans_channel_at_re_tau_1000_meets_lee_and_moser() {
                 100.0 * (r.carried / LEE_MOSER_1000_CF - 1.0)
             );
             assert!(r.budget_ok, "{name}: the halfway wall's budget closes every step");
+        }
+        if !r.settled {
+            failures.push(format!("{name}: not settled in {} steps", r.steps));
+        }
+        if !r.min_nu_tilde.is_some_and(|v| v >= 0.0) {
+            failures.push(format!("{name}: ν̃ below 0 ({:?})", r.min_nu_tilde));
+        }
+    }
+    println!("{}", score.table());
+    assert!(failures.is_empty(), "{failures:?}");
+    assert!(score.passes());
+}
+
+/// The SA channel at Lee & Moser's low Reynolds number, Re_τ 182, the range of a pipe at
+/// Re_b 5300 (Re_τ 181, `sa_pipe.rs`) and a square duct at Re_τ ≈ 150. It measures the model's own
+/// error there, on MRT:
+/// - **gated:** SA resolved to the wall (no wall model, halfway walls), first cell centre at
+///   y⁺ ≈ 1 and ½: carried C_f within 5 % of Lee & Moser's 8.123 × 10⁻³;
+/// - **pinned, not gated:** Han's on-node wall at 10 and 20 cells per δ (first node y⁺ 18 and 9).
+///   It over-predicts C_f by 6–7 % at this Reynolds number (+0.1 to +1.2 % at Re_τ 1000, the test
+///   above), while its request equals the carried stress (1.00001): the wall carries what it asks
+///   for, so the error is the wall-function closure at low Re_τ (Spalding's law at the first node
+///   fed by SA's profile). Each run must stay within 0.5 percentage points of its measured error,
+///   so a change that moves it, better or worse, fails and comes to review.
+///
+/// Every run settled under [`GATED`] with ν̃ ≥ 0. Measured when written (MRT, 4 threads, 484 s):
+///
+/// | wall | cells per δ (first node y⁺) | steps | U_b⁺ (LM 15.691) | C_f carried | requested / carried |
+/// |---|---|---|---|---|---|
+/// | resolved, halfway | 91 (1.0) | 95 300 | 15.803 (+0.71 %) | −1.41 % | – |
+/// | resolved, halfway | 182 (0.5) | 750 100 | 15.889 (+1.26 %) | −2.48 % | – |
+/// | Han on-node | 10 (18.2) | 54 400 | 15.166 (−3.35 %) | +7.04 % | 1.00001 |
+/// | Han on-node | 20 (9.1) | 115 200 | 15.224 (−2.98 %) | +6.23 % | 1.00001 |
+///
+/// SA's own error at Re_τ 180 is thus about −2.5 % in C_f, the floor any wall-resolved SA run at
+/// this Reynolds number starts from.
+#[test]
+#[ignore = "heavy: cargo xtask test --heavy (CI heavy job)"]
+fn sa_rans_channel_at_re_tau_180_meets_lee_and_moser() {
+    let resolved = Turbulence::SpalartAllmaras { prandtl: 0.9, wall_model: None, inflow_ratio: 3.0, ddes: None };
+    // The wall, on-node or not, cells per δ, and Han's measured C_f error (pinned).
+    let han = sa(WallModel::SpaldingBounce);
+    let runs = [(resolved, false, 91usize, None), (resolved, false, 182, None), (han, true, 10, Some(0.0704)), (han, true, 20, Some(0.0623))];
+    let mut score = Score::default();
+    let mut failures = Vec::new();
+    for (turbulence, on_node, cells, pinned) in runs {
+        let r = Channel {
+            re_tau: LEE_MOSER_180_RE_TAU,
+            cells,
+            bulk_guess: LEE_MOSER_180_BULK,
+            lattice_bulk: 0.1,
+            collision: Collision::Mrt,
+            sigma: None,
+            turbulence: Some(turbulence),
+            on_node,
+            slabs: false,
+            max_steps: 2_000_000,
+            sample: 100,
+            settling: GATED,
+        }
+        .run();
+        let y_plus = if on_node { LEE_MOSER_180_RE_TAU / cells as f64 } else { 0.5 * LEE_MOSER_180_RE_TAU / cells as f64 };
+        let wall = if on_node { "Han on-node" } else { "resolved, halfway" };
+        let name = format!("SA {wall}, {cells} cells per δ (first node y⁺ {y_plus:.1})");
+        report(&name, &r, LEE_MOSER_180_BULK, LEE_MOSER_180_CF);
+        let error = r.carried / LEE_MOSER_180_CF - 1.0;
+        match pinned {
+            None => score.push(Gate::new("SA channel 180", &format!("{name}: C_f carried"), r.carried, LEE_MOSER_180_CF, 0.05)),
+            Some(measured) => {
+                println!("pinned, not gated: C_f carried {:+.2} % against Lee & Moser (measured {:+.2} %)", 100.0 * error, 100.0 * measured);
+                if (error - measured).abs() > 0.005 {
+                    failures.push(format!("{name}: C_f error {:+.2} % left its pinned band {:+.2} ± 0.5 %", 100.0 * error, 100.0 * measured));
+                }
+            }
+        }
+        if on_node {
+            let ratio = r.requested.unwrap_or(f64::NAN) / r.carried;
+            score.push(Gate::new("SA channel 180", &format!("{name}: requested / carried"), ratio, 1.0, 0.01));
+        } else if !r.budget_ok {
+            failures.push(format!("{name}: the halfway wall's budget did not close"));
         }
         if !r.settled {
             failures.push(format!("{name}: not settled in {} steps", r.steps));
