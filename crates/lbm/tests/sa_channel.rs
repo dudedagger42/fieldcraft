@@ -59,6 +59,8 @@ struct Channel {
     /// U_b in lattice units (about).
     lattice_bulk: f64,
     collision: Collision,
+    /// The hybrid collision's fixed σ (`None`: its default, or another collision).
+    sigma: Option<f64>,
     turbulence: Option<Turbulence>,
     /// The walls on lattice nodes (the on-node bounce: one boundary node layer more) rather than
     /// halfway between cells.
@@ -133,8 +135,9 @@ impl Channel {
         d.initial_velocity = [self.bulk_guess, 0.0, 0.0];
         let dt = self.lattice_bulk * dx / self.bulk_guess;
         let mut p = collide(self.max_steps as f64 * dt, dt, None, self.collision);
-        if let Procedure::Fluid { turbulence, .. } = &mut p {
+        if let Procedure::Fluid { turbulence, sigma, .. } = &mut p {
             *turbulence = self.turbulence;
+            *sigma = self.sigma.map(fieldcraft_model::HrrSigma::Value);
         }
         model(1.0, 1.0 / self.re_tau, d, p)
     }
@@ -304,6 +307,7 @@ fn a_laminar_channel_reads_poiseuille_friction() {
         max_steps: 200_000,
         sample: 50,
         settling: GATED,
+        sigma: None,
     };
     let r = ch.run();
     let (bulk, cf) = (re_tau / 3.0, 18.0 / (re_tau * re_tau));
@@ -392,6 +396,7 @@ fn the_sa_wall_function_s_request_is_read() {
             max_steps: 400,
             sample: 100,
             settling: GATED,
+            sigma: None,
         };
         let r = ch.run();
         report(&format!("SA {wall:?}, {cells} cells per δ, 400 steps"), &r, LEE_MOSER_1000_BULK, LEE_MOSER_1000_CF);
@@ -411,12 +416,18 @@ fn c7(wall: WallModel, on_node: bool, cells: usize, max_steps: u64) -> ChannelRe
 
 /// [`c7`], with the walls as obstacle slabs when `slabs`.
 fn c7_on(wall: WallModel, on_node: bool, slabs: bool, cells: usize, max_steps: u64) -> ChannelResult {
+    c7_with(Collision::Mrt, None, wall, on_node, slabs, cells, max_steps)
+}
+
+/// [`c7_on`] with the collision `collision` (and the hybrid collision's fixed σ).
+fn c7_with(collision: Collision, sigma: Option<f64>, wall: WallModel, on_node: bool, slabs: bool, cells: usize, max_steps: u64) -> ChannelResult {
     Channel {
         re_tau: 1000.0,
         cells,
         bulk_guess: LEE_MOSER_1000_BULK,
         lattice_bulk: 0.1,
-        collision: Collision::Mrt,
+        collision,
+        sigma,
         turbulence: Some(sa(wall)),
         on_node,
         slabs,
@@ -519,5 +530,42 @@ fn sa_rans_channel_on_obstacle_walls_is_the_box_face_channel() {
     assert!(boxed.settled && slabbed.settled, "settled: box {} slabs {}", boxed.settled, slabbed.settled);
     assert_eq!((boxed.steps, boxed.carried.to_bits()), (slabbed.steps, slabbed.carried.to_bits()), "the same run");
     assert!(slabbed.min_nu_tilde.is_some_and(|v| v >= 0.0), "{:?}", slabbed.min_nu_tilde);
+    assert!(score.passes());
+}
+
+/// C7 on the collision 2DZP runs on (board decision after the 2DZP inlet probes): the hybrid
+/// collision at fixed σ 0.99, on Han's on-node wall, 20 and 32 cells per δ. The same gates as on
+/// MRT: carried C_f within 5 % of Lee & Moser on the wall-law U_b, the request within 1 % of the
+/// carried stress, settled, ν̃ ≥ 0.
+///
+/// Measured when written (4 threads, 46 s for both), wall-law U_b with the trapezoid beside it:
+///
+/// | cells per δ (y⁺₁) | steps | U_b⁺ | C_f carried | requested / carried |
+/// |---|---|---|---|---|
+/// | 20 (50) | 128 000 | 19.890 (−0.50 %; trapezoid −1.42 %) | 5.056e-3 (+1.01 %; trapezoid +2.91 %) | 1.00001 |
+/// | 32 (31) | 255 200 | 19.734 (−1.28 %; trapezoid −1.70 %) | 5.136e-3 (+2.61 %; trapezoid +3.48 %) | 1.00000 |
+///
+/// Against MRT (+0.11 % and +1.23 %) the hybrid collision adds about 1 % on the coarse grid and
+/// 1.4 % on the fine one, inside the gate on both.
+#[test]
+#[ignore = "heavy: cargo xtask test --heavy (CI heavy job)"]
+fn sa_rans_channel_on_the_hybrid_collision_meets_lee_and_moser() {
+    let mut score = Score::default();
+    let mut failures = Vec::new();
+    for cells in [20, 32] {
+        let r = c7_with(Collision::Hrr, Some(0.99), WallModel::SpaldingBounce, true, false, cells, 2_000_000);
+        let name = format!("SA Han on HRR σ 0.99, {cells} cells per δ (first node y⁺ {:.0})", 1000.0 / cells as f64);
+        report(&name, &r, LEE_MOSER_1000_BULK, LEE_MOSER_1000_CF);
+        score.push(Gate::new("C7 channel, HRR", &format!("{name}: C_f carried"), r.carried, LEE_MOSER_1000_CF, 0.05));
+        score.push(Gate::new("C7 channel, HRR", &format!("{name}: requested / carried"), r.requested.unwrap_or(f64::NAN) / r.carried, 1.0, 0.01));
+        if !r.settled {
+            failures.push(format!("{name}: not settled in {} steps", r.steps));
+        }
+        if !r.min_nu_tilde.is_some_and(|v| v >= 0.0) {
+            failures.push(format!("{name}: ν̃ below 0 ({:?})", r.min_nu_tilde));
+        }
+    }
+    println!("{}", score.table());
+    assert!(failures.is_empty(), "{failures:?}");
     assert!(score.passes());
 }
