@@ -243,3 +243,82 @@ fn hostile_layers_are_refused() {
     d.absorbing = Some(layer(0.5, Some(2.0), Some(0.5)));
     assert_eq!(try_setup(d), Ok(()));
 }
+
+/// The laminar flat-plate box (Re 2000 per unit length, Δ = 1/200, U = 0.1 in lattice units,
+/// TRT): x from −0.25 to 1, z from −Δ to 2, one cell periodic in y; a uniform velocity inlet, a
+/// convective pressure outlet, slip floor and roof, and the plate (0 ≤ x ≤ 1) as solid cells on the
+/// floor. It traps a quarter-wave acoustic mode between the inlet and the outlet. `absorbing`
+/// puts a layer at both. Run `steps` steps, calling `each` after every one.
+fn laminar_plate_box(absorbing: Option<AbsorbingLayer>, steps: u64, mut each: impl FnMut(u64, &Flow)) {
+    let h = 1.0 / 200.0;
+    let mut d = domain([-0.25, 0.0, -h], [1.0, h, 2.0], h);
+    d.faces.x_min = FaceCondition::Velocity { velocity: [1.0, 0.0, 0.0], profile: Profile::Uniform };
+    d.faces.x_max = FaceCondition::Pressure { pressure: 0.0, outflow: Outflow::Convective };
+    d.faces.y_min = FaceCondition::Periodic {};
+    d.faces.y_max = FaceCondition::Periodic {};
+    d.faces.z_min = FaceCondition::Slip {};
+    d.faces.z_max = FaceCondition::Slip {};
+    d.initial_velocity = [1.0, 0.0, 0.0];
+    d.absorbing = absorbing;
+    let plate = vec![obstacle("Plate", cuboid([0.0, -h, -2.0 * h], [1.0, 2.0 * h, 0.0]), &CUBOID_FACES)];
+    d.obstacles = vec!["Plate".into()];
+    let dt = 0.1 * h;
+    let m = model(1.0, 1.0 / 2000.0, d, collide(steps as f64 * dt, dt, None, Collision::Trt));
+    let limits = Limits { max_cell_updates: u64::MAX, max_steps: u64::MAX, ..Limits::default() };
+    let setup = Setup::new(&m, None, &plate, &limits).unwrap();
+    let mut flow = Flow::new(&setup, &plate).unwrap();
+    for k in 1..=steps {
+        flow.step().unwrap();
+        each(k, &flow);
+    }
+}
+
+/// The quarter-wave mode of the laminar plate box decays at least tenfold within five periods
+/// with the layer on: the inlet's density amplitude (the mean over the first interior column, half
+/// its range over one period) in the period after step 2000 + 5 T against the period before step
+/// 2000. The period is T = 4 L_x / c_s / (1 − Ma²) = 1786 steps. The layer is 20 cells at both
+/// ends (x < −0.15 and x > 0.9), clear of the plate's measured stations (0.3 ≤ x ≤ 0.9). Without
+/// the layer the same ratio is printed beside it: the mode barely decays.
+#[test]
+#[ignore = "heavy: cargo xtask test --heavy (CI heavy job)"]
+fn the_layer_drains_the_laminar_plate_s_quarter_wave() {
+    let h = 1.0 / 200.0;
+    let period = (4.0 * 250.0 * 3f64.sqrt() / (1.0 - 3.0 * 0.01)).round() as u64;
+    let (early, late) = (2000 - period..2000, 2000 + 5 * period..2000 + 6 * period);
+    let amplitude = |layer: Option<AbsorbingLayer>| -> (f64, f64) {
+        let (mut a, mut b) = ((f64::INFINITY, f64::NEG_INFINITY), (f64::INFINITY, f64::NEG_INFINITY));
+        laminar_plate_box(layer, late.end, |k, flow| {
+            let into = |r: &mut (f64, f64)| {
+                let grid = flow.grid();
+                let [_, _, nz] = grid.cells;
+                let rho: Vec<f64> = (0..nz).filter_map(|kz| flow.moments(grid.index([1, 0, kz])).map(|(r, _)| r)).collect();
+                let mean = rho.iter().sum::<f64>() / rho.len().max(1) as f64;
+                r.0 = r.0.min(mean);
+                r.1 = r.1.max(mean);
+            };
+            if early.contains(&k) {
+                into(&mut a);
+            } else if late.contains(&k) {
+                into(&mut b);
+            }
+            if k == 1 && layer.is_some() {
+                // The layer stays clear of the measured stations.
+                let grid = flow.grid();
+                for &c in flow.absorbing_cells() {
+                    let x = grid.centre(c as usize)[0];
+                    assert!(x < -0.15 + 1e-9 || x > 0.9 - 1e-9, "a layer cell at x = {x}");
+                }
+            }
+        });
+        (0.5 * (a.1 - a.0), 0.5 * (b.1 - b.0))
+    };
+    let layer = AbsorbingLayer { thickness: 20.0 * h, strength: None, filter_time: None };
+    let (on_early, on_late) = amplitude(Some(layer));
+    let (off_early, off_late) = amplitude(None);
+    println!(
+        "inlet density amplitude, period {period} steps: with the layer {on_early:.3e} → {on_late:.3e} (÷{:.1}), without {off_early:.3e} → {off_late:.3e} (÷{:.2})",
+        on_early / on_late,
+        off_early / off_late
+    );
+    assert!(on_late.is_finite() && on_late * 10.0 <= on_early, "the mode decayed only ÷{:.2}", on_early / on_late);
+}

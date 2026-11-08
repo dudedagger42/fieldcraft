@@ -33,7 +33,7 @@ mod common;
 use common::cases::*;
 use common::*;
 use fieldcraft_lbm::{Flow, Limits, Obstacle, Setup};
-use fieldcraft_model::{BoxFaces, Collision, FaceCondition, Outflow, Procedure, Turbulence};
+use fieldcraft_model::{AbsorbingLayer, BoxFaces, Collision, FaceCondition, Outflow, Procedure, Turbulence};
 
 /// The plate model's parameters (lengths in units of the reference length, U = 1).
 #[derive(Debug, Clone)]
@@ -63,6 +63,8 @@ struct Plate {
     /// When the time-mean C_f of those strips has settled (averaged over two acoustic periods,
     /// [`Plate::acoustic_period`]).
     settling: Settling,
+    /// An absorbing layer at the inlet and the outlet (none in the gated cases).
+    absorbing: Option<AbsorbingLayer>,
 }
 
 /// One strip's time-mean reading.
@@ -131,6 +133,7 @@ impl Plate {
             z_max: if self.pressure_top { FaceCondition::Pressure { pressure: 0.0, outflow: Outflow::Convective } } else { FaceCondition::Slip {} },
         };
         d.initial_velocity = [1.0, 0.0, 0.0];
+        d.absorbing = self.absorbing;
         let strips = self.strips();
         let obstacles: Vec<Obstacle> = strips
             .iter()
@@ -371,6 +374,7 @@ fn laminar_plate(max_steps: u64) -> Plate {
         sample: 100,
         settle: (0.3, 0.9),
         settling: LAMINAR_PIPELINE,
+        absorbing: None,
     }
 }
 
@@ -403,6 +407,36 @@ fn study_a_laminar_plate_against_blasius() {
     println!("{}", score.table());
     assert!(converged, "the laminar plate did not settle in {steps} steps");
     assert!(score.passes());
+}
+
+/// The absorbing layer leaves the laminar plate's friction alone: the study above with and without
+/// a 20-cell layer at the inlet and the outlet (x < −0.15 and x > 0.9, clear of the gated
+/// stations), each run until it settles. At every gated station (0.3 ≤ x ≤ 0.9) C_f Re_θ agrees
+/// within 0.5 %. The layer's filtered reference makes it vanish on a steady flow; what it removes
+/// is the quarter-wave ringing, so the run with it should also settle sooner (printed, not gated).
+/// About five minutes on four threads: `FIELDCRAFT_PLATE_STUDY=1 cargo test --release -p
+/// fieldcraft-lbm --test sa_flat_plate -- --ignored --nocapture study_the_absorbing`.
+#[test]
+#[ignore = "minutes: set FIELDCRAFT_PLATE_STUDY=1 (docs/verification.md, \"Long studies\")"]
+fn study_the_absorbing_layer_keeps_the_laminar_friction() {
+    if std::env::var_os(STUDY).is_none_or(|v| v != "1") {
+        println!("the laminar plate study runs only with {STUDY}=1: skipped");
+        return;
+    }
+    let off = laminar_plate(40_000);
+    let on = Plate { absorbing: Some(AbsorbingLayer { thickness: 20.0 * off.spacing, strength: None, filter_time: None }), ..off.clone() };
+    let (without, settled_without, steps_without) = off.run();
+    let (with, settled_with, steps_with) = on.run();
+    println!("settled without the layer: {settled_without} after {steps_without} steps; with it: {settled_with} after {steps_with} steps");
+    let mut worst = 0.0f64;
+    for (a, b) in without.iter().zip(&with).filter(|(a, _)| (0.3..=0.9).contains(&a.x)) {
+        let (fa, fb) = (a.cf * a.re_theta, b.cf * b.re_theta);
+        let change = (fb / fa - 1.0).abs();
+        worst = worst.max(change);
+        println!("x {:.3}: C_f Re_θ {fa:.5} without, {fb:.5} with ({:+.3} %)", a.x, 100.0 * (fb / fa - 1.0));
+    }
+    assert!(settled_without && settled_with, "a run did not settle");
+    assert!(worst <= 5e-3, "C_f Re_θ moved by {:.3} % with the layer", 100.0 * worst);
 }
 
 /// The study above, bounded: its first flow-through (2500 steps), with C_f and Re_θ at three
@@ -516,6 +550,7 @@ fn tmr_2dzp(turbulence: Turbulence, grid: PlateGrid) -> PlateResult {
         sample: grid.sample,
         settle: (0.1, 1.95),
         settling: GATED,
+        absorbing: None,
     };
     println!("2DZP: {plate:?}");
     let (stations, settled, steps) = plate.run();
@@ -556,6 +591,7 @@ fn sizing_the_wall_function_plate() {
         sample: grid.sample,
         settle: (0.1, 1.95),
         settling: GATED,
+        absorbing: None,
     };
     let (stations, _, steps) = plate.run();
     assert_eq!(steps, 200);
@@ -587,6 +623,7 @@ fn a_plate_on_han_s_wall_reads_its_thicknesses_from_the_wall_law() {
         sample: 100,
         settle: (0.1, 0.45),
         settling: GATED,
+        absorbing: None,
     };
     let (stations, _, steps) = plate.run();
     assert_eq!(steps, 300);

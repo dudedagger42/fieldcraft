@@ -354,6 +354,38 @@ What it does not establish:
   beat, so the laminar check settles on a looser rule than the gated cases' (`LAMINAR_PIPELINE` against
   `GATED` in `crates/lbm/tests/common/cases.rs`).
 
+### The absorbing layer on the laminar plate
+
+The absorbing layer (`absorbing`, docs/manual/fluid/boundary-conditions.md) is checked on the
+laminar plate box above in two ways.
+
+**It drains the quarter wave.** The heavy job runs `the_layer_drains_the_laminar_plate_s_quarter_wave`
+(`crates/lbm/tests/absorbing.rs`, about two minutes). It uses the plate box with a 20-cell layer at
+both ends and the default strength and filter, which keeps the layer clear of the stations. The
+inlet's density amplitude falls ÷38.4 between the period before step 2000 and the period five
+periods (T = 1786 steps) later. Without the layer it falls ÷1.08. The gate is ÷10.
+
+**It leaves the friction alone.** The study `study_the_absorbing_layer_keeps_the_laminar_friction`
+(`sa_flat_plate.rs`, FIELDCRAFT_PLATE_STUDY=1, about six minutes on four threads) runs the plate to
+settling with and without the layer. Recorded on Windows x86_64:
+
+| x | 0.325 | 0.375 | 0.425 | 0.475 | 0.525 | 0.575 | 0.625 | 0.675 | 0.725 | 0.775 | 0.825 | 0.875 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| c_f Re_θ change | −0.013 % | −0.033 % | −0.059 % | −0.080 % | −0.078 % | −0.054 % | −0.026 % | +0.007 % | +0.040 % | +0.087 % | +0.147 % | +0.238 % |
+
+All twelve stations are within the 0.5 % gate.
+
+**It slows the start-up.** The laminar pipeline's settling rule passes later with the layer: after
+27 900 steps instead of 11 500. The filtered reference also damps the plate's start-up, whose time
+scale (a flow-through, 2500 steps) is near the filter's (N_f = 2 L / c_s = 866 steps). This is the
+slow approach to the steady state that selective frequency damping is known for.
+- A filter a quarter of the period (`filter_time` 0.223, N_f 446) settles after 19 800 steps, with
+  every station within 0.155 %.
+- Without the layer the rule passes while the means still beat by 2–5 × 10⁻³ (above).
+
+So on this plate the layer removes the ringing but doesn't shorten the run. Its use is a flow
+whose mode would otherwise never settle: the 2DZP grid, with a period of about 33 000 steps.
+
 ### What #664's acceptance still lacks
 
 - **Developing pipe flow against Shah & London (1978)**: not built.
