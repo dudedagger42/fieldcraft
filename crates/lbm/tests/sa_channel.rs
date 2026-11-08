@@ -10,8 +10,10 @@
 //!   budget of `support/wall_balance.rs` (#829), the body impulse less the change of the
 //!   populations' momentum, per wall area;
 //! - **applied**: the momentum exchange the walls report (`Flow::forces`), per area;
-//! - **requested**: what the wall model asked for, where it reports it (Musker's request through
-//!   `wall_balance::musker_request`; the on-node wall's arrives with board task R5);
+//! - **requested**: what the wall model asked for, ρ u_τ² per wall face: with SA, the wall
+//!   function's u_τ at each first fluid node (`Flow::sa_wall_function`, Spalding's law on Han's
+//!   on-node bounce, Musker's under the Musker wall); with a subgrid model under Musker's wall,
+//!   Musker's request through `wall_balance::musker_request`;
 //! - U_b, the bulk velocity, and C_f = τ_w / (½ ρ U_b²) from the carried stress.
 //!
 //! Settling ([`GATED`], common::cases): a flow-through is 2πδ/U_b, the length of the usual channel
@@ -154,14 +156,18 @@ impl Channel {
             let next = wall_balance::population_momentum(&flow);
             let m = flow.mass();
             let wall: [f64; 3] = [0, 1, 2].map(|k| flow.forces().iter().map(|f| f[k]).sum());
-            let requested = match flow.walls() {
-                Some(walls) if musker => walls
+            let density = |cell: usize| flow.moments(cell).map_or(f64::NAN, |(r, _)| r);
+            // With SA under a wall model, the law's ρ u_τ² at each first fluid node (along the flow,
+            // +x); otherwise Musker's request where the wall model is Musker.
+            let requested = match (flow.sa_wall_function(), flow.walls()) {
+                ((Some(_), samples), _) => [samples.iter().map(|&(cell, _, u_tau)| density(cell) * u_tau * u_tau).sum(), 0.0, 0.0],
+                (_, Some(walls)) if musker => walls
                     .wall_cells()
                     .filter(|w| w.4.is_some())
                     .filter_map(|(cell, q, distance, _, _)| {
                         let target = walls.modelled(cell)?.0;
                         let normal = fieldcraft_lbm::lattice::C[q].map(|v| f64::from(v) * 0.5 / distance);
-                        wall_balance::musker_request(target, normal, distance, nu).ok()
+                        wall_balance::musker_request(target, normal, distance, nu).ok().map(|r| r.map(|r| r * density(cell)))
                     })
                     .fold([0.0; 3], |s, r| [0, 1, 2].map(|k| s[k] + r[k])),
                 _ => [0.0; 3],
@@ -267,4 +273,39 @@ fn a_laminar_channel_reads_poiseuille_friction() {
 fn the_lee_moser_reference_is_their_published_bulk_and_friction_velocity() {
     assert!((LEE_MOSER_1000_BULK - 19.9898).abs() < 1e-4, "{LEE_MOSER_1000_BULK}");
     assert!((LEE_MOSER_1000_CF - 5.00512e-3).abs() < 1e-8, "{LEE_MOSER_1000_CF}");
+}
+
+/// The model with wall model `wall`, inflow ν̃/ν 3 (the initial field).
+fn sa(wall: WallModel) -> Turbulence {
+    Turbulence::SpalartAllmaras { prandtl: 0.9, wall_model: Some(wall), inflow_ratio: 3.0, ddes: None }
+}
+
+/// With SA under a wall model the harness reads the wall function's request, ρ u_τ² at each first
+/// fluid node: positive, finite and of the carried stress's order after a few hundred steps on
+/// Han's on-node wall and on Musker's halfway one (a smoke test of the reading, not the gate).
+/// Under a second in release.
+#[test]
+fn the_sa_wall_function_s_request_is_read() {
+    for (wall, on_node, cells) in [(WallModel::SpaldingBounce, true, 20), (WallModel::Musker, false, 10)] {
+        let ch = Channel {
+            re_tau: 1000.0,
+            cells,
+            bulk_guess: LEE_MOSER_1000_BULK,
+            lattice_bulk: 0.1,
+            collision: Collision::Mrt,
+            turbulence: Some(sa(wall)),
+            on_node,
+            max_steps: 400,
+            sample: 100,
+            settling: GATED,
+        };
+        let r = ch.run();
+        report(&format!("SA {wall:?}, {cells} cells per δ, 400 steps"), &r, LEE_MOSER_1000_BULK, LEE_MOSER_1000_CF);
+        let requested = r.requested.unwrap_or(f64::NAN);
+        assert!(requested > 0.0 && requested.is_finite(), "{wall:?}: requested {requested}");
+        assert!(requested / r.carried > 0.1 && requested / r.carried < 10.0, "{wall:?}: requested {requested}, carried {}", r.carried);
+        // The on-node wall's per-step budget leaves out its boundary nodes and is not exact in
+        // the start-up; the halfway wall's closes every step.
+        assert!(on_node || r.budget_ok, "{wall:?}");
+    }
 }
