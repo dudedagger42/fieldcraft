@@ -163,7 +163,8 @@ Each time step, before the collision:
    inside the box samples that cell's velocity and stores its modelled velocity and relaxation
    rate. A wall cell whose second cell is not fluid inside the box keeps the bounce-back alone.
    With `"spalding_bounce"` (Han et al.'s eq. 14, `crates/lbm/src/bounce.rs`), each boundary
-   node (the outermost cell layer at a wall face; the wall passes through its centre) takes the
+   node (a fluid cell next to a wall: the outermost cell layer at a wall face, or the fluid layer
+   next to an obstacle; the wall passes through its centre) takes the
    stress τ = ρ u_τ² along the velocity parallel to the wall of the interior node one cell above
    it, u_τ the root of Spalding's law with κ 0.41 and B 5.5 at y = Δx, ρ that node's density.
    The boundary nodes do not collide: after the fluid cells' collision each runs eq. 14 instead
@@ -180,6 +181,14 @@ Each time step, before the collision:
    one cell from the wall. The GPU runs the same scheme (`node_bounce`; [GPU backend](gpu.md),
    "Han et al.'s on-node wall-function bounce"), within 10⁻⁴ of the CPU's velocity and 10⁻³ of
    its wall drag from the first step.
+   At obstacle edges and corners, plate ends and where a wall meets an inlet, outlet or slip face
+   (FieldCraft's extension of the paper, `crates/lbm/src/bounce.rs`): eq. 14 runs on each link
+   pair whose two cells and the normal neighbour are fluid, and every other link to the fluid is
+   halfway bounce-back (reported as the node's edge impulse). A stress a node can't carry is set
+   to zero, with the law's request kept beside it, so the wall takes exactly the stress it applies
+   and the fluid's mass is kept. A cell in an inlet, outlet or slip layer keeps that face's rule.
+   A channel built from obstacle slabs gives the box-face channel's result bit for bit
+   (`han_obstacles.rs`).
 3. **Collision.** For each fluid cell: the flux P from its populations; the cell's constant C,
    scaled by `1 − exp(−y⁺/A⁺)` with damping (taken as 1 from y⁺/A⁺ = 40, where it rounds to 1);
    the cell's rate from the closed form above, or the fluid's own rate where the result is not a

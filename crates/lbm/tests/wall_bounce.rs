@@ -309,8 +309,8 @@ fn the_boundary_nodes_are_the_outermost_layers_and_not_fluid() {
     }
 }
 
-/// What the on-node bounce does not do yet is refused, naming it: a moving wall, a moving obstacle face, a
-/// wall that meets a face that is not periodic, heat, and a box too thin for an interior node.
+/// What the on-node bounce does not do yet is refused, naming it: a moving wall, a moving obstacle face,
+/// heat, and a box too thin for an interior node; walls meeting at an edge run.
 #[test]
 fn the_on_node_bounce_refuses_what_it_does_not_support() {
     let dx = 0.125;
@@ -333,10 +333,13 @@ fn the_on_node_bounce_refuses_what_it_does_not_support() {
     let err = refused(d, &[]);
     assert!(err.contains("not supported yet") && err.contains("spalding_bounce") && err.contains("moving") && err.contains("y_max"), "{err}");
     let mut d = channel();
+    // Walls that meet at an edge run: the cells on the edge are corner nodes, which only bounce
+    // (crates/lbm/tests/han_obstacles.rs).
     d.faces.x_min = FaceCondition::Wall {};
     d.faces.x_max = FaceCondition::Wall {};
-    let err = refused(d, &[]);
-    assert!(err.contains("not supported yet") && err.contains("x_min") && err.contains("periodic"), "{err}");
+    let m = model(1.0, 0.01, d, bounced(10.0 * dx, dx, Collision::Mrt));
+    let (_, flow) = prepare(&m, &[]);
+    assert!(flow.wall_nodes().unwrap().nodes().iter().any(|w| !w.sampled()), "corner nodes");
     // An obstacle runs (crates/lbm/tests/han_obstacles.rs); one with a moving face doesn't.
     let mut d = channel();
     d.obstacles = vec!["Block".into()];

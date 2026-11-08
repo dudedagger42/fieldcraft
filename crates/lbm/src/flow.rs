@@ -809,13 +809,6 @@ impl Flow {
             }
             for face in BoxFace::ALL.into_iter().filter(|f| wall_velocity(*f).is_some()) {
                 let a = face.axis();
-                if let Some(other) = BoxFace::ALL.into_iter().find(|f| f.axis() != a && !periodic[f.axis()]) {
-                    return refuse(format!(
-                        "where the wall `{}` meets the face `{}` that is not periodic (an edge): the box must be periodic along its walls",
-                        face.name(),
-                        other.name()
-                    ));
-                }
                 if grid.cells[a] < 3 {
                     return refuse(format!("on a box {} cells across its wall `{}`: it needs at least 3", grid.cells[a], face.name()));
                 }
@@ -868,13 +861,17 @@ impl Flow {
                 if dirs.is_empty() {
                     continue;
                 }
-                // A node in the layer of an inlet, outlet or slip face.
-                if let Some(face) = (0..3).filter(|a| !periodic[*a]).find_map(|a| {
-                    let face = BoxFace::of(a, p[a] + 1 == grid.cells[a]);
-                    ((p[a] == 0 || p[a] + 1 == grid.cells[a]) && wall_velocity(face).is_none()).then_some(face)
-                }) {
-                    let body = dirs.iter().find_map(|d| groups.get(d.2 as usize).and_then(|g| g.body.clone())).unwrap_or_default();
-                    return refuse(format!("where the walls of `{body}` meet the face `{}` that is not a wall", face.name()));
+                // Where a wall meets an inlet, outlet or slip face, the cell in that face's layer
+                // keeps that face's rule and is no node: one rule per cell, as at the edge of two
+                // open faces. Its links to the wall stay halfway bounce-back, and the node beside
+                // it treats it as fluid (notes/cfd-wall-obstacles.md §3).
+                let junction = (0..3).filter(|a| !periodic[*a]).any(|a| {
+                    [(p[a] == 0, BoxFace::of(a, false)), (p[a] + 1 == grid.cells[a], BoxFace::of(a, true))]
+                        .iter()
+                        .any(|(at, face)| *at && wall_velocity(*face).is_none())
+                });
+                if junction {
+                    continue;
                 }
                 walled.push((cell, dirs));
             }
