@@ -386,6 +386,67 @@ slow approach to the steady state that selective frequency damping is known for.
 So on this plate the layer removes the ringing but doesn't shorten the run. Its use is a flow
 whose mode would otherwise never settle: the 2DZP grid, with a period of about 33 000 steps.
 
+### Spalart–Allmaras resolved to the wall at Re_τ 150–180: channel, pipe and square duct
+
+Fully developed RANS flow in a straight channel, pipe or duct doesn't change along it, so each case
+is one cross-section, a few cells long, periodic and driven by a body force. SA runs without a
+wall model, with the first cell centre near y⁺ 1. These three cases measure the model's own
+error at the low Reynolds numbers of small ducts.
+
+**Channel at Re_τ 182** (`sa_channel.rs`, `sa_rans_channel_at_re_tau_180_meets_lee_and_moser`,
+heavy job, about 8 minutes on four threads). The reference is Lee & Moser's header values for
+Re_τ 182.088 (u_τ = 0.0637309 at U_b = 1; C_f = 8.123 × 10⁻³; M. Lee, R. D. Moser, J. Fluid Mech.
+774:395–415, 2015). Run on MRT:
+
+| wall | cells per δ (first node y⁺) | U_b⁺ (LM 15.691) | C_f carried | |
+|---|---|---|---|---|
+| resolved, halfway | 91 (1.0) | 15.803 (+0.71 %) | −1.41 % | gated ±5 % |
+| resolved, halfway | 182 (0.5) | 15.889 (+1.26 %) | −2.48 % | gated ±5 % |
+| Han on-node | 10 (18.2) | 15.166 (−3.35 %) | +7.04 % | pinned ±0.5 points |
+| Han on-node | 20 (9.1) | 15.224 (−2.98 %) | +6.23 % | pinned ±0.5 points |
+
+- SA's own error at Re_τ 180 is about −2.5 % in C_f.
+- **Han's wall function over-predicts C_f by 6–7 % here** (+0.1 to +1.2 % at Re_τ 1000). Its
+  request equals the carried stress to 10⁻⁵, so the wall carries what it asks for, and the error is
+  the closure at low Re_τ: Spalding's law at the first node, fed by SA's profile. It is pinned in
+  its measured band rather than gated, so any change to it comes to review.
+
+**Pipe at Re_b 5300** (`sa_pipe.rs`; the stair-stepped circle is halfway bounce-back on the cells
+outside it; the hybrid collision at σ 0.99).
+- **Reference:** J. G. M. Eggels et al., J. Fluid Mech. 268:175–209, 1994. Their published DNS
+  profile (4TU.ResearchData, doi:10.4121/uuid:3e4aee44-0857-40e3-8492-1cb37ac1e189, under its
+  General Terms of Use) is in wall units. Integrated over its 96 radial cells, it gives
+  U_b⁺ = 14.730 (f = 0.03687, Re_τ = 179.9) and U_c/U_b = 1.311. G. K. El Khoury et al. (Flow
+  Turbul. Combust. 91:475–495, 2013: u_τ/U_b = 0.0683) and Blasius agree within 1 %.
+- **Command:** `FIELDCRAFT_PIPE_STUDY=1 cargo test --release -p fieldcraft-lbm --test sa_pipe --
+  --ignored --nocapture study`. Recorded on Windows x86_64:
+
+| cells per R (first cell y⁺) | steps | CPU time | U_b⁺ | f vs Eggels | U_c/U_b |
+|---|---|---|---|---|---|
+| 25 (3.6) | 168 000 | 357 s (4 threads) | 13.278 | +23.1 % | 1.309 |
+| 50 (1.8) | 236 000 | 1237 s (8 threads) | 14.379 | +4.94 % | 1.298 |
+| 100 (0.9) | 270 000 | 3372 s (8 threads) | 14.777 | −0.64 % | 1.299 |
+
+The error falls as the first cell moves into the sublayer, so what limits it is the near-wall
+resolution, not the staircase. The heavy job runs 16 cells per R for 10 000 steps, frozen
+(`a_short_sa_pipe_keeps_the_study_s_start`).
+
+**Square duct at Re_b 2205** (`fieldcraft-lbm-gpu`'s `sa_duct.rs`, on the CPU or the GPU). Re_b is
+U_b h/ν, with h the half-width.
+- **Reference:** A. Pinelli, M. Uhlmann, A. Sekimoto, G. Kawahara (J. Fluid Mech. 644:107–122,
+  2010) find their DNS friction in good agreement with Jones's square-duct correlation (O. C. Jones,
+  J. Fluids Eng. 98:173–180, 1976), 1/√f = 2 log₁₀(2.25 Re_b √f) − 0.8. That gives Re_τ = 150.9
+  here, as their 2h⁺ ≈ 300 does. The gate is Jones at the run's own Re_b.
+- **Command:** `FIELDCRAFT_DUCT_STUDY=1 FIELDCRAFT_DUCT_GPU=1 cargo test --release -p
+  fieldcraft-lbm-gpu --test sa_duct -- --ignored --nocapture study`.
+- **Recorded** on an RTX 4070 Laptop GPU at 100 cells per h (first cell y⁺ 0.75, 160 000 cells):
+  270 000 steps in 107 s, U_b⁺ 14.867 (Re_b 2244), **f −2.95 % against Jones**, U_c/U_b 1.352.
+- SA is a linear eddy-viscosity model and makes no secondary flow (the corner vortices come from
+  the anisotropy of the normal stresses), so U_c/U_b and the shear along an edge are reported, not
+  gated.
+- The heavy job runs 10 cells per h on the CPU for 10 000 steps, frozen
+  (`a_short_sa_duct_keeps_the_study_s_start`).
+
 ### What #664's acceptance still lacks
 
 - **Developing pipe flow against Shah & London (1978)**: not built.
