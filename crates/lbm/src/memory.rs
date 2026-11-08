@@ -48,12 +48,15 @@ const GRADIENT_VELOCITY: u64 = 3 * F64;
 /// wall cells' own records are on the surface and not counted); with the wall model alone, the
 /// index only ([`INDEX`]).
 const WALL_DISTANCE: u64 = F64 + 4;
-/// Per cell with the Spalart–Allmaras model (CPU only): its field ([`crate::sa::BYTES_PER_CELL`]:
+/// Per cell with the Spalart–Allmaras model on the CPU: its field ([`crate::sa::BYTES_PER_CELL`]:
 /// ν̃, faces, mask and scratch), wall distance and vorticity, and the distance transform's working
 /// memory: its three grid-sized passes of 8 bytes (the squared distances and the two line passes), and the copies of the wall points
 /// ([`crate::distance::WALL_POINT_COPIES`] each) at one point per cell, above what a wall surface has but a model alone cannot count.
 /// The transform itself refuses a run whose real count is above `Limits::max_memory`.
 const SPALART_ALLMARAS: u64 = crate::sa::BYTES_PER_CELL + 2 * F64 + 3 * F64 + crate::distance::WALL_POINT_COPIES;
+/// Per cell the GPU backend stages on the host for the Spalart–Allmaras model: the wall distance and the
+/// initial ν̃ in single precision. The device's own buffers are not host memory and are not counted.
+const DEVICE_SA_STAGING: u64 = 2 * F32;
 /// Per cell with fans or porous zones, and with conducting obstacles: an index.
 const INDEX: u64 = 4;
 /// Per cell with a free surface: its kind, its mass and fill level, whether it is populated,
@@ -336,7 +339,9 @@ impl Memory {
             Choice::Device => (
                 prepared
                     .saturating_add(outlet_staging)
-                    .saturating_add(per_cell(DEVICE_STAGING + if s.damping { DEVICE_DAMPING } else { 0 }))
+                    .saturating_add(per_cell(
+                        DEVICE_STAGING + if s.damping { DEVICE_DAMPING } else { 0 } + if s.spalart_allmaras { DEVICE_SA_STAGING } else { 0 },
+                    ))
                     .saturating_add(inlet_staging)
                     .saturating_add(s.zone_data.saturating_add(zone_cells).saturating_mul(3)),
                 per_cell(2 * RESULT).saturating_add(s.zone_data).saturating_add(zone_cells),
