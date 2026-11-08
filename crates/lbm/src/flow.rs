@@ -1264,13 +1264,24 @@ impl Flow {
                         };
                     }
                 }
+                let no_slip: Vec<bool> =
+                    BoxFace::ALL.iter().map(|f| wall_velocity(*f).is_some()).chain(obstacle_walls.iter().map(Option::is_some)).collect();
                 let surface = if on_node {
-                    // Every boundary node's centre (the same points from_nodes gives a flat node).
-                    let points: Vec<[f64; 3]> = node_list.iter().map(|w| grid.coords(w.cell as usize).map(|v| v as f64)).collect();
+                    // Every boundary node's centre (the same points from_nodes gives a flat node),
+                    // and the midpoint of every halfway link that remains beside them (a junction
+                    // cell's wall links, a diagonal off a convex corner): K2's "the wall points
+                    // the solver uses".
+                    let mut points: Vec<[f64; 3]> = node_list.iter().map(|w| grid.coords(w.cell as usize).map(|v| v as f64)).collect();
+                    for l in &links {
+                        if let Rule::Bounce { group, .. } = l.rule
+                            && no_slip.get(group as usize).copied().unwrap_or(false)
+                        {
+                            let (p, cq) = (grid.coords(l.cell as usize), c(usize::from(l.q)));
+                            points.push([0, 1, 2].map(|a| p[a] as f64 - 0.5 * cq[a]));
+                        }
+                    }
                     crate::distance::WallSurface::from_points(&points)?
                 } else {
-                    let no_slip: Vec<bool> =
-                        BoxFace::ALL.iter().map(|f| wall_velocity(*f).is_some()).chain(obstacle_walls.iter().map(Option::is_some)).collect();
                     crate::distance::WallSurface::from_links(&grid, &links, &no_slip)?
                 };
                 // The run's own Limits do not reach Flow::new, and need not: Setup::new checks the
