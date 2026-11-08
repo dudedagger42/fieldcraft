@@ -2,7 +2,8 @@
 //! "spalart_allmaras"}`): ν̃ transported on the cells that collide, its ν_t = ν̃ f_v1 in the
 //! collision's rate. With no ν̃ the flow is the laminar one bit for bit; a forced channel takes a
 //! positive ν_t that stays finite, with halfway and on-node walls; the result is the same bit for
-//! bit on any number of threads; DDES, dynamic σ and the GPU are refused, naming the model.
+//! bit on any number of threads; dynamic σ and the GPU are refused, naming the model (DDES:
+//! tests/ddes_flow.rs).
 //!
 //! Each test prints its numbers (`cargo test -p fieldcraft-lbm --test spalart_allmaras -- --nocapture`).
 
@@ -11,7 +12,7 @@ mod common;
 use common::*;
 use fieldcraft_lbm::sa::{WallLaw, law_eddy_viscosity};
 use fieldcraft_lbm::{Choice, Flow, Limits, Memory, Setup};
-use fieldcraft_model::{Collision, Ddes, FaceCondition, HrrSigma, Procedure, Turbulence, WallModel};
+use fieldcraft_model::{Collision, FaceCondition, HrrSigma, Procedure, Turbulence, WallModel};
 
 /// The model with inflow ν̃/ν `ratio` and wall model `wall_model`.
 fn sa(ratio: f64, wall_model: Option<WallModel>) -> Turbulence {
@@ -193,7 +194,7 @@ fn results_are_bit_for_bit_the_same_on_one_and_many_threads() {
     assert_eq!(one, solve(3));
 }
 
-/// DDES, dynamic σ, an inflow ratio out of range and the GPU are refused with the model's name and
+/// Dynamic σ, an inflow ratio out of range and the GPU are refused with the model's name and
 /// what to do instead; nothing panics. The memory estimate counts the model's field.
 #[test]
 fn what_is_not_supported_is_refused_and_the_memory_counts_the_field() {
@@ -204,9 +205,6 @@ fn what_is_not_supported_is_refused_and_the_memory_counts_the_field() {
         }
         Setup::new(&model(1.0, 0.1, couette(4), p), None, &[], &Limits::default()).unwrap_err().to_string()
     };
-    let ddes = Turbulence::SpalartAllmaras { prandtl: 0.9, wall_model: None, inflow_ratio: 3.0, ddes: Some(Ddes { c_des: 0.65 }) };
-    let e = refused(ddes, Collision::Trt, None);
-    assert!(e.contains("not supported yet") && e.contains("DDES"), "{e}");
     let e = refused(sa(3.0, None), Collision::Hrr, Some(HrrSigma::Dynamic));
     assert!(e.contains("not supported yet") && e.contains("dynamic σ") && e.contains("Spalart–Allmaras"), "{e}");
     for bad in [-1.0, 101.0, f64::NAN, f64::INFINITY] {

@@ -1032,6 +1032,7 @@ fn fluid_summary(r: &FluidResult, display: &DisplaySystem) -> Value {
         "tau_thermal": r.stats.tau_thermal,
         "temperature": temperature,
         "frozen": r.stats.frozen,
+        "ddes": r.stats.ddes.map(|d| json!({"les_fraction": d.les_fraction, "max_f_d": d.max_f_d})),
         "free_surface": r.stats.free_surface.map(|fs| json!({
             "initial_mass": fs.initial_mass,
             "mass": fs.mass,
@@ -1981,10 +1982,10 @@ pub(crate) mod tests {
         assert_eq!(s.model, before);
     }
 
-    /// The Spalart–Allmaras model: hostile parameters refused with a message naming them, DDES
-    /// and the GPU "not supported yet"; never a panic, the model unchanged, nothing solved. An
-    /// unknown field is refused by the command. A valid model solves on the CPU, reporting its
-    /// largest ν_t/ν.
+    /// The Spalart–Allmaras model: hostile parameters refused with a message naming them, the GPU
+    /// "not supported yet"; never a panic, the model unchanged, nothing solved. An unknown field is
+    /// refused by the command. A valid model solves on the CPU, with and without DDES, reporting
+    /// its largest ν_t/ν and, with DDES, its LES fraction and largest f_d.
     #[test]
     fn spalart_allmaras_solves_on_the_cpu_and_hostile_parameters_are_named() {
         use fieldcraft_model::{Ddes, Procedure, Turbulence};
@@ -1997,7 +1998,7 @@ pub(crate) mod tests {
             ddes: c_des.map(|c_des| Ddes { c_des }),
         };
         let mut cases = vec![(sa(0.9, 3.0, None), "not supported yet"), (sa(0.9, 3.0, Some(0.65)), "not supported yet")];
-        let gpu_only = format!("{:?}", cases[0].0);
+        let gpu_only = [format!("{:?}", cases[0].0), format!("{:?}", cases[1].0)];
         for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0, 0.0, 1e300] {
             cases.push((sa(bad, 3.0, None), "turbulent Prandtl number"));
             if bad != 0.0 {
@@ -2014,7 +2015,7 @@ pub(crate) mod tests {
             // Compared as text: a NaN parameter is never equal to itself.
             let before = format!("{:?}", s.model);
             // The valid model is refused on the GPU alone; the CPU solves it below.
-            let backends: &[&str] = if format!("{turbulence:?}") == gpu_only { &["gpu"] } else { &["cpu", "gpu"] };
+            let backends: &[&str] = if gpu_only.contains(&format!("{turbulence:?}")) { &["gpu"] } else { &["cpu", "gpu"] };
             for backend in backends {
                 let error = s.execute("solve.fluid", &json!({"backend": backend})).unwrap_err().to_string();
                 assert!(error.contains(want), "{turbulence:?} on {backend}: {error}");
@@ -2040,7 +2041,17 @@ pub(crate) mod tests {
         // and not negative (the lbm tests' forced channel shows a positive one).
         let ratio = reply.get("eddy_viscosity_ratio").and_then(serde_json::Value::as_f64);
         assert!(ratio.is_some_and(|r| r.is_finite() && r >= 0.0), "{reply}");
+        assert!(reply["ddes"].is_null(), "{reply}");
         assert_eq!(s.solved_steps().count(), 1);
+        let mut step = s.model.step("Shear").unwrap().clone();
+        if let Procedure::Fluid { turbulence: t, .. } = &mut step.procedure {
+            *t = Some(sa(0.9, 3.0, Some(0.65)));
+        }
+        s.model.replace_step(step).unwrap();
+        let reply = s.execute("solve.fluid", &json!({"backend": "cpu"})).unwrap();
+        let share = |key: &str| reply["ddes"][key].as_f64();
+        assert!(share("les_fraction").is_some_and(|f| (0.0..=1.0).contains(&f)), "{reply}");
+        assert!(share("max_f_d").is_some_and(|f| (0.0..=1.0).contains(&f)), "{reply}");
     }
 
     /// A channel filled by a velocity inlet behind a free surface: the solve reports the mass
@@ -2507,6 +2518,7 @@ pub(crate) mod tests {
             backend: "cpu".into(),
             tau_thermal: None,
             eddy_viscosity_ratio: None,
+            ddes: None,
             frozen: None,
             free_surface: None,
         };

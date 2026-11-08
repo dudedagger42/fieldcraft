@@ -52,6 +52,8 @@ const WALL_DISTANCE: u64 = F64 + 4;
 /// ν̃, faces, mask and scratch), wall distance and vorticity, and the distance transform's working
 /// memory (three passes of f64, counted throughout to stay on the safe side).
 const SPALART_ALLMARAS: u64 = crate::sa::BYTES_PER_CELL + 2 * F64 + 3 * F64;
+/// Per cell with DDES on the Spalart–Allmaras model: its length d̃ ([`crate::ddes`]).
+const DDES: u64 = F64;
 /// Per cell with fans or porous zones, and with conducting obstacles: an index.
 const INDEX: u64 = 4;
 /// Per cell with a free surface: its kind, its mass and fill level, whether it is populated,
@@ -140,6 +142,8 @@ struct Shape {
     gradients: bool,
     /// The Spalart–Allmaras model's field.
     spalart_allmaras: bool,
+    /// DDES on the Spalart–Allmaras model (its length field).
+    ddes: bool,
     wall_model: bool,
     zones: bool,
     zone_data: u64,
@@ -165,6 +169,7 @@ impl Shape {
             wall_model,
             gradients: false,
             spalart_allmaras,
+            ddes: false,
             zones: !domain.fans.is_empty() || !domain.porous.is_empty(),
             zone_count: (domain.fans.len() + domain.porous.len()) as u64,
             // Headers, curves, and per fan its table entry, its list's padding and its slots of
@@ -191,7 +196,8 @@ impl Memory {
             setup.spalart_allmaras.is_some(),
         )?;
         let gradients = setup.collision == Collision::Hrr || setup.vreman > 0.0 || setup.spalart_allmaras.is_some();
-        Ok(Memory::from_shape(&Shape { gradients, ..shape }, backend))
+        let ddes = setup.spalart_allmaras.is_some_and(|sa| sa.c_des.is_some());
+        Ok(Memory::from_shape(&Shape { gradients, ddes, ..shape }, backend))
     }
 
     /// The memory of fluid step `step` of `model` on `backend`, from the model alone (no
@@ -205,8 +211,9 @@ impl Memory {
         let (damping, wall_model) = turbulence.map_or((false, false), |t| (t.van_driest().is_some(), t.wall_model().is_some()));
         let sa = matches!(turbulence, Some(fieldcraft_model::Turbulence::SpalartAllmaras { .. }));
         let gradients = *collision == Some(Collision::Hrr) || matches!(turbulence, Some(fieldcraft_model::Turbulence::Vreman { .. })) || sa;
+        let ddes = matches!(turbulence, Some(fieldcraft_model::Turbulence::SpalartAllmaras { ddes: Some(_), .. }));
         let shape = Shape::new(domain, u64::from(*frames), turbulence.is_some(), damping, wall_model, sa)?;
-        Ok(Memory::from_shape(&Shape { gradients, ..shape }, backend))
+        Ok(Memory::from_shape(&Shape { gradients, ddes, ..shape }, backend))
     }
 
     fn from_shape(s: &Shape, backend: Choice) -> Memory {
@@ -244,6 +251,9 @@ impl Memory {
         }
         if s.spalart_allmaras {
             flow += SPALART_ALLMARAS;
+        }
+        if s.ddes {
+            flow += DDES;
         }
         if s.zones {
             // Both ownership per cell and the zones' lists of owned fluid cells.

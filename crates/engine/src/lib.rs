@@ -151,7 +151,9 @@ impl EngineError {
 pub type Result<T> = std::result::Result<T, EngineError>;
 
 /// The result of a solved step, from the implicit, the explicit or the lattice Boltzmann solver.
+/// One per solved step, so the fluid result's size is not worth a box at every use.
 #[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::large_enum_variant)]
 pub enum StepResult {
     Implicit(fieldcraft_solver::StepResult),
     Explicit(ExplicitResult),

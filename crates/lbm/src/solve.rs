@@ -173,6 +173,10 @@ pub struct FluidStats {
     pub tau_thermal: Option<f64>,
     /// With a turbulence model: the largest eddy viscosity over the fluid's own in the last step.
     pub eddy_viscosity_ratio: Option<f64>,
+    /// With DDES: the last step's share of fluid cells in LES mode (f_d > 0.5) and largest f_d.
+    /// Reported by the solve, not saved (like `frozen`).
+    #[serde(skip)]
+    pub ddes: Option<crate::ddes::DdesStats>,
     /// With a phase change: the share of the fluid's volume frozen at the end (the mean over the
     /// fluid cells of the solid fraction). Reported by the solve, not saved: the results encoding
     /// skips it (none when read back), so results saved before it read unchanged.
@@ -737,6 +741,7 @@ fn run_checkpointed(
             backend: flow.name(),
             tau_thermal: setup.thermal.as_ref().map(|t| t.tau),
             eddy_viscosity_ratio: setup.turbulent().then(|| flow.eddy_viscosity_ratio()),
+            ddes: flow.ddes(),
             frozen: flow.frozen(),
             free_surface,
         },

@@ -54,8 +54,10 @@ pub const MAX_STEPS: usize = 10_000;
 /// Most cells of a stored fluid grid.
 pub const MAX_CELLS: usize = u32::MAX as usize;
 
-/// A step's result as a solver reported it.
+/// A step's result as a solver reported it. One per solved step, read and written whole, so the
+/// fluid result's size is not worth a box at every use.
 #[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::large_enum_variant)]
 pub enum Solved {
     /// A static, frequency, buckling or heat transfer step.
     Implicit(fieldcraft_solver::StepResult),
