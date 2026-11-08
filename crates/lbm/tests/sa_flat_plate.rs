@@ -189,10 +189,10 @@ impl Plate {
             // The layer pulls its cells toward a filtered copy of their own state: keep it off the
             // plate's leading edge and the gated strips.
             let last = gated.iter().map(|&s| strips[s].1).fold(0.0, f64::max);
+            let thickness = layer.thickness.unwrap_or(fieldcraft_model::fluids::DEFAULT_ABSORBING_CELLS as f64 * self.spacing);
             assert!(
-                -self.upstream + layer.thickness <= 1e-12 && self.length - layer.thickness >= last - 1e-12,
-                "the absorbing layer ({} thick) reaches the plate or the gated strips (−{} to {}, gated up to {last})",
-                layer.thickness,
+                -self.upstream + thickness <= 1e-12 && self.length - thickness >= last - 1e-12,
+                "the absorbing layer ({thickness} thick) reaches the plate or the gated strips (−{} to {}, gated up to {last})",
                 self.upstream,
                 self.length
             );
@@ -562,7 +562,7 @@ fn study_the_absorbing_layer_keeps_the_laminar_friction() {
         return;
     }
     let off = laminar_plate(40_000);
-    let on = Plate { absorbing: Some(AbsorbingLayer { thickness: 20.0 * off.spacing, strength: None, filter_time: None }), ..off.clone() };
+    let on = Plate { absorbing: Some(AbsorbingLayer { thickness: Some(20.0 * off.spacing), strength: None, filter_time: None }), ..off.clone() };
     let (without, settled_without, steps_without) = off.run();
     let (with, settled_with, steps_with) = on.run();
     println!("settled without the layer: {settled_without} after {steps_without} steps; with it: {settled_with} after {steps_with} steps");
@@ -636,14 +636,12 @@ impl PlateGrid {
     /// The wall-function grid: Δ = 1/2000, so the first cell centre lies at y⁺ ≈ 40–55 over the
     /// gated range (Re_θ 4000–13000), with U = 0.1 in lattice units. The hybrid collision at fixed
     /// σ 0.99: on MRT the velocity inlet runs away at τ − ½ = 1.2 × 10⁻⁴ (step 1366), on the hybrid
-    /// collision it holds longer. An absorbing layer 0.05 thick (100 cells) at the inlet and the
-    /// outlet drains the quarter-wave mode the two faces trap (about 33 000 steps long here, barely
-    /// damped otherwise); 0.05 is as far as the outlet's layer can reach without touching the last
-    /// gated strip (x ≤ 1.95). At strength 4, the cap: the layer's profile vanishes at the face and
-    /// its default strength is c_s per thickness in cells, so at 100 cells it damps the column next to
-    /// the inlet by only 7 × 10⁻⁴ per step, and a grid-scale density mode along the inlet's first
-    /// columns grew there until the run went unstable at step 9311. A free stream on this grid with
-    /// the layer at strength 4 holds 20 000 steps.
+    /// collision it holds longer. The default absorbing layer (10 cells) at the inlet and the outlet
+    /// damps the inlet's first columns and drains the quarter-wave mode the two faces trap (about
+    /// 33 000 steps long here, barely damped otherwise). A layer 0.05 thick (100 cells) at its default
+    /// strength damped the column next to the inlet by only 7 × 10⁻⁴ per step, and a grid-scale
+    /// density mode along the inlet's first columns grew there until the run went unstable at step
+    /// 9311.
     fn wall_function() -> PlateGrid {
         PlateGrid {
             cells_per_unit: 2000.0,
@@ -654,7 +652,7 @@ impl PlateGrid {
             pressure_top: false,
             collision: Collision::Hrr,
             sigma: Some(0.99),
-            absorbing: Some(AbsorbingLayer { thickness: 0.05, strength: Some(4.0), filter_time: None }),
+            absorbing: Some(AbsorbingLayer { thickness: None, strength: None, filter_time: None }),
             max_steps: 400_000,
             sample: 2000,
         }
@@ -844,7 +842,7 @@ fn a_plate_run_resumes_from_its_restart_file_bit_for_bit() {
         re: 200.0,
         spacing: 1.0 / 40.0,
         sample: 20,
-        absorbing: Some(AbsorbingLayer { thickness: 0.1, strength: None, filter_time: None }),
+        absorbing: Some(AbsorbingLayer { thickness: Some(0.1), strength: None, filter_time: None }),
         ..laminar_plate(0)
     };
     // The 2DZP configuration in small: SA on Han's wall, the hybrid collision at σ 0.99, a layer.
@@ -852,7 +850,7 @@ fn a_plate_run_resumes_from_its_restart_file_bit_for_bit() {
         collision: Collision::Hrr,
         sigma: Some(0.99),
         sample: 20,
-        absorbing: Some(AbsorbingLayer { thickness: 0.05, strength: None, filter_time: None }),
+        absorbing: Some(AbsorbingLayer { thickness: Some(0.05), strength: None, filter_time: None }),
         ..small_han_plate()
     };
     for base in [laminar, han] {

@@ -99,7 +99,7 @@ fn an_absorbing_layer_resumes_with_its_filtered_reference() {
         for f in [&mut d.faces.y_min, &mut d.faces.y_max, &mut d.faces.z_min, &mut d.faces.z_max] {
             *f = FaceCondition::Periodic {};
         }
-        d.absorbing = Some(fieldcraft_model::AbsorbingLayer { thickness: 4.0, strength: Some(2.0), filter_time: Some(9.0) });
+        d.absorbing = Some(fieldcraft_model::AbsorbingLayer { thickness: Some(4.0), strength: Some(2.0), filter_time: Some(9.0) });
         parity(&model(1.0, 0.1, d, collide(67.0, 1.0, None, collision)), &[]);
     }
 }

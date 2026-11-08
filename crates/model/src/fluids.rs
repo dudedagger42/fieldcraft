@@ -675,6 +675,13 @@ impl FreeSurface {
 /// The largest absorbing-layer strength, relative to the matched value.
 pub const MAX_ABSORBING_STRENGTH: f64 = 4.0;
 
+/// An absorbing layer's thickness in cells when none is given. A cell count, not a length: in this
+/// type II layer (H. Xu, P. Sagaut, J. Comput. Phys. 245:14–42, 2013) the matched strength is the speed of sound per thickness in cells and the profile vanishes at the
+/// face, so the damping on the columns next to a face falls about with the square of the cell
+/// count. Ten cells hold a velocity inlet at τ − ½ ≈ 10⁻⁴ at every spacing tried; a layer of a
+/// fixed length becomes too weak there on a fine grid (100 cells let the inlet run away).
+pub const DEFAULT_ABSORBING_CELLS: usize = 10;
+
 /// An absorbing layer inside the box at each velocity and pressure face. It drains the pressure
 /// waves those faces reflect (a box's quarter-wave acoustic mode, which otherwise rings for a
 /// long time), and it leaves a steady flow unchanged: each layer cell is pulled toward a slowly
@@ -682,8 +689,10 @@ pub const MAX_ABSORBING_STRENGTH: f64 = 4.0;
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AbsorbingLayer {
-    /// How far the layer reaches into the box from each velocity or pressure face.
-    pub thickness: f64,
+    /// How far the layer reaches into the box from each velocity or pressure face (default
+    /// [`DEFAULT_ABSORBING_CELLS`] cells, whatever the spacing).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thickness: Option<f64>,
     /// Its strength relative to the matched value, whose damping rate times the thickness is the
     /// speed of sound (default 1; at most [`MAX_ABSORBING_STRENGTH`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -698,7 +707,9 @@ pub struct AbsorbingLayer {
 impl AbsorbingLayer {
     /// Check the numbers; `open` says whether the domain has a velocity or pressure face.
     pub fn validate(&self, open: bool) -> Result<()> {
-        positive("absorbing layer thickness", self.thickness)?;
+        if let Some(t) = self.thickness {
+            positive("absorbing layer thickness", t)?;
+        }
         if let Some(s) = self.strength {
             positive("absorbing layer strength", s)?;
             if s > MAX_ABSORBING_STRENGTH {
