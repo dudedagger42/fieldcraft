@@ -17,6 +17,12 @@
 //! outlet trap and the plate's C_f follows. The gate interpolates C_f at each reference Re_θ between the strips that
 //! bracket it (common::cases).
 //!
+//! On Han's on-node wall (WL1) the strips' top row is the wall's node row, so the wall sits at
+//! z = +Δ/2 and the leading edge 1.5 Δ above the slip floor. θ and δ* take the interval from the wall
+//! to the first fluid node from the wall law (`WallInterval`) and report the trapezoid beside it.
+//! Re_θ for the gate is the law's. A strip's force includes its nodes' share, and its request is
+//! the law's (`wanted`).
+//!
 //! The turbulent case runs for hours: [`tmr_2dzp`] takes the turbulence model and grid, and each
 //! model gets its own ignored `#[test]` naming it (none yet: slice 15a's Spalart–Allmaras adds the
 //! first). The laminar check runs in the heavy job.
@@ -63,7 +69,15 @@ struct Plate {
 struct Station {
     x: f64,
     cf: f64,
+    /// Re_θ from θ's law entry (the gate's), and from its trapezoid entry.
     re_theta: f64,
+    re_theta_trapezoid: f64,
+    /// The momentum and displacement thickness (lattice units), [law, trapezoid]: on Han's on-node
+    /// wall the interval from the wall to the first node is integrated from the wall law
+    /// (`WallInterval`) or by the trapezoid from u = 0; on a halfway wall both entries are the
+    /// midpoint sum.
+    theta: [f64; 2],
+    delta_star: [f64; 2],
     /// The wall model's requested C_f, when it reports one.
     requested: Option<f64>,
     edge: f64,
@@ -154,6 +168,7 @@ impl Plate {
         let nu = self.lattice_nu();
         let [nx, _, nz] = grid.cells;
         let column = |x: f64| ((x + self.upstream) / self.spacing).floor().clamp(0.0, nx as f64 - 1.0) as usize;
+        let on_node = flow.on_node_bounce();
         let gated: Vec<usize> =
             (0..strips.len()).filter(|&s| (self.settle.0..=self.settle.1).contains(&(0.5 * (strips[s].0 + strips[s].1)))).collect();
         let window = ((2.0 * self.acoustic_period() / self.sample as f64).round() as usize).max(1);
@@ -183,6 +198,9 @@ impl Plate {
                     x: first[s].x,
                     cf: avg(&|t| t.cf, s),
                     re_theta: avg(&|t| t.re_theta, s),
+                    re_theta_trapezoid: avg(&|t| t.re_theta_trapezoid, s),
+                    theta: [avg(&|t| t.theta[0], s), avg(&|t| t.theta[1], s)],
+                    delta_star: [avg(&|t| t.delta_star[0], s), avg(&|t| t.delta_star[1], s)],
                     requested: first[s].requested.map(|_| avg(&|t| t.requested.unwrap_or(f64::NAN), s)),
                     edge: avg(&|t| t.edge, s),
                 })
@@ -203,6 +221,16 @@ impl Plate {
                     }
                 }
             }
+            // Han's nodes: the stress the law asks for (`wanted`; the applied `stress` except at a
+            // strip's end nodes, along the axes they can't carry).
+            if let Some(nodes) = flow.wall_nodes() {
+                for n in nodes.nodes() {
+                    if let Some(s) = groups.iter().position(|x| x.contains(&(n.group as usize))) {
+                        requested[s] += n.wanted[0];
+                        any_requested = true;
+                    }
+                }
+            }
             if steps % self.sample != 0 {
                 continue;
             }
@@ -214,18 +242,26 @@ impl Plate {
                     let i = column(0.5 * (a + b));
                     // The edge is the profile's fastest cell below 80 % of the height (the cells
                     // next to a pressure top are not free stream, and over a slip top the outer flow
-                    // is not uniform); θ integrates up to it, where every term is non-negative.
+                    // is not uniform); θ integrates up to it, where every term is non-negative. The
+                    // profile starts at the first fluid cell: row 1 over a halfway wall (at z = 0,
+                    // half a cell below it), row 2 over Han's node row (row 1, the wall itself, at
+                    // z = +Δ/2, a whole cell below it).
+                    let first = if on_node { 2 } else { 1 };
                     let profile: Vec<f64> =
-                        (1..(nz * 4 / 5).max(2)).map(|k| flow.moments(grid.index([i, 0, k])).map_or(f64::NAN, |(_, u)| u[0])).collect();
+                        (first..(nz * 4 / 5).max(first + 1)).map(|k| flow.moments(grid.index([i, 0, k])).map_or(f64::NAN, |(_, u)| u[0])).collect();
                     let top = (0..profile.len()).max_by(|&a, &b| profile[a].total_cmp(&profile[b])).unwrap_or(0);
                     let u = &profile[..=top.min(profile.len().saturating_sub(1))];
                     let edge = u.last().copied().unwrap_or(f64::NAN);
                     let q = 0.5 * edge * edge;
                     let n = self.sample as f64 * cells;
+                    let (theta, delta_star) = thicknesses(u, edge, on_node, nu);
                     Station {
                         x: 0.5 * (a + b),
                         cf: carried[s] / n / q,
-                        re_theta: edge * momentum_thickness(u, 1.0, edge) / nu,
+                        re_theta: edge * theta[0] / nu,
+                        re_theta_trapezoid: edge * theta[1] / nu,
+                        theta,
+                        delta_star,
                         requested: any_requested.then(|| requested[s] / n / q),
                         edge,
                     }
@@ -251,14 +287,42 @@ impl Plate {
     }
 }
 
+/// The momentum and displacement thickness of a profile `u` sampled one cell apart up to its edge
+/// speed `edge` (lattice units), each as [law, trapezoid].
+///
+/// Over a halfway wall the first sample is half a cell from the wall and both entries are the
+/// midpoint sum Σ f(u_j). Over Han's on-node wall the first sample is a whole cell above the wall,
+/// where u = 0: from the first sample up it is the trapezoid, Σ f(u_j) − ½ f(u_1) (f(U_e) = 0 at
+/// the top), and the interval below it is added from the wall law or by its own trapezoid
+/// (`WallInterval`, board WL3 P1). For δ* the integrand is 1 at the wall, so its trapezoid share is
+/// not ½ f(u_1).
+fn thicknesses(u: &[f64], edge: f64, on_node: bool, nu: f64) -> ([f64; 2], [f64; 2]) {
+    let theta = momentum_thickness(u, 1.0, edge);
+    let delta_star = displacement_thickness(u, 1.0, edge);
+    if !on_node {
+        return ([theta; 2], [delta_star; 2]);
+    }
+    let Some((&u1, w)) = u.first().and_then(|u1| Some((u1, WallInterval::new(*u1, 1.0, nu)?))) else {
+        return ([f64::NAN; 2], [f64::NAN; 2]);
+    };
+    let r = u1 / edge;
+    let (theta_above, delta_above) = (theta - 0.5 * r * (1.0 - r), delta_star - 0.5 * (1.0 - r));
+    let [t_law, t_trap] = w.momentum_thickness(edge);
+    let [d_law, d_trap] = w.displacement_thickness(edge);
+    ([theta_above + t_law, theta_above + t_trap], [delta_above + d_law, delta_above + d_trap])
+}
+
 fn print_stations(stations: &[Station], reference: impl Fn(f64) -> f64) {
-    println!("|   x   |  Re_θ  |  U_e  | C_f carried | C_f requested | reference | error |");
+    println!("|   x   | Re_θ law, trapezoid | δ* law, trapezoid |  U_e  | C_f carried | C_f requested | reference | error |");
     for s in stations {
         let r = reference(s.re_theta);
         println!(
-            "| {:.3} | {:6.0} | {:.4} | {:.5e} | {} | {:.5e} | {:+.2} % |",
+            "| {:.3} | {:6.0}, {:6.0} | {:.3}, {:.3} | {:.4} | {:.5e} | {} | {:.5e} | {:+.2} % |",
             s.x,
             s.re_theta,
+            s.re_theta_trapezoid,
+            s.delta_star[0],
+            s.delta_star[1],
             s.edge,
             s.cf,
             s.requested.map_or("—".into(), |c| format!("{c:.5e}")),
@@ -450,4 +514,41 @@ fn sizing_the_wall_function_plate() {
     let (stations, _, steps) = plate.run();
     assert_eq!(steps, 200);
     assert!(stations.iter().all(|s| s.cf.is_finite()));
+}
+
+/// A small SA plate on Han's on-node wall (WL1), a few hundred steps: the profile starts above the
+/// node row, θ and δ* come as [law, trapezoid] with the first interval from the wall law, and the
+/// strips report the law's request. A check of the reading, not of the flow (under a second).
+#[test]
+fn a_plate_on_han_s_wall_reads_its_thicknesses_from_the_wall_law() {
+    let plate = Plate {
+        re: 1e5,
+        length: 0.5,
+        upstream: 0.1,
+        height: 0.2,
+        spacing: 1.0 / 100.0,
+        lattice_velocity: 0.1,
+        strip: 0.05,
+        pressure_top: false,
+        collision: Collision::Mrt,
+        turbulence: Some(Turbulence::SpalartAllmaras {
+            prandtl: 0.9,
+            wall_model: Some(fieldcraft_model::WallModel::SpaldingBounce),
+            inflow_ratio: 3.0,
+            ddes: None,
+        }),
+        max_steps: 300,
+        sample: 100,
+        settle: (0.1, 0.45),
+        settling: GATED,
+    };
+    let (stations, _, steps) = plate.run();
+    assert_eq!(steps, 300);
+    print_stations(&stations, karman_schoenherr);
+    for s in stations.iter().filter(|s| (0.1..=0.45).contains(&s.x)) {
+        let finite = [s.cf, s.re_theta, s.re_theta_trapezoid].iter().chain(&s.theta).chain(&s.delta_star).all(|v| v.is_finite());
+        assert!(finite && s.theta[0] > 0.0 && s.delta_star[0] > 0.0, "{s:?}");
+        assert!(s.theta[0] != s.theta[1] && s.delta_star[0] != s.delta_star[1], "the law's first interval differs from the trapezoid's: {s:?}");
+        assert!(s.requested.is_some_and(|r| r > 0.0 && r.is_finite()), "Han's nodes report the law's request: {s:?}");
+    }
 }
