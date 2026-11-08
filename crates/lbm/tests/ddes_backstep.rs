@@ -41,7 +41,7 @@
 //!
 //! The case runs for hours: [`driver_seegmiller`] takes a configured [`Step`]
 //! ([`Step::driver_seegmiller`] gives the case's own), and each model gets its own ignored
-//! `#[test]` naming it (none yet: slice 15b adds the first). A 100-step laminar run of the case's
+//! `#[test]` naming it (the first: [`sa_rans_on_han_s_wall_reattaches_where_measured`]). A 100-step laminar run of the case's
 //! geometry stays in the trunk gate; the longer pipeline check runs in the heavy job.
 
 mod common;
@@ -50,7 +50,7 @@ use common::cases::*;
 use common::*;
 use fieldcraft_lbm::statistics::Blocks;
 use fieldcraft_lbm::{Flow, Limits, Obstacle};
-use fieldcraft_model::{BoxFaces, Collision, FaceCondition, Outflow, Procedure, Turbulence};
+use fieldcraft_model::{AbsorbingLayer, BoxFaces, Collision, FaceCondition, HrrSigma, Outflow, Procedure, Turbulence, WallModel};
 
 /// The step model's parameters (lengths in units of H, inlet speed 1).
 #[derive(Debug, Clone)]
@@ -65,7 +65,11 @@ struct Step {
     /// The span in H; 0 for one cell.
     span: f64,
     collision: Collision,
+    /// The hybrid collision's fixed σ (HRR only).
+    sigma: Option<f64>,
     turbulence: Option<Turbulence>,
+    /// The absorbing layer at the inlet and the outlet.
+    absorbing: Option<AbsorbingLayer>,
     sample: u64,
     block: usize,
     startup: f64,
@@ -212,9 +216,19 @@ impl Step {
         let g = flow.grid();
         let h = g.spacing;
         let [nx, ny, nz] = g.cells;
+        // Han's on-node wall turns the first open cells beside a wall into boundary nodes (the
+        // wall itself, half a cell inside the cells the builder left open): the shape is measured
+        // from the open cells, nodes included, so it is the configured step either way.
+        let mut node = vec![false; g.len()];
+        for n in flow.wall_nodes().map_or(&[][..], |w| w.nodes()) {
+            if let Some(c) = node.get_mut(n.cell as usize) {
+                *c = true;
+            }
+        }
+        let open = |c: usize| flow.is_fluid(c) || node.get(c).copied().unwrap_or(false);
         let mut first = Vec::with_capacity(nx);
         for i in 0..nx {
-            let column = |j: usize| (0..nz).map(|k| flow.is_fluid(g.index([i, j, k]))).collect::<Vec<bool>>();
+            let column = |j: usize| (0..nz).map(|k| open(g.index([i, j, k]))).collect::<Vec<bool>>();
             let c = column(0);
             if (1..ny).any(|j| column(j) != c) {
                 return Err(format!("column {i} differs along the span"));
@@ -293,6 +307,7 @@ impl Step {
             z_max: FaceCondition::Wall {},
         };
         d.initial_velocity = [1.0, 0.0, 0.0];
+        d.absorbing = self.absorbing;
         let strips = self.strips();
         let (y0, y1) = (-h, width + h);
         let mut obstacles: Vec<Obstacle> = strips
@@ -315,7 +330,7 @@ impl Step {
             time_step: Some(dt),
             frames: 2,
             magic: None,
-            sigma: None,
+            sigma: self.sigma.map(HrrSigma::Value),
             collision: Some(self.collision),
             turbulence: self.turbulence,
             steady: None,
@@ -397,10 +412,25 @@ impl Step {
             assert!(sample.iter().all(|s| s.is_finite()), "the wall shear is not finite after {steps} steps");
             interval.iter_mut().for_each(|v| *v = 0.0);
             if shear.push(&sample) {
-                match reattachment(&floor_x, &floor_of(&shear.last_block())) {
-                    Ok(x_r) => blocks.push(x_r).unwrap(),
-                    Err(why) => missing = (missing.0 + 1, Some(why)),
+                let last = reattachment(&floor_x, &floor_of(&shear.last_block()));
+                match &last {
+                    Ok(x_r) => blocks.push(*x_r).unwrap(),
+                    Err(why) => missing = (missing.0 + 1, Some(why.clone())),
                 }
+                // A long run says where it is once per block: the block's reattachment, the
+                // running mean, and the inlet's largest |ρ − 1| (its first four columns).
+                let inlet = (0..4.min(nx))
+                    .flat_map(|i| (0..nz).flat_map(move |k| (0..ny).map(move |j| [i, j, k])))
+                    .filter_map(|c| flow.moments(grid.index(c)).map(|m| (m.0 - 1.0).abs()))
+                    .fold(0.0, f64::max);
+                println!(
+                    "step {steps}: block {} x_r {last:?}, mean {:.3} H over {} blocks ({} refused), inlet |ρ − 1| {inlet:.2e}, {:.0} s",
+                    shear.blocks(),
+                    blocks.mean(),
+                    blocks.means().len(),
+                    missing.0,
+                    clock.elapsed().as_secs_f64()
+                );
                 if blocks.acceptance().accepted {
                     settled = true;
                     break;
@@ -499,7 +529,9 @@ fn laminar(max_steps: u64) -> Step {
         cells_per_h: 4,
         lattice_velocity: 0.05,
         collision: Collision::Trt,
+        sigma: None,
         turbulence: None,
+        absorbing: None,
         sample: 10,
         block: 2,
         startup: 0.0,
@@ -577,6 +609,11 @@ impl Step {
     /// turbulence model; `span` in H, 0 for one cell (2D). U = 0.1 in lattice units keeps
     /// τ − ½ = 3 U N / Re_H = 1.3 × 10⁻⁴ above the wall model's floor of 10⁻⁴, and puts the first
     /// cell upstream at y⁺ ≈ 43.
+    ///
+    /// The hybrid collision at fixed σ 0.99 and the default absorbing layer (10 cells) at the
+    /// inlet and the outlet: at this τ a velocity inlet's first columns grow a density mode one
+    /// cell wide, which the layer damps (`inlet_free_stream.rs`); the step's uniform inlet held
+    /// 20 000 steps with it and drifted to |ρ − 1| 0.25 without it.
     fn case(span: f64) -> Step {
         Step {
             re_h: 36_000.0,
@@ -586,8 +623,10 @@ impl Step {
             downstream: 30.0,
             expansion_ratio: 1.125,
             span,
-            collision: Collision::Mrt,
+            collision: Collision::Hrr,
+            sigma: Some(0.99),
             turbulence: None,
+            absorbing: Some(AbsorbingLayer { thickness: None, strength: None, filter_time: None }),
             sample: 500,
             block: 10,
             startup: 2.0,
@@ -596,7 +635,6 @@ impl Step {
     }
 
     /// The case with a turbulence model: what each model's run uses.
-    #[allow(dead_code)]
     fn driver_seegmiller(turbulence: Turbulence, span: f64) -> Step {
         Step { turbulence: Some(turbulence), ..Step::case(span) }
     }
@@ -615,10 +653,21 @@ impl Step {
 ///     assert!(run.settled && score.passes());
 /// }
 /// ```
-#[allow(dead_code)]
 fn driver_seegmiller(step: &Step) -> (Run, Score) {
     println!("Driver & Seegmiller: {step:?}");
     let r = step.run();
     let score = report(step, &r);
     (r, score)
+}
+
+/// Spalart–Allmaras RANS on Han's wall in 2D (one cell of span), the case's grid and inlet: the
+/// first model run toward x_r / H. Hours on 5 threads:
+/// `FIELDCRAFT_THREADS=5 cargo test --release -p fieldcraft-lbm --test ddes_backstep sa_rans_on_han_s_wall -- --ignored --nocapture`.
+#[test]
+#[ignore = "hours: tests/oracle/ddes-backstep-driver-seegmiller/README.md"]
+fn sa_rans_on_han_s_wall_reattaches_where_measured() {
+    let sa = Turbulence::SpalartAllmaras { prandtl: 0.9, wall_model: Some(WallModel::SpaldingBounce), inflow_ratio: 3.0, ddes: None };
+    let steps = std::env::var("FIELDCRAFT_STEP_MAX_STEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(400_000);
+    let (run, score) = driver_seegmiller(&Step { max_steps: steps, ..Step::driver_seegmiller(sa, 0.0) });
+    assert!(run.settled && score.passes(), "x_r {:?}, settled {}", run.x_r, run.settled);
 }
