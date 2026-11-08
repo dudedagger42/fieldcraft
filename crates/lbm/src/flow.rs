@@ -612,6 +612,17 @@ struct SaState {
     /// ([`Flow::wall_friction`]).
     law: Option<crate::sa::WallLaw>,
     wall: Vec<(usize, f64, f64)>,
+    /// With DDES: each cell's length d̃, which the destruction term reads instead of the distance.
+    ddes: Option<DdesState>,
+}
+
+/// DDES on the Spalart–Allmaras model ([`crate::ddes`]): its C_DES, each cell's length d̃ of the
+/// step (rebuilt before ν̃ advances, from the same gradient as the vorticity) and what that showed.
+#[derive(Debug, Clone)]
+struct DdesState {
+    c_des: f64,
+    length: Vec<f64>,
+    stats: crate::ddes::DdesStats,
 }
 
 /// Cells per parallel block of the collision and the streaming: about a 256th of the grid, so a
@@ -1198,7 +1209,12 @@ impl Flow {
                 } else {
                     (setup.wall_model == Some(WallModel::Musker)).then_some(crate::sa::WallLaw::Musker)
                 };
-                Some(SaState { field, distance, vorticity: filled(n, 0.0, "vorticities")?, law, wall: Vec::new() })
+
+                let ddes = match sa.c_des {
+                    Some(c_des) => Some(DdesState { c_des, length: filled(n, 0.0, "DDES lengths")?, stats: crate::ddes::DdesStats::default() }),
+                    None => None,
+                };
+                Some(SaState { field, distance, vorticity: filled(n, 0.0, "vorticities")?, law, wall: Vec::new(), ddes })
             }
         };
         open.shrink_to_fit();
@@ -1465,7 +1481,12 @@ impl Flow {
             + bytes(&self.cell_u)
             + bytes(&self.cell_nu_t)
             + bytes(&self.gradient_u)
-            + self.sa.as_ref().map_or(0, |s| s.field.heap_bytes() + bytes(&s.vorticity) + size_of_val(s.distance.as_slice()) as u64)
+            + self.sa.as_ref().map_or(0, |s| {
+                s.field.heap_bytes()
+                    + bytes(&s.vorticity)
+                    + size_of_val(s.distance.as_slice()) as u64
+                    + s.ddes.as_ref().map_or(0, |d| bytes(&d.length))
+            })
             + bytes(&self.zone_of)
             + bytes(&self.open_scratch)
             + self.zone_cells.iter().map(bytes).sum::<u64>()
@@ -1603,6 +1624,11 @@ impl Flow {
         self.sa.as_ref().map(|s| s.distance.as_slice())
     }
 
+    /// With DDES, each cell's length d̃ of the last step (lattice units; 0 outside the fluid).
+    pub fn ddes_length(&self) -> Option<&[f64]> {
+        self.sa.as_ref().and_then(|s| s.ddes.as_ref()).map(|d| d.length.as_slice())
+    }
+
     /// With the hybrid collision's dynamic σ, its smallest and mean value over the fluid cells in
     /// the last step (a diagnostic; `None` without dynamic σ or before the first step).
     pub fn dynamic_sigma(&self) -> Option<(f64, f64)> {
@@ -1634,6 +1660,12 @@ impl Flow {
     /// With a shear-dependent fluid: how many cells' relaxation times were clamped.
     pub fn viscosity_clamps(&self) -> Option<Clamps> {
         self.rheology.is_some().then_some(self.clamps)
+    }
+
+    /// With DDES: the share of fluid cells in LES mode (f_d > 0.5) and the largest f_d of the last
+    /// step's lengths (none without DDES).
+    pub fn ddes(&self) -> Option<crate::ddes::DdesStats> {
+        self.sa.as_ref().and_then(|s| s.ddes.as_ref()).map(|d| d.stats)
     }
 
     /// The largest eddy viscosity over the fluid's own viscosity in the last step (0 without a
@@ -2183,7 +2215,10 @@ impl Flow {
     /// With the Spalart–Allmaras model: each cell's vorticity from the finite-difference gradient
     /// of the velocities [`Flow::gradient_velocities`] gathered (as the hybrid collision's and
     /// Vreman's), then one lattice step of ν̃ ([`SaField::advance`]), before the collision reads
-    /// its ν_t.
+    /// its ν_t. With DDES the same gradient gives each cell's length d̃ ([`crate::ddes::cell`],
+    /// with ν_t of ν̃ before this step and the filter width Δ of one cell), which the destruction
+    /// term reads instead of the wall distance; blocks are fixed, so the lengths and the LES
+    /// fraction do not depend on the thread count.
     fn advance_sa(&mut self) -> Result<()> {
         if self.sa.is_none() {
             return Ok(());
@@ -2193,19 +2228,44 @@ impl Flow {
         let (grid, periodic, block, steps) = (self.grid, self.periodic, self.block, self.steps_done);
         let fluid = populated_mask(&self.fluid, &self.bulk, self.surface.as_ref());
         let u = &self.gradient_u;
-        parallel::chunks_mut(&mut sa.vorticity, block, |b, out| {
-            for (i, w) in out.iter_mut().enumerate() {
+        let nu = (1.0 / self.omega_plus - 0.5) / 3.0;
+        let (field, distance) = (&sa.field, sa.distance.as_slice());
+        let c_des = sa.ddes.as_ref().map(|d| d.c_des);
+        // Per block: its vorticities, its lengths (empty without DDES), its fluid and LES cell
+        // counts and its largest f_d.
+        let lengths: &mut [f64] = sa.ddes.as_mut().map_or(&mut [], |d| d.length.as_mut_slice());
+        let mut length_blocks = lengths.chunks_mut(block);
+        let mut parts: Vec<(&mut [f64], &mut [f64], [usize; 2], f64)> =
+            sa.vorticity.chunks_mut(block).map(|w| (w, length_blocks.next().unwrap_or(&mut []), [0; 2], 0.0)).collect();
+        parallel::for_each_mut(&mut parts, |b, (vorticity, length, counts, max)| {
+            for (i, w) in vorticity.iter_mut().enumerate() {
                 let cell = b * block + i;
                 *w = 0.0;
-                let (true, Some(&uc)) = (fluid.get(cell).copied().unwrap_or(false), u.get(cell)) else { continue };
-                let p = grid.coords(cell);
-                let nb: crate::hrr::Neighbours =
-                    [0, 1, 2].map(|axis| [false, true].map(|up| neighbour(&grid, periodic, fluid, p, axis, up).and_then(|c| u.get(c).copied())));
-                *w = crate::sa::vorticity(&crate::hrr::gradient(uc, &nb));
+                let (true, Some(_)) = (fluid.get(cell).copied().unwrap_or(false), u.get(cell)) else {
+                    if let Some(l) = length.get_mut(i) {
+                        *l = 0.0;
+                    }
+                    continue;
+                };
+                let g = crate::ddes::cell_gradient(&grid, periodic, fluid, u, cell);
+                *w = crate::sa::vorticity(&g);
+                if let (Some(c_des), Some(l)) = (c_des, length.get_mut(i)) {
+                    let d = distance.get(cell).copied().unwrap_or(0.0);
+                    let (dt, f) = crate::ddes::cell(nu + field.nu_t(cell, nu), &g, d, 1.0, c_des);
+                    *l = dt;
+                    counts[0] += 1;
+                    counts[1] += usize::from(f > 0.5);
+                    *max = max.max(f);
+                }
             }
         });
-        let nu = (1.0 / self.omega_plus - 0.5) / 3.0;
-        let input = SaInput { u, vorticity: &sa.vorticity, length: sa.distance.as_slice(), nu, model: true, source: None, substeps: None };
+        let stats = crate::ddes::DdesStats::of_blocks(parts.iter().map(|(_, _, counts, max)| (*counts, *max)));
+        drop(parts);
+        if let Some(d) = &mut sa.ddes {
+            d.stats = stats;
+        }
+        let length = sa.ddes.as_ref().map_or(sa.distance.as_slice(), |d| d.length.as_slice());
+        let input = SaInput { u, vorticity: &sa.vorticity, length, nu, model: true, source: None, substeps: None };
         sa.field.advance(&input).map_err(|e| match e {
             Error::Unstable(m) => Error::Unstable(format!("{m} (at time step {})", steps + 1)),
             other => other,
@@ -3188,6 +3248,9 @@ impl crate::backend::Backend for Flow {
         Some(solid / self.fluid_cells.max(1) as f64)
     }
 
+    fn ddes(&self) -> Option<crate::ddes::DdesStats> {
+        Flow::ddes(self)
+    }
     fn eddy_viscosity_ratio(&self) -> f64 {
         Flow::eddy_viscosity_ratio(self)
     }

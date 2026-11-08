@@ -293,6 +293,8 @@ pub struct Setup {
 pub struct SaSetup {
     /// ν̃/ν at inflows and in the initial field.
     pub inflow_ratio: f64,
+    /// With DDES ([`crate::ddes`]): its C_DES; the destruction term then reads each cell's d̃.
+    pub c_des: Option<f64>,
 }
 
 /// What a zone of the domain does, in lattice units.
@@ -567,13 +569,7 @@ impl Setup {
                                 C_DES.end()
                             )));
                         }
-                        if ddes.is_some() {
-                            return Err(Error::Invalid(
-                                "not supported yet: DDES (`ddes`) with the Spalart–Allmaras model; leave out `ddes` for the Reynolds-averaged model"
-                                    .into(),
-                            ));
-                        }
-                        (0.0, 0.0, Some(SaSetup { inflow_ratio }), prandtl, None, t.wall_model())
+                        (0.0, 0.0, Some(SaSetup { inflow_ratio, c_des: ddes.map(|d| d.c_des) }), prandtl, None, t.wall_model())
                     }
                 }
             }

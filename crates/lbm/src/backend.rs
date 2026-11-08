@@ -52,6 +52,12 @@ pub trait Backend {
     fn zones(&mut self) -> Result<Vec<crate::flow::ZoneSample>> {
         Ok(Vec::new())
     }
+    /// With DDES: the last step's share of fluid cells in LES mode and largest f_d. A backend
+    /// without the Spalart–Allmaras model refuses a flow with it when it is made, so the default
+    /// is none.
+    fn ddes(&self) -> Option<crate::ddes::DdesStats> {
+        None
+    }
     /// The largest eddy viscosity over the fluid's own viscosity in the last step. A backend
     /// without a turbulence model refuses a flow with one when it is made, so the default is 0.
     fn eddy_viscosity_ratio(&self) -> f64 {

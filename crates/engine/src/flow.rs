@@ -616,6 +616,7 @@ pub(crate) mod tests {
             backend: "cpu".into(),
             tau_thermal: None,
             eddy_viscosity_ratio: None,
+            ddes: None,
             frozen: None,
             free_surface: None,
         };
