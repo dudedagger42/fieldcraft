@@ -433,14 +433,20 @@ resolution, not the staircase. The heavy job runs 16 cells per R for 10 000 step
 
 **Square duct at Re_b 2205** (`fieldcraft-lbm-gpu`'s `sa_duct.rs`, on the CPU or the GPU). Re_b is
 U_b h/ν, with h the half-width.
-- **Reference:** A. Pinelli, M. Uhlmann, A. Sekimoto, G. Kawahara (J. Fluid Mech. 644:107–122,
-  2010) find their DNS friction in good agreement with Jones's square-duct correlation (O. C. Jones,
-  J. Fluids Eng. 98:173–180, 1976), 1/√f = 2 log₁₀(2.25 Re_b √f) − 0.8. That gives Re_τ = 150.9
-  here, as their 2h⁺ ≈ 300 does. The gate is Jones at the run's own Re_b.
+- **Reference, the gate:** S. Pirozzoli, D. Modesti, P. Orlandi, F. Grasso (J. Fluid Mech., 2018,
+  doi:10.1017/jfm.2018.66), case A, which is this flow (Gavrilakis' case): 2hu_b/ν = 4410,
+  Re_τ* = 151, C_f = 9.38 × 10⁻³, so **f = 0.03752** and U_b⁺ = 14.60. The run is set at
+  Re_τ 150.9, so f is compared with the DNS directly.
+- **Beside it:** Jones's square-duct correlation (O. C. Jones, J. Fluids Eng. 98:173–180, 1976),
+  1/√f = 2 log₁₀(2.25 Re_b √f) − 0.8. It gives f = 0.03748 at Re_b 2205, within 0.1 % of the DNS.
+  A. Pinelli, M. Uhlmann, A. Sekimoto and G. Kawahara (J. Fluid Mech. 644:107–122, 2010) find their
+  DNS friction in good agreement with it, but publish no values. Neither paper quotes a tolerance
+  for the correlation.
 - **Command:** `FIELDCRAFT_DUCT_STUDY=1 FIELDCRAFT_DUCT_GPU=1 cargo test --release -p
   fieldcraft-lbm-gpu --test sa_duct -- --ignored --nocapture study`.
 - **Recorded** on an RTX 4070 Laptop GPU at 100 cells per h (first cell y⁺ 0.75, 160 000 cells):
-  270 000 steps in 107 s, U_b⁺ 14.867 (Re_b 2244), **f −2.95 % against Jones**, U_c/U_b 1.352.
+  270 000 steps in 107 s, U_b⁺ 14.867 (DNS 14.60), **f −3.52 % against the DNS** (−2.95 % against
+  Jones at its Re_b 2244), U_c/U_b 1.352.
 - SA is a linear eddy-viscosity model and makes no secondary flow (the corner vortices come from
   the anisotropy of the normal stresses), so U_c/U_b and the shear along an edge are reported, not
   gated.

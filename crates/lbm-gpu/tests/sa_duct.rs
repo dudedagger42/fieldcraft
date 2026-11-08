@@ -11,14 +11,21 @@
 //! profiles at the expected U_b⁺. It is settled when U_b moves by less than [`SETTLED`] between
 //! windows of [`WINDOW`] steps.
 //!
-//! **Reference.** A. Pinelli, M. Uhlmann, A. Sekimoto, G. Kawahara, *Reynolds number dependence
-//! of mean flow structure in square duct turbulence*, J. Fluid Mech. 644:107–122, 2010
-//! (doi:10.1017/S0022112009992242). Their DNS at Re_b = U_b h/ν = 1077–3500 has mean wall friction
-//! in good agreement with Jones's correlation for the square duct (O. C. Jones, *An improvement in
-//! the calculation of turbulent friction in rectangular ducts*, J. Fluids Eng. 98:173–180, 1976),
-//! 1/√f = 2 log₁₀(2.25 Re_b √f) − 0.8, f = 8 u_τ²/U_b², with the edge 2h⁺ ≈ 300 at Re_b 2205 (the
-//! case Gavrilakis first simulated, J. Fluid Mech. 244:101–129, 1992). The gate compares f with
-//! Jones at the run's own Re_b.
+//! **References.**
+//! - The gate: the DNS of S. Pirozzoli, D. Modesti, P. Orlandi, F. Grasso, *Turbulence and
+//!   secondary motions in square duct flow*, J. Fluid Mech., 2018 (doi:10.1017/jfm.2018.66;
+//!   arXiv:1707.03638). Their case A (their table 1) is this flow, Gavrilakis' case
+//!   (J. Fluid Mech. 244:101–129, 1992): 2 h u_b/ν = 4410, so U_b h/ν = 2205; Re_τ* = h u_τ*/ν = 151
+//!   with u_τ* the perimeter-mean friction velocity; C_f = 9.38 × 10⁻³, so f = 4 C_f = 0.03752 and
+//!   U_b⁺ = √(2/C_f) = 14.60. The run is set at Re_τ 150.9, so f is compared with the DNS directly.
+//! - Beside it: Jones's correlation for the square duct (O. C. Jones, *An improvement in the
+//!   calculation of turbulent friction in rectangular ducts*, J. Fluids Eng. 98:173–180, 1976),
+//!   1/√f = 2 log₁₀(2.25 Re_b √f) − 0.8 with f = 8 u_τ²/U_b², at the run's own Re_b. It gives
+//!   f = 0.03748 at Re_b 2205, within 0.1 % of the DNS. A. Pinelli, M. Uhlmann, A. Sekimoto and
+//!   G. Kawahara (J. Fluid Mech. 644:107–122, 2010, doi:10.1017/S0022112009992242) find their DNS
+//!   over Re_b 1077–3500 in good agreement with Jones but publish no friction values; Pirozzoli et
+//!   al. find the hydraulic-diameter law and Jones's correction equally accurate for the square
+//!   duct. Neither paper quotes a tolerance for the correlation.
 //!
 //! **What SA cannot do here.** SA is a linear (Boussinesq) eddy-viscosity model, so it produces no
 //! secondary flow of the second kind: Prandtl's corner vortices come from the anisotropy of the
@@ -38,8 +45,12 @@ use fieldcraft_model::{Collision, FaceCondition, HrrSigma, Procedure, Turbulence
 /// Steps per settling window and the relative change of U_b between windows.
 const WINDOW: u64 = 5000;
 const SETTLED: f64 = 2e-5;
-/// Pinelli et al.'s Re_b 2205, and Re_τ from Jones's correlation there.
+/// Gavrilakis' and Pirozzoli et al.'s case A: Re_b = U_b h/ν 2205; Re_τ follows from Jones's
+/// correlation there (150.9, the DNS's 151).
 const RE_B: f64 = 2205.0;
+/// Pirozzoli et al.'s case A: C_f = 2 (u_τ*/U_b)² and Re_τ* (see the module docs).
+const DNS_CF: f64 = 9.38e-3;
+const DNS_RE_TAU: f64 = 151.0;
 
 /// Jones's f at `re_b` (U_b h/ν), by fixed-point iteration (it converges in a few steps).
 fn jones(re_b: f64) -> f64 {
@@ -141,13 +152,14 @@ impl Duct {
     }
 }
 
-/// Jones's correlation at Re_b 2205 gives Re_τ ≈ 151, as Pinelli et al.'s 2h⁺ ≈ 300 says.
+/// Jones's correlation at Re_b 2205 gives Re_τ ≈ 151 and the DNS's friction within 0.2 %.
 #[test]
 fn jones_s_correlation_matches_the_dns_edge_in_wall_units() {
     let f = jones(RE_B);
     let re_tau = RE_B * (f / 8.0).sqrt();
     assert!((f - 0.03748).abs() < 1e-5, "{f}");
-    assert!((2.0 * re_tau - 300.0).abs() < 5.0, "2h⁺ {}", 2.0 * re_tau);
+    assert!((re_tau - DNS_RE_TAU).abs() < 0.5, "Re_τ {re_tau}");
+    assert!((f / (4.0 * DNS_CF) - 1.0).abs() < 2e-3, "Jones {f}, DNS {}", 4.0 * DNS_CF);
 }
 
 /// The environment variable that runs the duct study (docs/verification.md, "Long studies").
@@ -155,16 +167,17 @@ const STUDY: &str = "FIELDCRAFT_DUCT_STUDY";
 
 /// The duct at Re_τ ≈ 151, SA resolved to the wall on the hybrid collision (σ 0.99),
 /// `FIELDCRAFT_DUCT_CELLS` cells per half-width (100 by default), run until it settles, on the GPU
-/// with `FIELDCRAFT_DUCT_GPU=1`, else on the CPU. Gates: f within 5 % of Jones at the run's Re_b;
-/// settled, ν̃ ≥ 0. U_c/U_b is reported. It runs only when asked:
+/// with `FIELDCRAFT_DUCT_GPU=1`, else on the CPU. Gates: f within 5 % of Pirozzoli et al.'s DNS;
+/// settled, ν̃ ≥ 0. Jones at the run's Re_b and U_c/U_b are reported. It runs only when asked:
 /// `FIELDCRAFT_DUCT_STUDY=1 FIELDCRAFT_DUCT_GPU=1 cargo test --release -p fieldcraft-lbm-gpu --test
 /// sa_duct -- --ignored --nocapture study` (about two minutes on an RTX 4070 Laptop GPU; hours on
 /// the CPU). The bounded regression below checks its start on every heavy run.
 ///
 /// Measured when written: on the CPU at 10 cells per h (first cell y⁺ 7.5, 60 000 steps, 59 s on
-/// 4 threads), f +57 % against Jones, too coarse for SA resolved to the wall; on the RTX 4070
+/// 4 threads), f +70 % against the DNS, too coarse for SA resolved to the wall; on the RTX 4070
 /// Laptop GPU (in-place streaming, 160 000 cells) at 100 cells per h (y⁺ 0.75): 270 000 steps in
-/// 107 s, U_b⁺ 14.867, Re_b 2244, **f 0.03620, −2.95 % against Jones** (0.03730), U_c/U_b 1.352.
+/// 107 s, U_b⁺ 14.867, Re_b 2244, **f 0.03620, −3.52 % against the
+/// DNS** (0.03752; −2.95 % against Jones at Re_b 2244, 0.03730), U_c/U_b 1.352.
 #[test]
 #[ignore = "minutes on a GPU: set FIELDCRAFT_DUCT_STUDY=1 (docs/verification.md, \"Long studies\")"]
 fn study_the_sa_square_duct_against_jones_s_friction() {
@@ -184,13 +197,14 @@ fn study_the_sa_square_duct_against_jones_s_friction() {
     };
     let f = 8.0 / (r.bulk * r.bulk);
     let re_b = r.bulk * re_tau;
-    let reference = jones(re_b);
+    let (dns, reference) = (4.0 * DNS_CF, jones(re_b));
     println!(
-        "SA square duct on {}, {cells} cells per h (first cell y⁺ ≈ {:.2}), HRR σ 0.99: U_b⁺ {:.3}, Re_b {re_b:.0}; f {f:.5} (Jones {reference:.5}, {:+.2} %); \
+        "SA square duct on {}, {cells} cells per h (first cell y⁺ ≈ {:.2}), HRR σ 0.99: U_b⁺ {:.3}, Re_b {re_b:.0}; f {f:.5} (DNS {dns:.5}, {:+.2} %; Jones {reference:.5}, {:+.2} %); \
          U_c/U_b {:.3}; min ν̃ {:.2e}; settled {} after {} steps, {:.0} s",
         r.backend,
         0.5 * re_tau / cells as f64,
         r.bulk,
+        100.0 * (f / dns - 1.0),
         100.0 * (f / reference - 1.0),
         r.centre,
         r.min_nu_tilde,
@@ -199,7 +213,7 @@ fn study_the_sa_square_duct_against_jones_s_friction() {
         started.elapsed().as_secs_f64()
     );
     let mut score = Score::default();
-    score.push(Gate::new("SA duct", &format!("f, {cells} cells per h"), f, reference, 0.05));
+    score.push(Gate::new("SA duct", &format!("f, {cells} cells per h"), f, dns, 0.05));
     println!("{}", score.table());
     assert!(r.settled, "not settled in {} steps", r.steps);
     assert!(r.min_nu_tilde >= 0.0, "ν̃ {}", r.min_nu_tilde);
