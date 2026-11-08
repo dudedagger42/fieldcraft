@@ -141,6 +141,7 @@ whose forces are read back (a submission's last). The temperature lattice is two
 | Steady-state rule and averaging | yes (decided on the host from read-back fields) |
 | Fans and porous zones (curves, Darcy–Forchheimer, loss coefficients), with every collision and wall treatment | yes |
 | The halfway wall-function bounce (`wall_model: "spalding_bounce_halfway"`) | yes |
+| The Spalart–Allmaras model (`turbulence: {"type": "spalart_allmaras"}`), with DDES, resolved to the wall or on Han et al.'s on-node wall | yes; with `musker`, Van Driest damping, heat or the dynamic σ it is refused (CPU only) |
 | Han et al.'s on-node wall-function bounce (`wall_model: "spalding_bounce"`, their eq. 14) | yes: box faces, obstacles, edges, corners and the cells where a wall meets an open face |
 | The absorbing layer at velocity and pressure faces (`absorbing`) | no: refused (CPU only) |
 
