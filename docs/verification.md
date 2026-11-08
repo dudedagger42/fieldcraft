@@ -316,6 +316,44 @@ not measured for these runs.
 
 The first cell's y⁺ is the measured Re_τ × 0.5 / N.
 
+### Laminar flat plate against Blasius (the 2DZP case's measuring pipeline)
+
+The pipeline of the turbulent flat plate (`tests/oracle/sa-flat-plate-2dzp`, pending), checked on
+a laminar plate: the same model built in code (velocity inlet, slip floor ahead of the plate, the
+plate as strips of solid cells, a slip top two plate lengths up, convective pressure outlet), each
+strip's C_f from the momentum its wall carries, U_e the profile's fastest speed and θ integrated up
+to it, every value a time mean over two periods of the domain's acoustic quarter wave
+(`Plate::acoustic_period`). Re 2000 per unit length, Δ = 1/200, U_lat 0.1, TRT (τ − ½ = 0.03),
+10⁵ cells. Reference: Blasius's layer, c_f Re_θ = 0.664² = 0.441 (H. Schlichting, *Boundary-Layer
+Theory*, 7th ed., McGraw-Hill 1979, ch. VII), gated at 5 % from x = 0.3 to 0.9 (Re_x 600–1800).
+
+```
+FIELDCRAFT_PLATE_STUDY=1 cargo test --release -p fieldcraft-lbm --test sa_flat_plate -- --ignored --nocapture study
+```
+
+About 2.5 minutes on four threads. Recorded on Windows x86_64: settled after 11 500 steps
+(4.6 flow-throughs; the laminar pipeline's settling, 1 % drift of the two-period means), all
+twelve stations within the gate:
+
+| x | 0.325 | 0.375 | 0.425 | 0.475 | 0.525 | 0.575 | 0.625 | 0.675 | 0.725 | 0.775 | 0.825 | 0.875 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| c_f Re_θ vs Blasius | −1.99 % | −0.86 % | −0.55 % | −0.31 % | −0.16 % | −0.08 % | −0.05 % | −0.03 % | −0.04 % | −0.41 % | −0.20 % | −0.35 % |
+
+The heavy job runs its first flow-through instead (2500 steps,
+`a_short_laminar_plate_keeps_the_study_s_friction`, half a minute): C_f and Re_θ at x = 0.325,
+0.625 and 0.875 frozen at their first measurement with a relative band of 10⁻⁹. The run is laminar
+and deterministic (the same bits on two and four threads), so the band is round-off room and any
+change to the collision, the walls, the inlet, the outlet or the measures fails it.
+
+What it does not establish:
+- **The turbulent case.** The 2DZP gate (Kármán–Schoenherr within 5 % over Re_θ 4000–13000) runs on
+  Han's on-node wall with SA on the hybrid collision at fixed σ 0.99. It waits for the absorbing
+  layer: the inlet and outlet trap an acoustic quarter wave that neither MRT nor TRT damps (e-fold
+  about 10⁵ steps on this plate), and on the 2DZP grid its period is about 33 000 steps.
+- **Settling to 0.1 %.** The two-period means still move 2–5 × 10⁻³ between windows as the modes
+  beat, so the laminar check settles on a looser rule than the gated cases' (`LAMINAR_PIPELINE` against
+  `GATED` in `crates/lbm/tests/common/cases.rs`).
+
 ### What #664's acceptance still lacks
 
 - **Developing pipe flow against Shah & London (1978)**: not built.

@@ -25,7 +25,8 @@
 //!
 //! The turbulent case runs for hours: [`tmr_2dzp`] takes the turbulence model and grid, and each
 //! model gets its own ignored `#[test]` naming it (none yet: slice 15a's Spalart–Allmaras adds the
-//! first). The laminar check runs in the heavy job.
+//! first). The laminar check is a study run by hand (docs/verification.md, "Long studies"); the
+//! heavy job runs its first flow-through against frozen values.
 
 mod common;
 
@@ -353,18 +354,10 @@ fn gate(case: &str, stations: &[Station], from: f64, refs: &[(f64, f64, f64)], s
 /// 10 000–30 000 agree to 0.3 %.
 const LAMINAR_PIPELINE: Settling = Settling { min_flow_throughs: 4.0, drift: 1e-2 };
 
-/// The measuring pipeline on a laminar plate at Re 2000 per unit length: C_f Re_θ within 5 % of
-/// Blasius's 0.441 from x = 0.3 to 0.9 (Re_x 600–1800), clear of the leading edge and the outlet.
-/// τ − ½ = 3 U_lat / (Re Δ) = 0.03: at Re 10⁴ (τ − ½ = 0.006) the leading edge went unstable with
-/// either a slip or a pressure top. The top is a slip wall two plate lengths up; the layer's
-/// displacement accelerates the edge flow (U_e ≈ 1.07 U); C_f and Re_θ are both formed with the
-/// measured edge speed. Measured on a065b79b: settled after 11 500 steps, C_f Re_θ 0.03–2.0 % below
-/// Blasius over the gated stations (lowest at x = 0.325). About two minutes in release on four
-/// threads (10⁵ cells).
-#[test]
-#[ignore = "heavy: cargo xtask test --heavy (CI heavy job)"]
-fn a_laminar_plate_reads_blasius_friction() {
-    let plate = Plate {
+/// The laminar plate at Re 2000 per unit length (Δ = 1/200, TRT, slip top two plate lengths up),
+/// run for at most `max_steps` steps.
+fn laminar_plate(max_steps: u64) -> Plate {
+    Plate {
         re: 2000.0,
         length: 1.0,
         upstream: 0.25,
@@ -375,12 +368,33 @@ fn a_laminar_plate_reads_blasius_friction() {
         pressure_top: false,
         collision: Collision::Trt,
         turbulence: None,
-        max_steps: 40_000,
+        max_steps,
         sample: 100,
         settle: (0.3, 0.9),
         settling: LAMINAR_PIPELINE,
-    };
-    let (stations, converged, steps) = plate.run();
+    }
+}
+
+/// The environment variable that runs the plate studies (docs/verification.md, "Long studies").
+const STUDY: &str = "FIELDCRAFT_PLATE_STUDY";
+
+/// The measuring pipeline on a laminar plate at Re 2000 per unit length: C_f Re_θ within 5 % of
+/// Blasius's 0.441 from x = 0.3 to 0.9 (Re_x 600–1800), clear of the leading edge and the outlet.
+/// τ − ½ = 3 U_lat / (Re Δ) = 0.03: at Re 10⁴ (τ − ½ = 0.006) the leading edge went unstable with
+/// either a slip or a pressure top. The top is a slip wall two plate lengths up; the layer's
+/// displacement accelerates the edge flow (U_e ≈ 1.07 U); C_f and Re_θ are both formed with the
+/// measured edge speed. About two minutes on four threads (10⁵ cells), so it runs only when asked:
+/// `FIELDCRAFT_PLATE_STUDY=1 cargo test --release -p fieldcraft-lbm --test sa_flat_plate -- --ignored --nocapture study`.
+/// The bounded regression below checks its first flow-through on every heavy run; the recorded
+/// results are in docs/verification.md ("Long studies").
+#[test]
+#[ignore = "minutes: set FIELDCRAFT_PLATE_STUDY=1 (docs/verification.md, \"Long studies\")"]
+fn study_a_laminar_plate_against_blasius() {
+    if std::env::var_os(STUDY).is_none_or(|v| v != "1") {
+        println!("the laminar plate study runs only with {STUDY}=1: skipped");
+        return;
+    }
+    let (stations, converged, steps) = laminar_plate(40_000).run();
     println!("laminar plate, Re 2000 per unit length, Δ = 1/200: {steps} steps, settled: {converged}");
     print_stations(&stations, |re_theta| BLASIUS_CF_RE_THETA / re_theta);
     let mut score = Score::default();
@@ -390,6 +404,39 @@ fn a_laminar_plate_reads_blasius_friction() {
     println!("{}", score.table());
     assert!(converged, "the laminar plate did not settle in {steps} steps");
     assert!(score.passes());
+}
+
+/// The study above, bounded: its first flow-through (2500 steps), with C_f and Re_θ at three
+/// gated stations, each the mean of the 25 samples (the averaging window, two acoustic periods,
+/// is longer than the run). Frozen at its first measurement; the run is laminar and
+/// deterministic, so the band of 10⁻⁹ (relative) is round-off room only, and any change to
+/// the collision, the walls, the inlet or outlet, or the measuring pipeline fails it. About half
+/// a minute on four threads.
+#[test]
+#[ignore = "heavy: cargo xtask test --heavy (CI heavy job)"]
+fn a_short_laminar_plate_keeps_the_study_s_friction() {
+    // x, C_f, Re_θ: measured when frozen (2026-11-07, Windows x86_64; the same bits on two and four
+    // threads). Still the start-up: C_f is near 0.043 at every station, against 0.016–0.024 settled.
+    const FROZEN: [(f64, f64, f64); 3] = [
+        (0.325, 4.309038167324105e-2, 1.4895299537647583e1),
+        (0.625, 4.335373848472823e-2, 1.68498305361289e1),
+        (0.875, 4.413276296504364e-2, 1.7141221700117505e1),
+    ];
+    let (stations, _, steps) = laminar_plate(2500).run();
+    assert_eq!(steps, 2500);
+    let found: Vec<(f64, f64, f64, &Station)> =
+        FROZEN.iter().map(|&(x, cf, re_theta)| (x, cf, re_theta, stations.iter().find(|s| (s.x - x).abs() < 1e-9).unwrap())).collect();
+    for (x, _, _, s) in &found {
+        println!("x {x}: C_f {:e}, Re_θ {:e}", s.cf, s.re_theta);
+    }
+    for (x, cf, re_theta, s) in found {
+        assert!(
+            (s.cf / cf - 1.0).abs() < 1e-9 && (s.re_theta / re_theta - 1.0).abs() < 1e-9,
+            "x {x}: C_f {} (frozen {cf}), Re_θ {} (frozen {re_theta})",
+            s.cf,
+            s.re_theta
+        );
+    }
 }
 
 /// The 2DZP grid and run controls (lengths in units of the reference length).
