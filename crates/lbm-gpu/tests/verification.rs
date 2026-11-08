@@ -958,6 +958,19 @@ fn melting_and_freezing_are_refused_clearly() {
     assert!(e.as_deref().is_some_and(|e| e.contains("freezing") && e.contains("cpu")), "{e:?}");
 }
 
+/// The absorbing layer is CPU only: the GPU backend refuses it by name, before it looks for a
+/// device.
+#[test]
+fn an_absorbing_layer_is_refused_clearly() {
+    let mut d = domain([0.0; 3], [20.0, 2.0, 2.0], 1.0);
+    d.faces.x_min = FaceCondition::Velocity { velocity: [0.02, 0.0, 0.0], profile: fieldcraft_model::Profile::Uniform };
+    d.faces.x_max = FaceCondition::Pressure { pressure: 0.0, outflow: fieldcraft_model::Outflow::Uniform };
+    d.absorbing = Some(fieldcraft_model::AbsorbingLayer { thickness: 4.0, strength: None, filter_time: None });
+    let (_, flow) = prepare(&model(1.0, 0.1, d, step(10.0, 1.0, None)), &[]);
+    let e = GpuFlow::with_options(&flow, Policy::from_env().expect("FIELDCRAFT_GPU names a policy"), Options::default()).err().map(|e| e.to_string());
+    assert!(e.as_deref().is_some_and(|e| e.contains("absorbing") && e.contains("cpu")), "{e:?}");
+}
+
 /// A body force changed while the flow runs (`Backend::set_acceleration`, for a flow held at a
 /// constant flow rate): plane Poiseuille flow driven by a for half its steps and 2a for the rest
 /// on both backends, which agree, as do their mean velocities (`Backend::mean_velocity`).

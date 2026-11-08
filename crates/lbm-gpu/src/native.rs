@@ -797,6 +797,11 @@ impl GpuFlow {
         if flow.free_surface() {
             return Err(Error::Invalid("a free surface is not on the GPU backend yet: solve on the CPU (`backend: \"cpu\"`)".into()));
         }
+        if !flow.absorbing_cells().is_empty() {
+            return Err(Error::Invalid(
+                "not supported yet on the GPU: the absorbing layer (`absorbing`) at the velocity and pressure faces; solve on the CPU (`backend: \"cpu\"`)".into(),
+            ));
+        }
         // The Spalart–Allmaras model's parts not on the device yet (G0 §5), and its faces.
         let sa_faces = match flow.spalart_allmaras() {
             None => None,
