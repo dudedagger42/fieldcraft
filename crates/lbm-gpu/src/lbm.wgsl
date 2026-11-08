@@ -1306,7 +1306,7 @@ fn sa_coefficients(v: f32, nu: f32, omega: f32, d: f32) -> vec3<f32> {
 
 // DDES's shielding f_d = 1 − tanh((8 r_d)³), r_d = (ν + ν_t) / (|∇u| κ² d²) with |∇u| floored at
 // 1e-10 (fieldcraft_lbm::ddes::f_d of r_d): tanh's argument capped at DDES_TANH_CAP, as on the CPU,
-// where it changes nothing, so a driver whose tanh is sinh/cosh never sees cosh overflow (G0 §3.1);
+// where it changes nothing, so a driver whose tanh is sinh/cosh never sees cosh overflow;
 // a wall distance that is not positive or an r_d that is not a number gives 0 (RANS).
 const DDES_TANH_CAP: f32 = 20.0;
 const DDES_FLOOR: f32 = 1e-10;
