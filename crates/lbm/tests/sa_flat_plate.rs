@@ -63,9 +63,18 @@ struct Plate {
     /// When the time-mean C_f of those strips has settled (averaged over two acoustic periods,
     /// [`Plate::acoustic_period`]).
     settling: Settling,
-    /// An absorbing layer at the inlet and the outlet (none in the gated cases).
+    /// An absorbing layer at the inlet and the outlet; it must stay clear of the plate and of the
+    /// gated strips (asserted in [`Plate::run`]).
     absorbing: Option<AbsorbingLayer>,
+    /// The hybrid collision's fixed σ (`None`: its default, or another collision).
+    sigma: Option<f64>,
+    /// A restart file: loaded when it exists, rewritten (atomically) every [`CHECKPOINT_SAMPLES`]
+    /// samples, so an hours-long run survives a crash.
+    checkpoint: Option<std::path::PathBuf>,
 }
+
+/// Samples between two restart files of a run with [`Plate::checkpoint`].
+const CHECKPOINT_SAMPLES: usize = 10;
 
 /// One strip's time-mean reading.
 #[derive(Debug, Clone, Copy)]
@@ -149,7 +158,7 @@ impl Plate {
             time_step: Some(dt),
             frames: 2,
             magic: None,
-            sigma: None,
+            sigma: self.sigma.map(fieldcraft_model::HrrSigma::Value),
             collision: Some(self.collision),
             turbulence: self.turbulence,
             steady: None,
@@ -176,12 +185,34 @@ impl Plate {
         let gated: Vec<usize> =
             (0..strips.len()).filter(|&s| (self.settle.0..=self.settle.1).contains(&(0.5 * (strips[s].0 + strips[s].1)))).collect();
         let window = ((2.0 * self.acoustic_period() / self.sample as f64).round() as usize).max(1);
+        if let Some(layer) = self.absorbing {
+            // The layer pulls its cells toward a filtered copy of their own state: keep it off the
+            // plate's leading edge and the gated strips.
+            let last = gated.iter().map(|&s| strips[s].1).fold(0.0, f64::max);
+            assert!(
+                -self.upstream + layer.thickness <= 1e-12 && self.length - layer.thickness >= last - 1e-12,
+                "the absorbing layer ({} thick) reaches the plate or the gated strips (−{} to {}, gated up to {last})",
+                layer.thickness,
+                self.upstream,
+                self.length
+            );
+        }
         // Each strip's reading per sample interval, and the gated strips' C_f.
         let mut samples: Vec<Vec<Station>> = Vec::new();
         let mut history: Vec<Vec<f64>> = Vec::new();
         let (mut carried, mut requested) = (vec![0.0; strips.len()], vec![0.0; strips.len()]);
         let mut any_requested = false;
         let mut steps = 0;
+        if let Some(path) = self.checkpoint.as_ref().filter(|p| p.exists()) {
+            let file = std::fs::File::open(path).unwrap();
+            use fieldcraft_lbm::backend::Backend;
+            let mut a = Restart { read: Some(std::io::BufReader::new(file)), write: None };
+            flow.checkpoint(&mut a).unwrap();
+            (steps, any_requested) = (a.u64(0), a.u64(0) == 1);
+            history = (0..a.u64(0)).map(|_| (0..a.u64(0)).map(|_| a.f64(0.0)).collect()).collect();
+            samples = (0..a.u64(0)).map(|_| (0..a.u64(0)).map(|_| a.station(None)).collect()).collect();
+            println!("resumed {} at step {steps} ({} samples)", path.display(), samples.len());
+        }
         let flow_through = (self.upstream + self.length) / self.spacing / self.lattice_velocity;
         let clock = std::time::Instant::now();
         let throughput = |steps: u64, flow: &Flow| {
@@ -275,6 +306,9 @@ impl Plate {
             assert!(stations.iter().all(|s| s.cf.is_finite()), "C_f is not finite after {steps} steps: {stations:?}");
             history.push(gated.iter().map(|&s| stations[s].cf).collect());
             samples.push(stations);
+            if let Some(path) = self.checkpoint.as_ref().filter(|_| samples.len().is_multiple_of(CHECKPOINT_SAMPLES)) {
+                save(path, &mut flow, steps, any_requested, &history, &samples);
+            }
             if self.settling.settled(&history, window, steps as f64 / flow_through) {
                 throughput(steps, &flow);
                 return (mean(&samples), true, steps);
@@ -289,6 +323,83 @@ impl Plate {
         }
         (mean(&samples), false, steps)
     }
+}
+
+/// A restart file for [`Plate::run`]: the flow's own state (`Backend::checkpoint`), then the
+/// harness's (the step, the samples and the gated history), little-endian.
+struct Restart {
+    read: Option<std::io::BufReader<std::fs::File>>,
+    write: Option<std::io::BufWriter<std::fs::File>>,
+}
+
+impl fieldcraft_lbm::checkpoint::Archive for Restart {
+    fn loading(&self) -> bool {
+        self.read.is_some()
+    }
+    fn bytes(&mut self, value: &mut [u8]) -> fieldcraft_lbm::Result<()> {
+        use std::io::{Read, Write};
+        let r = match (&mut self.read, &mut self.write) {
+            (Some(r), _) => r.read_exact(value),
+            (_, Some(w)) => w.write_all(value),
+            _ => Ok(()),
+        };
+        r.map_err(|e| fieldcraft_lbm::Error::Invalid(format!("plate restart file: {e}")))
+    }
+}
+
+impl Restart {
+    /// Read `v` back when loading, write it when saving.
+    fn u64(&mut self, mut v: u64) -> u64 {
+        let mut b = v.to_le_bytes();
+        fieldcraft_lbm::checkpoint::Archive::bytes(self, &mut b).unwrap();
+        v = u64::from_le_bytes(b);
+        v
+    }
+    fn f64(&mut self, v: f64) -> f64 {
+        f64::from_bits(self.u64(v.to_bits()))
+    }
+    fn station(&mut self, s: Option<&Station>) -> Station {
+        let d =
+            Station { x: 0.0, cf: 0.0, re_theta: 0.0, re_theta_trapezoid: 0.0, theta: [0.0; 2], delta_star: [0.0; 2], requested: None, edge: 0.0 };
+        let s = s.unwrap_or(&d);
+        let mut v = [s.x, s.cf, s.re_theta, s.re_theta_trapezoid, s.theta[0], s.theta[1], s.delta_star[0], s.delta_star[1], s.edge];
+        for x in &mut v {
+            *x = self.f64(*x);
+        }
+        let has = self.u64(u64::from(s.requested.is_some())) == 1;
+        let requested = self.f64(s.requested.unwrap_or(0.0));
+        let [x, cf, re_theta, re_theta_trapezoid, t0, t1, d0, d1, edge] = v;
+        Station { x, cf, re_theta, re_theta_trapezoid, theta: [t0, t1], delta_star: [d0, d1], requested: has.then_some(requested), edge }
+    }
+}
+
+/// Write the restart file: to `path` with `.tmp` added, then renamed over `path`.
+fn save(path: &std::path::Path, flow: &mut Flow, steps: u64, any_requested: bool, history: &[Vec<f64>], samples: &[Vec<Station>]) {
+    use fieldcraft_lbm::backend::Backend;
+    let tmp = path.with_extension("tmp");
+    {
+        let mut a = Restart { read: None, write: Some(std::io::BufWriter::new(std::fs::File::create(&tmp).unwrap())) };
+        flow.checkpoint(&mut a).unwrap();
+        a.u64(steps);
+        a.u64(u64::from(any_requested));
+        a.u64(history.len() as u64);
+        for row in history {
+            a.u64(row.len() as u64);
+            for &v in row {
+                a.f64(v);
+            }
+        }
+        a.u64(samples.len() as u64);
+        for row in samples {
+            a.u64(row.len() as u64);
+            for s in row {
+                a.station(Some(s));
+            }
+        }
+        std::io::Write::flush(a.write.as_mut().unwrap()).unwrap();
+    }
+    std::fs::rename(&tmp, path).unwrap();
+    println!("saved {} at step {steps}", path.display());
 }
 
 /// The momentum and displacement thickness of a profile `u` sampled one cell apart up to its edge
@@ -375,6 +486,8 @@ fn laminar_plate(max_steps: u64) -> Plate {
         settle: (0.3, 0.9),
         settling: LAMINAR_PIPELINE,
         absorbing: None,
+        sigma: None,
+        checkpoint: None,
     }
 }
 
@@ -486,14 +599,22 @@ struct PlateGrid {
     strip: f64,
     pressure_top: bool,
     collision: Collision,
+    /// The hybrid collision's fixed σ.
+    sigma: Option<f64>,
+    /// The absorbing layer at the inlet and the outlet.
+    absorbing: Option<AbsorbingLayer>,
     max_steps: u64,
     sample: u64,
 }
 
 impl PlateGrid {
     /// The wall-function grid: Δ = 1/2000, so the first cell centre lies at y⁺ ≈ 40–55 over the
-    /// gated range (Re_θ 4000–13000), with U = 0.1 in lattice units.
-    #[allow(dead_code)]
+    /// gated range (Re_θ 4000–13000), with U = 0.1 in lattice units. The hybrid collision at fixed
+    /// σ 0.99: on MRT the velocity inlet runs away at τ − ½ = 1.2 × 10⁻⁴ (step 1366), on the hybrid
+    /// collision at σ 0.99 and 0.95 it holds. An absorbing layer 0.05 thick (100 cells) at the inlet
+    /// and the outlet drains the quarter-wave mode the two faces trap (about 33 000 steps long here,
+    /// barely damped otherwise); 0.05 is as far as the outlet's layer can reach without touching the
+    /// last gated strip (x ≤ 1.95).
     fn wall_function() -> PlateGrid {
         PlateGrid {
             cells_per_unit: 2000.0,
@@ -502,7 +623,9 @@ impl PlateGrid {
             upstream: 0.33,
             strip: 0.05,
             pressure_top: false,
-            collision: Collision::Mrt,
+            collision: Collision::Hrr,
+            sigma: Some(0.99),
+            absorbing: Some(AbsorbingLayer { thickness: 0.05, strength: None, filter_time: None }),
             max_steps: 400_000,
             sample: 2000,
         }
@@ -534,7 +657,7 @@ struct PlateResult {
 /// }
 /// ```
 #[allow(dead_code)]
-fn tmr_2dzp(turbulence: Turbulence, grid: PlateGrid) -> PlateResult {
+fn tmr_2dzp(turbulence: Turbulence, grid: PlateGrid, checkpoint: Option<std::path::PathBuf>) -> PlateResult {
     let plate = Plate {
         re: 5e6,
         length: 2.0,
@@ -550,7 +673,9 @@ fn tmr_2dzp(turbulence: Turbulence, grid: PlateGrid) -> PlateResult {
         sample: grid.sample,
         settle: (0.1, 1.95),
         settling: GATED,
-        absorbing: None,
+        absorbing: grid.absorbing,
+        sigma: grid.sigma,
+        checkpoint,
     };
     println!("2DZP: {plate:?}");
     let (stations, settled, steps) = plate.run();
@@ -580,7 +705,7 @@ fn sizing_the_wall_function_plate() {
         lattice_velocity: grid.lattice_velocity,
         strip: grid.strip,
         pressure_top: grid.pressure_top,
-        collision: grid.collision,
+        collision: Collision::Mrt,
         turbulence: Some(Turbulence::Smagorinsky {
             constant: 0.1,
             prandtl: 0.9,
@@ -592,6 +717,8 @@ fn sizing_the_wall_function_plate() {
         settle: (0.1, 1.95),
         settling: GATED,
         absorbing: None,
+        sigma: None,
+        checkpoint: None,
     };
     let (stations, _, steps) = plate.run();
     assert_eq!(steps, 200);
@@ -603,7 +730,20 @@ fn sizing_the_wall_function_plate() {
 /// strips report the law's request. A check of the reading, not of the flow (under a second).
 #[test]
 fn a_plate_on_han_s_wall_reads_its_thicknesses_from_the_wall_law() {
-    let plate = Plate {
+    let (stations, _, steps) = small_han_plate().run();
+    assert_eq!(steps, 300);
+    print_stations(&stations, karman_schoenherr);
+    for s in stations.iter().filter(|s| (0.1..=0.45).contains(&s.x)) {
+        let finite = [s.cf, s.re_theta, s.re_theta_trapezoid].iter().chain(&s.theta).chain(&s.delta_star).all(|v| v.is_finite());
+        assert!(finite && s.theta[0] > 0.0 && s.delta_star[0] > 0.0, "{s:?}");
+        assert!(s.theta[0] != s.theta[1] && s.delta_star[0] != s.delta_star[1], "the law's first interval differs from the trapezoid's: {s:?}");
+        assert!(s.requested.is_some_and(|r| r > 0.0 && r.is_finite()), "Han's nodes report the law's request: {s:?}");
+    }
+}
+
+/// A small SA plate on Han's on-node wall (Re 10⁵ per unit length, Δ = 1/100, MRT), 300 steps.
+fn small_han_plate() -> Plate {
+    Plate {
         re: 1e5,
         length: 0.5,
         upstream: 0.1,
@@ -624,14 +764,83 @@ fn a_plate_on_han_s_wall_reads_its_thicknesses_from_the_wall_law() {
         settle: (0.1, 0.45),
         settling: GATED,
         absorbing: None,
-    };
-    let (stations, _, steps) = plate.run();
-    assert_eq!(steps, 300);
-    print_stations(&stations, karman_schoenherr);
-    for s in stations.iter().filter(|s| (0.1..=0.45).contains(&s.x)) {
-        let finite = [s.cf, s.re_theta, s.re_theta_trapezoid].iter().chain(&s.theta).chain(&s.delta_star).all(|v| v.is_finite());
-        assert!(finite && s.theta[0] > 0.0 && s.delta_star[0] > 0.0, "{s:?}");
-        assert!(s.theta[0] != s.theta[1] && s.delta_star[0] != s.delta_star[1], "the law's first interval differs from the trapezoid's: {s:?}");
-        assert!(s.requested.is_some_and(|r| r > 0.0 && r.is_finite()), "Han's nodes report the law's request: {s:?}");
+        sigma: None,
+        checkpoint: None,
     }
+}
+
+/// Board task C4, slice 15a's gate: NASA TMR 2DZP with Spalart–Allmaras on Han's on-node wall, on
+/// the wall-function grid ([`PlateGrid::wall_function`]: the hybrid collision at σ 0.99, an
+/// absorbing layer at the inlet and the outlet), against Kármán–Schoenherr within 5 % at Re_θ
+/// 4000–13000, settled under [`GATED`]. Hours long, so it runs only when asked:
+/// `FIELDCRAFT_PLATE_STUDY=1 cargo test --release -p fieldcraft-lbm --test sa_flat_plate -- --ignored --nocapture han_s_wall_meets`.
+/// `FIELDCRAFT_PLATE_FILTER=quarter` sets the layer's filter time to a quarter of the acoustic
+/// period instead of its default half; `FIELDCRAFT_PLATE_CHECKPOINT=<file>` keeps a restart file
+/// there, and a run started with it resumes from it.
+#[test]
+#[ignore = "hours: set FIELDCRAFT_PLATE_STUDY=1 (docs/verification.md, \"Long studies\")"]
+fn study_spalart_allmaras_on_han_s_wall_meets_karman_schoenherr() {
+    if std::env::var_os(STUDY).is_none_or(|v| v != "1") {
+        println!("the 2DZP study runs only with {STUDY}=1 (hours long): skipped");
+        return;
+    }
+    let mut grid = PlateGrid::wall_function();
+    if std::env::var("FIELDCRAFT_PLATE_FILTER").is_ok_and(|v| v == "quarter") {
+        // A quarter of the quarter wave's period, in model time (one step is U_lat Δ / U, U = 1).
+        let dx = 1.0 / grid.cells_per_unit;
+        let cells = ((grid.upstream + 2.0) / dx).round();
+        let period = 4.0 * cells * 3f64.sqrt() / (1.0 - 3.0 * grid.lattice_velocity * grid.lattice_velocity);
+        grid.absorbing = grid.absorbing.map(|a| AbsorbingLayer { filter_time: Some(0.25 * period * grid.lattice_velocity * dx), ..a });
+    }
+    println!("2DZP study: absorbing layer {:?}", grid.absorbing);
+    let sa =
+        Turbulence::SpalartAllmaras { prandtl: 0.9, wall_model: Some(fieldcraft_model::WallModel::SpaldingBounce), inflow_ratio: 3.0, ddes: None };
+    let checkpoint = std::env::var_os("FIELDCRAFT_PLATE_CHECKPOINT").map(std::path::PathBuf::from);
+    let r = tmr_2dzp(sa, grid, checkpoint);
+    assert!(r.settled, "not settled in {} steps", r.steps);
+    assert!(r.score.passes());
+}
+
+/// A run with a restart file resumes bit for bit: a small laminar plate (Re 200, Δ = 1/40, an
+/// absorbing layer, so its filter state is in the file too), and a small SA plate on Han's wall on
+/// the hybrid collision at σ 0.99 with a layer (the 2DZP configuration), each run 400 steps straight
+/// through, and run 200 steps, stopped, then resumed to 400 from its file, give the same stations.
+#[test]
+fn a_plate_run_resumes_from_its_restart_file_bit_for_bit() {
+    let dir = std::env::temp_dir().join(format!("fieldcraft-plate-restart-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("plate.restart");
+    let _ = std::fs::remove_file(&path);
+    let laminar = Plate {
+        re: 200.0,
+        spacing: 1.0 / 40.0,
+        sample: 20,
+        absorbing: Some(AbsorbingLayer { thickness: 0.1, strength: None, filter_time: None }),
+        ..laminar_plate(0)
+    };
+    // The 2DZP configuration in small: SA on Han's wall, the hybrid collision at σ 0.99, a layer.
+    let han = Plate {
+        collision: Collision::Hrr,
+        sigma: Some(0.99),
+        sample: 20,
+        absorbing: Some(AbsorbingLayer { thickness: 0.05, strength: None, filter_time: None }),
+        ..small_han_plate()
+    };
+    for base in [laminar, han] {
+        let _ = std::fs::remove_file(&path);
+        let plate = |max_steps: u64, checkpoint: Option<std::path::PathBuf>| Plate { max_steps, checkpoint, ..base.clone() };
+        let (straight, _, _) = plate(400, None).run();
+        let (_, _, first) = plate(200, Some(path.clone())).run();
+        assert_eq!(first, 200);
+        assert!(path.exists(), "a restart file at step 200");
+        let (resumed, _, steps) = plate(400, Some(path.clone())).run();
+        assert_eq!(steps, 400);
+        let bits = |s: &[Station]| {
+            s.iter()
+                .map(|s| [s.cf, s.re_theta, s.theta[0], s.delta_star[0], s.edge, s.requested.unwrap_or(0.0)].map(f64::to_bits))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(bits(&resumed), bits(&straight), "{:?}", base.collision);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }
