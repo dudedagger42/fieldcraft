@@ -74,6 +74,35 @@ written for h. The temperature lattice is stored as deviations from w_q T₀, wi
 temperature. Each group's force is read back as the sum of the deviations' exchange plus its
 weights' share, which the host adds.
 
+The regularised and hybrid collisions rebuild every population from δρ, j and the
+non-equilibrium flux. In f32 that rebuild kept mass and momentum only to its rounding, and beside
+walls in a nearly steady flow the rounding had the same sign every step: the mean momentum drifted
+about 4 × 10⁻⁸ of itself per step from the CPU's. So the rebuilt populations are projected back
+onto the collision's exact budget (mass unchanged, momentum plus the force), with the defects
+summed as per-direction differences.
+
+### Relaxation times near ½
+
+As τ⁺ → ½ (high Reynolds numbers on a given grid, RANS and LES), f32 limits how closely the GPU
+follows the CPU, and the limit depends on the collision. Measured against the CPU in a channel
+with walls and a body force, laminar and with the Spalart–Allmaras model (the larger of the two:
+the velocity difference over the largest velocity after 2000 steps, on an RTX 4070 Laptop;
+`the_sa_channel_follows_the_cpu`):
+
+| τ⁺ − ½ | `trt` (Λ 3/16) | `mrt` | `hrr`, σ 0.99 |
+|---|---|---|---|
+| 5.7 × 10⁻³ | 6 × 10⁻⁶ | 5 × 10⁻⁷ | 1.5 × 10⁻⁶ |
+| 1.9 × 10⁻³ | 5 × 10⁻⁵ | 3 × 10⁻⁶ | – |
+| 6.4 × 10⁻⁴ | 2 × 10⁻⁴ | 2 × 10⁻⁶ | – |
+| 1.15 × 10⁻⁴ | 1.5 × 10⁻³ | 3 × 10⁻⁶ | 1.5 × 10⁻⁶ |
+
+- **Below τ⁺ − ½ ≈ 10⁻³, use `mrt` or `hrr` on the GPU.** Both stay within 10⁻⁵ of the CPU's
+  velocity down to τ⁺ − ½ = 1.15 × 10⁻⁴, and over 20 000 steps there.
+- **`trt`'s GPU parity holds for τ⁺ − ½ ≳ 2 × 10⁻³ at its default Λ = 3/16.** Its antisymmetric
+  relaxation time is τ⁻ = ½ + Λ/(τ⁺ − ½), so near ½ those modes are hardly damped and their f32
+  rounding builds up. A smaller τ⁻ would damp them, but Λ also sets where the halfway wall sits,
+  so it is not changed for precision. Run `trt` at such τ on the CPU.
+
 ### Streaming layouts
 
 The momentum populations stream in one of two layouts (`fieldcraft_lbm_gpu::Options::streaming`):
