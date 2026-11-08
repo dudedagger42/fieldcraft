@@ -1739,6 +1739,11 @@ impl Flow {
         self.sa.as_ref().map(|s| s.distance.as_slice())
     }
 
+    /// With DDES, its constant C_DES (none without DDES).
+    pub fn ddes_constant(&self) -> Option<f64> {
+        self.sa.as_ref().and_then(|s| s.ddes.as_ref()).map(|d| d.c_des)
+    }
+
     /// With DDES, each cell's length d̃ of the last step (lattice units; 0 outside the fluid).
     pub fn ddes_length(&self) -> Option<&[f64]> {
         self.sa.as_ref().and_then(|s| s.ddes.as_ref()).map(|d| d.length.as_slice())

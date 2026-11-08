@@ -41,6 +41,8 @@
 // needs the cell's ν_t too: the momentum collision leaves it in `moments`' w (the density there
 // is only read after `cell_moments` has rewritten it), so it costs no memory and no binding.
 // The last step's largest ν_t goes to stats[3] (cleared by clear_eddy).
+// With DDES, the last step's LES cells (f_d > ½) go to stats[6] and its largest f_d to stats[7]
+// (also cleared by clear_eddy).
 //
 // The wall model (fieldcraft_lbm::wall, Malaspinas & Sagaut 2014): before the collision
 // `wall_sample` reads each wall cell's second cell (one link further along the wall's normal),
@@ -82,7 +84,8 @@
 // Johnson & Spalart's negative form, 2012): ν̃ in `nu_tilde`, transported as SaField::advance
 // does on the cells' own six faces. After `gradient_velocity`, `sa_prepare` writes each fluid
 // cell's vorticity |curl u| from `fd_gradient` beside its wall distance (`sa_cell`, the distance
-// computed once on the host); then each of the chunk's N equal sub-steps (dt = 1/N in
+// computed once on the host) and its destruction length: the distance, or with DDES
+// (fieldcraft_lbm::ddes; Spalart et al. 2006) d̃ from the same gradient; then each of the chunk's N equal sub-steps (dt = 1/N in
 // `params.sa.z`, N from the host's reduction of the previous chunk) is `sa_rate` (each cell's
 // explicit transport rate and coefficient sum from the old ν̃, into `sa_rate`, and the largest
 // coefficient into stats[4]) and `sa_update` (ν̃ += dt rate in place, then the model's sources
@@ -174,14 +177,15 @@ struct Params {
     // damping: its wall cells (z) and 1 / A⁺ (w, as f32 bits).
     wall: vec4<u32>,
     // The hybrid collision's fixed σ (x), Vreman's c = 2.5 C_s² (y) and dynamic σ's cap on the
-    // von Kármán length, the box's shortest extent in cells (z).
+    // von Kármán length, the box's shortest extent in cells (z); DDES's C_DES Δ (w, Δ one cell).
     les: vec4<f32>,
     // Whether each axis is periodic (xyz: 1 or 0), for the finite-difference gradient's
     // neighbours.
     periodic: vec4<u32>,
     // The Spalart–Allmaras model: each box face's kind for ν̃ (x, 2 bits per face −x, +x, −y, +y,
     // −z, +z: 1 wall, 2 inflow, 3 open), the inflow ν̃ (y) and the sub-step dt = 1/N (z), as f32
-    // bits, and whether the model's sources act (w: 1, or 0 for the transport alone).
+    // bits, and flags (w): bit 0 whether the model's sources act (or the transport alone), bit 1
+    // DDES (with C_DES Δ in `les.w`).
     sa: vec4<u32>,
 };
 
@@ -258,11 +262,12 @@ struct Params {
 // The flags buffer (`fluid`), writable, for `fan_update` alone.
 @group(0) @binding(26) var<storage, read_write> zones_rw: array<u32>;
 // The Spalart–Allmaras model: ν̃ per cell (0 outside the fluid); each cell's transport rate and
-// coefficient sum of the current sub-step (`sa_rate`); each cell's vorticity (x, `sa_prepare`)
-// and wall distance (y, from the host).
+// coefficient sum of the current sub-step (`sa_rate`); each cell's vorticity (x, `sa_prepare`),
+// wall distance (y, from the host), destruction length (z: d, or DDES's d̃, `sa_prepare`) and
+// DDES's shielding f_d (w, 0 without DDES).
 @group(0) @binding(27) var<storage, read_write> nu_tilde: array<f32>;
 @group(0) @binding(28) var<storage, read_write> sa_rates: array<vec2<f32>>;
-@group(0) @binding(29) var<storage, read_write> sa_cell: array<vec2<f32>>;
+@group(0) @binding(29) var<storage, read_write> sa_cell: array<vec4<f32>>;
 
 var<workgroup> red: array<vec4<f32>, 256>;
 // The largest squared speed of a workgroup's cells (collide): one atomic per workgroup, not
@@ -1198,22 +1203,76 @@ fn sa_coefficients(v: f32, nu: f32, omega: f32, d: f32) -> vec3<f32> {
     return vec3<f32>(0.0);
 }
 
-// Each fluid cell's vorticity |curl u| (sa::vorticity) from the finite-difference gradient, beside
-// its wall distance; 0 outside the fluid.
+// DDES's shielding f_d = 1 − tanh((8 r_d)³), r_d = (ν + ν_t) / (|∇u| κ² d²) with |∇u| floored at
+// 1e-10 (fieldcraft_lbm::ddes::f_d of r_d): tanh's argument capped at DDES_TANH_CAP, as on the CPU,
+// where it changes nothing, so a driver whose tanh is sinh/cosh never sees cosh overflow (G0 §3.1);
+// a wall distance that is not positive or an r_d that is not a number gives 0 (RANS).
+const DDES_TANH_CAP: f32 = 20.0;
+const DDES_FLOOR: f32 = 1e-10;
+
+fn ddes_f_d(nu_total: f32, grad2: f32, d: f32) -> f32 {
+    var norm = sqrt(grad2);
+    if !(norm < 1e30) { norm = DDES_FLOOR; }
+    norm = max(norm, DDES_FLOOR);
+    if !(d > 0.0 && d < 1e30) { return 0.0; }
+    let r = nu_total / (norm * SA_KAPPA * SA_KAPPA * d * d);
+    if r != r { return 0.0; }
+    if r <= 0.0 { return 1.0; }
+    let x = 8.0 * r;
+    return clamp(1.0 - tanh(min(x * x * x, DDES_TANH_CAP)), 0.0, 1.0);
+}
+
+// d̃ = d − f_d max(0, d − C_DES Δ), held in [C_DES Δ, d] (fieldcraft_lbm::ddes::length).
+fn ddes_length(d: f32, les: f32, f: f32) -> f32 {
+    if !(d < 1e30) || d <= les { return d; }
+    return clamp(d - f * (d - les), les, d);
+}
+
+// Each fluid cell's vorticity |curl u| (sa::vorticity) from the finite-difference gradient, and its
+// destruction length: the wall distance, or with DDES d̃ from the same gradient and ν_t of ν̃ before
+// this step (as the CPU's step); 0 outside the fluid. With DDES the step's LES cells and largest
+// f_d to stats[6] and stats[7] (one atomic each per workgroup).
 @compute @workgroup_size(256)
 fn sa_prepare(@builtin(local_invocation_index) lid: u32, @builtin(workgroup_id) wg: vec3<u32>) {
     let cell = cell_of(lid, wg);
-    if !SA || cell >= params.n { return; }
-    var w = 0.0;
-    if is_fluid(cell) {
-        let g = fd_gradient(cell);
-        let wx = g.y.z - g.z.y;
-        let wy = g.z.x - g.x.z;
-        let wz = g.x.y - g.y.x;
-        w = sqrt(wx * wx + wy * wy + wz * wz);
-        if !(w < 1e30) { w = 0.0; }
+    let ddes = (params.sa.w & 2u) != 0u;
+    speed[lid] = 0.0;
+    eddy[lid] = 0.0;
+    if SA && cell < params.n {
+        let c = sa_cell[cell];
+        var w = 0.0;
+        var length = 0.0;
+        var f = 0.0;
+        if is_fluid(cell) {
+            length = c.y;
+            let g = fd_gradient(cell);
+            let wx = g.y.z - g.z.y;
+            let wy = g.z.x - g.x.z;
+            let wz = g.x.y - g.y.x;
+            w = sqrt(wx * wx + wy * wy + wz * wz);
+            if !(w < 1e30) { w = 0.0; }
+            if ddes {
+                let nu = params.smag.w;
+                f = ddes_f_d(nu + sa_nu_t(nu_tilde[cell], nu), gradient_norm2(g), c.y);
+                length = ddes_length(c.y, params.les.w, f);
+                speed[lid] = f;
+                eddy[lid] = select(0.0, 1.0, f > 0.5);
+            }
+        }
+        sa_cell[cell] = vec4<f32>(w, c.y, length, f);
     }
-    sa_cell[cell] = vec2<f32>(w, sa_cell[cell].y);
+    workgroupBarrier();
+    for (var k = 128u; k > 0u; k = k >> 1u) {
+        if lid < k {
+            speed[lid] = max(speed[lid], speed[lid + k]);
+            eddy[lid] = eddy[lid] + eddy[lid + k];
+        }
+        workgroupBarrier();
+    }
+    if lid == 0u && SA && ddes {
+        atomicAdd(&stats[6], u32(eddy[0]));
+        atomicMax(&stats[7], bitcast<u32>(speed[0]));
+    }
 }
 
 // What lies across the face of the cell at `p` one step `d` along an axis (`face` its index,
@@ -1326,8 +1385,8 @@ fn sa_update(@builtin(local_invocation_index) lid: u32, @builtin(workgroup_id) w
     let dt = bitcast<f32>(params.sa.z);
     var v = nu_tilde[cell] + dt * sa_rates[cell].x;
     let c = sa_cell[cell];
-    let s = sa_coefficients(v, params.smag.w, c.x, c.y);
-    if params.sa.w != 0u && s.z > 0.0 {
+    let s = sa_coefficients(v, params.smag.w, c.x, c.z);
+    if (params.sa.w & 1u) != 0u && s.z > 0.0 {
         if v > 0.0 {
             v = (v + dt * v * (s.x + max(-s.y, 0.0))) / (1.0 + dt * max(s.y, 0.0));
         } else if v < 0.0 {
@@ -2211,11 +2270,13 @@ fn open_thermal(@builtin(local_invocation_index) lid: u32, @builtin(workgroup_id
     }
 }
 
-// Clears the largest eddy viscosity before a chunk's last step, so stats[3] holds that step's
-// alone, as the CPU reports it.
+// Clears the largest eddy viscosity and DDES's statistics before a chunk's last step, so
+// stats[3], stats[6] and stats[7] hold that step's alone, as the CPU reports them.
 @compute @workgroup_size(1)
 fn clear_eddy() {
     atomicStore(&stats[3], 0u);
+    atomicStore(&stats[6], 0u);
+    atomicStore(&stats[7], 0u);
 }
 
 // Flags a temperature that stopped being a number.

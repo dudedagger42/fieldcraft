@@ -4,6 +4,8 @@
 //! coupled RANS channel within 5e-5 for ν̃, 1e-4 / 1e-5 for velocity / density (the LES bounds),
 //! 1e-3 for the largest ν_t/ν and the wall shear, SA-neg's smallest ν̃ within 1e-5 of ν; the wall
 //! distance on the device is the CPU's rounded to f32, bit for bit; two runs agree bit for bit.
+//! DDES (G2): one step from the same fields gives d̃ within 1e-6 of the largest wall distance,
+//! f_d within 1e-5 and the LES fraction within 1e-3.
 //! Both run the same fixed sub-step count (`Flow::set_sa_substeps`, `GpuFlow::fix_sa_substeps`),
 //! so the sub-step splitting is not part of the difference. Each test prints what it measured.
 
@@ -13,6 +15,11 @@ use fieldcraft_model::{FaceCondition, WallModel};
 /// The model with inflow ν̃/ν `ratio` and wall model `wall_model`.
 fn sa(ratio: f64, wall_model: Option<WallModel>) -> Turbulence {
     Turbulence::SpalartAllmaras { prandtl: 0.9, wall_model, inflow_ratio: ratio, ddes: None }
+}
+
+/// The model with DDES (C_DES 0.65) and inflow ν̃/ν 3.
+fn ddes() -> Turbulence {
+    Turbulence::SpalartAllmaras { prandtl: 0.9, wall_model: None, inflow_ratio: 3.0, ddes: Some(fieldcraft_model::Ddes { c_des: 0.65 }) }
 }
 
 /// `p` with turbulence model `t`.
@@ -239,8 +246,8 @@ fn the_sub_step_count_is_planned_or_refused() {
     assert!(e.contains("more than 64 sub-steps"), "{e}");
 }
 
-/// What G1 does not run on the device yet is refused before a device is opened, naming the model
-/// and the CPU: a wall model (its wall function), DDES and heat.
+/// What the device does not run with the model yet is refused before a device is opened, naming
+/// the model and the CPU: a wall model (its wall function) and heat.
 #[test]
 fn what_the_gpu_does_not_run_with_spalart_allmaras_is_refused_clearly() {
     let refused = |flow: &Flow| {
@@ -256,20 +263,6 @@ fn what_the_gpu_does_not_run_with_spalart_allmaras_is_refused_clearly() {
     let e = refused(&flow);
     println!("Musker's wall function: {e:?}");
     assert!(e.as_deref().is_some_and(|e| e.contains("Spalart–Allmaras") && e.contains("wall model") && e.contains("cpu")), "{e:?}");
-    let mut step = channel.step("Run").cloned().unwrap();
-    if let Procedure::Fluid { turbulence, .. } = &mut step.procedure {
-        *turbulence = Some(Turbulence::SpalartAllmaras {
-            prandtl: 0.9,
-            wall_model: None,
-            inflow_ratio: 3.0,
-            ddes: Some(fieldcraft_model::Ddes { c_des: 0.65 }),
-        });
-    }
-    channel.replace_step(step).unwrap();
-    let (_, flow) = prepare(&channel, &[]);
-    let e = refused(&flow);
-    println!("DDES: {e:?}");
-    assert!(e.as_deref().is_some_and(|e| e.contains("Spalart–Allmaras") && e.contains("DDES") && e.contains("cpu")), "{e:?}");
     let mut d = domain([0.0; 3], [4.0, 2.0, 2.0], 1.0);
     d.thermal = Some(FluidThermal::default());
     d.faces.y_max = FaceCondition::MovingWall { velocity: [0.01, 0.0, 0.0] };
@@ -278,4 +271,70 @@ fn what_the_gpu_does_not_run_with_spalart_allmaras_is_refused_clearly() {
     let e = refused(&flow);
     println!("heat: {e:?}");
     assert!(e.as_deref().is_some_and(|e| e.contains("Spalart–Allmaras") && e.contains("heat") && e.contains("cpu")), "{e:?}");
+}
+
+/// DDES's shielding from the same fields: the CPU runs a forced channel at Re_τ 180 from rest
+/// until its walls' shear has grown into the flow (cells in LES mode beside the walls, shielded
+/// ones in the core, where the velocity gradient is floored and r_d is about 1e7, the cell where a
+/// tanh of an uncapped argument overflows to NaN), the device takes that state, and both take one
+/// step. d̃ within 1e-6 of the largest wall distance, f_d within 1e-5 (the CPU's f_d recovered
+/// from its d̃ where d − C_DES Δ ≥ 0.5, which multiplies its rounding by at most 1.2, with cells
+/// between full shielding and none among them), the LES fraction within 1e-3
+/// (no cell of the channel's 192 may flip) and the largest f_d within 1e-5; both layouts, the two-relaxation-time
+/// and multiple-relaxation-time collisions, and the hybrid collision in place. Then the device
+/// runs on for 200 steps with DDES in the step and ν̃ stays within the RANS row's 5e-5.
+#[test]
+fn ddes_shielding_follows_the_cpu() {
+    let cases = [Collision::Trt, Collision::Mrt]
+        .into_iter()
+        .flat_map(|c| [Streaming::InPlace, Streaming::TwoBuffers].map(move |s| (c, s)))
+        .chain([(Collision::Hrr, Streaming::InPlace)]);
+    let mut failed = Vec::new();
+    for (collision, streaming) in cases {
+        let mut m = forced_channel(collision, 400.0, 180.0);
+        let mut step = m.step("Run").cloned().unwrap();
+        if let Procedure::Fluid { turbulence, .. } = &mut step.procedure {
+            *turbulence = Some(ddes());
+        }
+        m.replace_step(step).unwrap();
+        let (_, mut cpu) = prepare(&m, &[]);
+        cpu.set_sa_substeps(Some(2));
+        cpu.advance(200).unwrap();
+        let Some(mut gpu) = gpu(&cpu, streaming) else { return };
+        gpu.fix_sa_substeps(Some(2)).unwrap();
+        cpu.advance(1).unwrap();
+        gpu.advance(1).unwrap();
+        let d = cpu.sa_wall_distance().unwrap().to_vec();
+        let (lc, lg) = (cpu.ddes_length().unwrap().to_vec(), gpu.ddes_length().unwrap().unwrap());
+        let fg = gpu.ddes_shielding().unwrap().unwrap();
+        let c_des = 0.65;
+        let largest = d.iter().fold(0.0f64, |m, v| m.max(*v));
+        let dl = lc.iter().zip(&lg).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max) / largest;
+        // The CPU's f_d where d̃ shows it well: d − C_DES Δ ≥ 0.5 (d from 1.5 cells).
+        let recovered: Vec<(f64, f64)> =
+            d.iter().zip(&lc).zip(&fg).filter(|((d, _), _)| **d - c_des >= 0.5).map(|((d, l), f)| ((d - l) / (d - c_des), *f)).collect();
+        let df = recovered.iter().map(|(c, g)| (c - g).abs()).fold(0.0, f64::max);
+        let partial = recovered.iter().filter(|(c, _)| *c > 1e-6 && *c < 1.0 - 1e-6).count();
+        let finite = lg.iter().chain(&fg).all(|v| v.is_finite());
+        let (sc, sg) = (Backend::ddes(&cpu).unwrap(), Backend::ddes(&*gpu).unwrap());
+        let dfrac = (sc.les_fraction - sg.les_fraction).abs();
+        let dmax = (sc.max_f_d - sg.max_f_d).abs();
+        let shielded = fg.iter().zip(&d).filter(|(f, d)| **d > 0.0 && **f == 0.0).count();
+        cpu.advance(200).unwrap();
+        gpu.advance(200).unwrap();
+        let (dv, scale) = nu_tilde_difference(&mut cpu, &mut gpu);
+        println!(
+            "DDES ({collision:?}, {streaming:?}), Re_τ 180, one step: d̃ {dl:.2e} of {largest:.2}, f_d {df:.2e} over {} cells ({partial} with 0 < f_d < 1); LES fraction {:.4} vs {:.4}, largest f_d {:.6} vs {:.6}; {shielded} cells fully shielded; 200 steps on: ν̃ {dv:.2e} of {scale:.3e}",
+            recovered.len(),
+            sc.les_fraction,
+            sg.les_fraction,
+            sc.max_f_d,
+            sg.max_f_d
+        );
+        let mixed = sc.les_fraction > 0.0 && sc.les_fraction < 1.0 && shielded > 0;
+        if !(finite && mixed && partial > 0 && dl < 1e-6 && df < 1e-5 && dfrac <= 1e-3 && dmax < 1e-5 && dv < 5e-5) {
+            failed.push(format!("{collision:?} {streaming:?}"));
+        }
+    }
+    assert!(failed.is_empty(), "{failed:?}");
 }
