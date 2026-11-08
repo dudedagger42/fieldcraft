@@ -269,6 +269,15 @@ struct SaDevice {
     substeps: Option<u32>,
     /// Whether the count is fixed ([`GpuFlow::fix_sa_substeps`]) rather than planned per chunk.
     fixed: bool,
+    /// Whether the destruction length is DDES's d̃ (`sa_prepare`).
+    ddes: bool,
+    /// With DDES, the last chunk's last step's LES fraction and largest f_d (none before a step).
+    ddes_stats: Option<fieldcraft_lbm::ddes::DdesStats>,
+}
+
+/// `params.sa.w`: bit 0 whether the model's sources act, bit 1 DDES.
+fn sa_flags(model: bool, ddes: bool) -> u32 {
+    u32::from(model) | u32::from(ddes) << 1
 }
 
 /// The Spalart–Allmaras sub-steps per lattice step, at most (`fieldcraft_lbm::sa::MAX_SUBSTEPS`).
@@ -800,10 +809,6 @@ impl GpuFlow {
                 if flow.wall_model() || flow.wall_bounce() || flow.wall_nodes().is_some() {
                     return refuse("a wall model (its wall function)");
                 }
-                // DDES's length d̃ on the device is G2.
-                if flow.ddes_length().is_some() {
-                    return refuse("DDES");
-                }
                 if flow.walls().is_some_and(|w| w.damped()) {
                     return refuse("Van Driest's damping");
                 }
@@ -1194,7 +1199,9 @@ impl GpuFlow {
         };
         // Dynamic σ's cap on the von Kármán length: the box's shortest extent in cells.
         let l_max = flow.grid().cells.iter().copied().min().unwrap_or(1) as f32;
-        let les = [fixed_sigma as f32, flow.vreman() as f32, l_max, 0.0];
+        // DDES's C_DES Δ, Δ one cell (the CPU's filter width in lattice units), in `les.w`.
+        let c_des = flow.ddes_constant().filter(|_| sa_faces.is_some());
+        let les = [fixed_sigma as f32, flow.vreman() as f32, l_max, c_des.unwrap_or(0.0) as f32];
         let periodic = flow.periodic().map(u32::from);
         let sa_inflow = flow.spalart_allmaras().map_or(0.0, |f| f.inflow());
         let params = [0u32, 1].map(|phase| {
@@ -1206,7 +1213,12 @@ impl GpuFlow {
             bytes.extend_from_slice(&bytes_f32(&les));
             bytes.extend_from_slice(&bytes_u32(&[periodic[0], periodic[1], periodic[2], 0]));
             // `sa` (SA_PARAMS): the face kinds, the inflow ν̃ and the sub-step dt (set per chunk).
-            bytes.extend_from_slice(&bytes_u32(&[sa_faces.unwrap_or(0), (sa_inflow as f32).to_bits(), 1.0f32.to_bits(), 1]));
+            bytes.extend_from_slice(&bytes_u32(&[
+                sa_faces.unwrap_or(0),
+                (sa_inflow as f32).to_bits(),
+                1.0f32.to_bits(),
+                sa_flags(true, c_des.is_some()),
+            ]));
             device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("lbm params"),
                 contents: &bytes,
@@ -1254,7 +1266,8 @@ impl GpuFlow {
         let velocity = empty("lbm gradient velocities", if gradients { 12 * n as u64 } else { 16 });
         let stats = storage("lbm stats", &bytes_u32(&[0; 8]));
         // The Spalart–Allmaras model: ν̃ (from the host's initial field), the sub-step rates, and
-        // each cell's vorticity beside its wall distance, both as f32.
+        // each cell's vorticity, wall distance, destruction length (the distance until the first
+        // `sa_prepare`) and DDES's f_d, all as f32.
         let (nu_tilde, sa_rates, sa_cell) = match (flow.spalart_allmaras(), flow.sa_wall_distance()) {
             (Some(field), Some(distance)) if sa_faces.is_some() => {
                 let mut v = filled(n, 0.0f32, "Spalart–Allmaras ν̃")?;
@@ -1263,9 +1276,10 @@ impl GpuFlow {
                 }
                 let nu_tilde = storage("lbm sa nu_tilde", &bytes_f32(&v));
                 drop(v);
-                let mut cell = filled(2 * n, 0.0f32, "Spalart–Allmaras wall distances")?;
-                for (out, d) in cell.as_chunks_mut::<2>().0.iter_mut().zip(distance) {
+                let mut cell = filled(4 * n, 0.0f32, "Spalart–Allmaras wall distances")?;
+                for (out, d) in cell.as_chunks_mut::<4>().0.iter_mut().zip(distance) {
                     out[1] = *d as f32;
+                    out[2] = *d as f32;
                 }
                 let sa_cell = storage("lbm sa cells", &bytes_f32(&cell));
                 (nu_tilde, empty("lbm sa rates", 8 * n as u64), sa_cell)
@@ -1428,7 +1442,7 @@ impl GpuFlow {
                 }),
                 None => None,
             },
-            sa: sa_faces.map(|_| SaDevice { nu_tilde, substeps: None, fixed: false }),
+            sa: sa_faces.map(|_| SaDevice { nu_tilde, substeps: None, fixed: false, ddes: c_des.is_some(), ddes_stats: None }),
             sa_cells: sa_faces.map(|_| sa_cell),
         })
     }
@@ -1450,11 +1464,9 @@ impl GpuFlow {
     /// With the Spalart–Allmaras model: whether its sources act (on by default); off, ν̃ is only
     /// transported, as the CPU's [`Flow::set_sa_model`].
     pub fn set_sa_model(&mut self, on: bool) -> Result<()> {
-        if self.sa.is_none() {
-            return Err(Error::Invalid("the flow has no Spalart–Allmaras model".into()));
-        }
+        let Some(sa) = &self.sa else { return Err(Error::Invalid("the flow has no Spalart–Allmaras model".into())) };
         for p in &self.params {
-            self.queue.write_buffer(p, SA_PARAMS + 12, &u32::from(on).to_le_bytes());
+            self.queue.write_buffer(p, SA_PARAMS + 12, &sa_flags(on, sa.ddes).to_le_bytes());
         }
         Ok(())
     }
@@ -1465,9 +1477,31 @@ impl GpuFlow {
         if self.sa.is_none() {
             return Ok(None);
         }
+        self.sa_cell(1)
+    }
+
+    /// With DDES, each cell's length d̃ of the last step (lattice units, 0 outside the fluid), as
+    /// the CPU's [`Flow::ddes_length`].
+    pub fn ddes_length(&self) -> Result<Option<Vec<f64>>> {
+        if !self.sa.as_ref().is_some_and(|s| s.ddes) {
+            return Ok(None);
+        }
+        self.sa_cell(2)
+    }
+
+    /// With DDES, each cell's shielding f_d of the last step (0 outside the fluid).
+    pub fn ddes_shielding(&self) -> Result<Option<Vec<f64>>> {
+        if !self.sa.as_ref().is_some_and(|s| s.ddes) {
+            return Ok(None);
+        }
+        self.sa_cell(3)
+    }
+
+    /// Component `k` of every cell's `sa_cell` (vorticity, wall distance, length, f_d).
+    fn sa_cell(&self, k: usize) -> Result<Option<Vec<f64>>> {
         let Some(cells) = self.sa_cells.as_ref() else { return Ok(None) };
-        let v = self.read_f32(cells, 2 * self.n)?;
-        Ok(Some(v.as_chunks::<2>().0.iter().map(|c| f64::from(c[1])).collect()))
+        let v = self.read_f32(cells, 4 * self.n)?;
+        Ok(Some(v.as_chunks::<4>().0.iter().map(|c| f64::from(c.get(k).copied().unwrap_or(0.0))).collect()))
     }
 
     /// With the Spalart–Allmaras model, the sub-steps per lattice step the next chunk takes (none
@@ -1837,6 +1871,14 @@ impl GpuFlow {
             if word(5) != 0 {
                 return Err(Error::Unstable(format!("Spalart–Allmaras: ν̃ stopped being a finite number by time step {}", self.steps_done)));
             }
+            // With DDES: the last step's LES cells and largest f_d, as the CPU's statistics.
+            if sa.ddes {
+                let cells = self.fluid_cells as f64;
+                sa.ddes_stats = Some(fieldcraft_lbm::ddes::DdesStats {
+                    les_fraction: if cells > 0.0 { f64::from(word(6)) / cells } else { 0.0 },
+                    max_f_d: f64::from(f32::from_bits(word(7))),
+                });
+            }
             let most = f64::from(f32::from_bits(word(4)));
             let worst = most / f64::from(sa_substeps.max(1));
             if sa.fixed {
@@ -1864,6 +1906,10 @@ impl GpuFlow {
 impl Backend for GpuFlow {
     fn eddy_viscosity_ratio(&self) -> f64 {
         self.eddy_ratio
+    }
+
+    fn ddes(&self) -> Option<fieldcraft_lbm::ddes::DdesStats> {
+        self.sa.as_ref().and_then(|s| s.ddes_stats)
     }
 
     fn nu_tilde(&mut self) -> Result<Option<Vec<f64>>> {
