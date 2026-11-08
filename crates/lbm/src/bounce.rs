@@ -51,17 +51,18 @@
 //! area `Δx²`), to round-off, whatever the normal flow; along the normal it is the bounce-back's
 //! `2 Σ f_q` of the populations arriving from the fluid (their pressure and normal momentum flux).
 //!
-//! **Obstacles, edges and corners** (FieldCraft's extension, not the paper's). A fluid cell next to a wall along one of the six axes (a solid cell,
-//! or outside the box through a wall face) is a boundary node, the wall through its centre: at a
-//! box face the outermost layer, as above; at an obstacle, the fluid layer next to it. Eq. 14
-//! is applied link pair by link pair ([`roles`], [`on_links`]): along the normal, and on each
-//! tangential pair `n ± e_b` whose two cells and the normal neighbour are fluid, it is eq. 14
-//! (a pair carries `τ_{w,b}` exactly and keeps mass, as on a plane wall); every other link to the
-//! fluid (an edge, a corner, the sides of a plate's leading edge, a pair cut by a corner) is
-//! halfway bounce-back, its momentum exchange counted as the node's edge impulse; a node at a
-//! concave corner (two wall directions) has no normal and only bounces. A stress a node can't
-//! carry is set to zero and the law's full request kept beside it ([`WallNode::wanted`]), so
-//! the wall takes exactly the stress it applies. A plane node runs [`on_node`] unchanged.
+//! **Obstacles, edges and corners** (FieldCraft's extension, not the paper's). A fluid cell next to
+//! a wall along one of the six axes (a solid cell, or outside the box through a wall face) is a
+//! boundary node, the wall through its centre: at a box face the outermost layer, as above; at an
+//! obstacle, the fluid layer next to it. Eq. 14 is applied link pair by link pair ([`roles`],
+//! [`on_links`]): along the normal, and on each tangential pair `n ± e_b` whose two cells and the
+//! normal neighbour are fluid, it is eq. 14 (a pair carries `τ_{w,b}` exactly and keeps mass, as on
+//! a plane wall); every other link to the fluid (an edge, a corner, the sides of a plate's leading
+//! edge, a pair cut by a corner) is halfway bounce-back, its momentum exchange counted as the
+//! node's edge impulse; a node at a concave corner (two wall directions) has no normal and only
+//! bounces. A stress a node can't carry is set to zero and the law's full request kept beside it
+//! ([`WallNode::wanted`]), so the wall takes exactly the stress it applies. A plane node runs
+//! [`on_node`] unchanged.
 //!
 //! **Junctions.** Where a wall meets an inlet, outlet or slip face, the cell in that face's layer
 //! keeps the face's rule and is no node (one rule per cell, as at the edge of two open faces): its
@@ -259,9 +260,10 @@ pub fn carries(roles: &[Role; Q], axis: usize, inward: i32, b: usize) -> bool {
     C.iter().position(|c| *c == v).is_some_and(|q| roles.get(q) == Some(&Role::Han))
 }
 
-/// Eq. 14 by link pairs on one boundary node of any shape: its streamed populations `fq` become its post-collision populations, by `roles`. The wall's
-/// normal is along `axis`; `stress` is the wall stress as in [`on_node`], and its
-/// component along a tangential axis must be zero unless the roles carry it ([`carries`]).
+/// Eq. 14 by link pairs on one boundary node of any shape: its streamed populations `fq` become its
+/// post-collision populations, by `roles`. The wall's normal is along `axis`; `stress` is the wall
+/// stress as in [`on_node`], and its component along a tangential axis must be zero unless the
+/// roles carry it ([`carries`]).
 ///
 /// Each role is a pair of links whose populations to the fluid sum to those from it, so the
 /// fluid's mass is kept to round-off whatever the node's shape; a Han pair along `b` carries
