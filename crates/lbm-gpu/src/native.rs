@@ -843,7 +843,7 @@ impl GpuFlow {
                 "not supported yet on the GPU: the absorbing layer (`absorbing`) at the velocity and pressure faces; solve on the CPU (`backend: \"cpu\"`)".into(),
             ));
         }
-        // The Spalart–Allmaras model's parts not on the device yet (G0 §5), and its faces.
+        // The Spalart–Allmaras model's parts not on the device yet, and its faces.
         let sa_faces = match flow.spalart_allmaras() {
             None => None,
             Some(field) => {
