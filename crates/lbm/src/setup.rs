@@ -1052,7 +1052,9 @@ impl Setup {
             ));
         }
         let velocity_face = fieldcraft_model::BoxFace::ALL.iter().any(|&f| matches!(domain.faces.get(f), FaceCondition::Velocity { .. }));
-        if domain.absorbing.is_none() && velocity_face && tau_plus - 0.5 < SMALL_ABSORBING_TAU {
+        // Silent where a layer would be refused anyway: heat in the fluid or a free surface.
+        let layer_allowed = domain.thermal.is_none() && domain.free_surface.is_none();
+        if domain.absorbing.is_none() && layer_allowed && velocity_face && tau_plus - 0.5 < SMALL_ABSORBING_TAU {
             warnings.push(format!(
                 "a velocity face without an absorbing layer at τ − ½ = {:.1e}: the inlet's first columns can run away at this τ (measured on a free stream, the hybrid collision ran away up to τ − ½ = 3 × 10⁻³ and TRT up to 10⁻²); add `\"absorbing\": {{}}` for the default layer of {} cells",
                 tau_plus - 0.5,

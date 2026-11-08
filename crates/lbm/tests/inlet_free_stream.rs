@@ -25,7 +25,7 @@ mod common;
 
 use common::*;
 use fieldcraft_lbm::{Flow, Limits, Setup};
-use fieldcraft_model::{AbsorbingLayer, Collision, FaceCondition, HrrSigma, Model, Outflow, Procedure, Profile, Turbulence};
+use fieldcraft_model::{AbsorbingLayer, Collision, FaceCondition, FluidThermal, HrrSigma, Model, Outflow, Procedure, Profile, Turbulence};
 
 const U_LAT: f64 = 0.1;
 const TAU_MINUS_HALF: f64 = 1.2e-4;
@@ -33,8 +33,17 @@ const TAU_MINUS_HALF: f64 = 1.2e-4;
 /// The default layer: no thickness, so 10 cells.
 const DEFAULT_LAYER: AbsorbingLayer = AbsorbingLayer { thickness: None, strength: None, filter_time: None };
 
-/// The free stream's model, `length` × `height` at `cells_per_unit` and τ − ½ = `tau_minus_half`.
-fn stream_model(cells_per_unit: f64, length: f64, height: f64, tau_minus_half: f64, absorbing: Option<AbsorbingLayer>, steps: u64) -> Model {
+/// The free stream's model, `length` × `height` at `cells_per_unit` and τ − ½ = `tau_minus_half`,
+/// with heat in the fluid when `heat` (at a diffusivity of 100 ν, which the thermal lattice resolves).
+fn stream_model(
+    cells_per_unit: f64,
+    length: f64,
+    height: f64,
+    tau_minus_half: f64,
+    absorbing: Option<AbsorbingLayer>,
+    steps: u64,
+    heat: bool,
+) -> Model {
     let dx = 1.0 / cells_per_unit;
     let dt = U_LAT * dx;
     let nu = tau_minus_half / 3.0 * dx * dx / dt;
@@ -52,7 +61,12 @@ fn stream_model(cells_per_unit: f64, length: f64, height: f64, tau_minus_half: f
         *sigma = Some(HrrSigma::Value(0.99));
         *turbulence = Some(Turbulence::SpalartAllmaras { prandtl: 0.9, wall_model: None, inflow_ratio: 3.0, ddes: None });
     }
-    model(1.0, nu, d, p)
+    if heat {
+        d.thermal = Some(FluidThermal::default());
+        hot_model(1.0, nu, 100.0 * nu, d, p)
+    } else {
+        model(1.0, nu, d, p)
+    }
 }
 
 /// The free stream, `length` × `height` at `cells_per_unit`, started at the inlet velocity with
@@ -65,7 +79,7 @@ fn free_stream(
     steps: u64,
     density: impl Fn(f64, f64) -> f64,
 ) -> Flow {
-    let (setup, mut flow) = prepare(&stream_model(cells_per_unit, length, height, TAU_MINUS_HALF, absorbing, steps), &[]);
+    let (setup, mut flow) = prepare(&stream_model(cells_per_unit, length, height, TAU_MINUS_HALF, absorbing, steps, false), &[]);
     let grid = *flow.grid();
     let to_lattice = 1.0 / setup.velocity_scale();
     flow.set_equilibrium(|cell| {
@@ -195,14 +209,16 @@ fn the_default_layer_damps_the_inlet_s_grid_scale_mode() {
 }
 
 /// Setup warns about a velocity inlet with no layer at small τ − ½, where the runs above depart,
-/// and is silent with the default layer or at τ − ½ = 0.1.
+/// and is silent with the default layer, at τ − ½ = 0.1, and with heat in the fluid (where a layer
+/// is refused, so the warning's advice could not be taken).
 #[test]
 fn a_velocity_inlet_without_a_layer_at_small_viscosity_is_warned_about() {
-    let warned = |tau_minus_half: f64, absorbing: Option<AbsorbingLayer>| {
-        let setup = Setup::new(&stream_model(200.0, 0.5, 0.1, tau_minus_half, absorbing, 10), None, &[], &Limits::default()).unwrap();
+    let warned = |tau_minus_half: f64, absorbing: Option<AbsorbingLayer>, heat: bool| {
+        let setup = Setup::new(&stream_model(200.0, 0.5, 0.1, tau_minus_half, absorbing, 10, heat), None, &[], &Limits::default()).unwrap();
         setup.warnings.iter().any(|w| w.contains("without an absorbing layer"))
     };
-    assert!(warned(TAU_MINUS_HALF, None), "no warning for a bare inlet at τ − ½ = {TAU_MINUS_HALF}");
-    assert!(!warned(TAU_MINUS_HALF, Some(DEFAULT_LAYER)), "a warning with the default layer");
-    assert!(!warned(0.1, None), "a warning at τ − ½ = 0.1");
+    assert!(warned(TAU_MINUS_HALF, None, false), "no warning for a bare inlet at τ − ½ = {TAU_MINUS_HALF}");
+    assert!(!warned(TAU_MINUS_HALF, Some(DEFAULT_LAYER), false), "a warning with the default layer");
+    assert!(!warned(0.1, None, false), "a warning at τ − ½ = 0.1");
+    assert!(!warned(TAU_MINUS_HALF, None, true), "a warning with heat in the fluid, where setup refuses a layer");
 }

@@ -76,7 +76,8 @@ was 100 cells on a fine grid let it run away. A run that gives a thickness over 
 The layer is never added unasked, since it changes the flow next to the faces. A velocity face
 with no layer at τ − ½ below 10⁻² gets a warning instead: without one, measured on a free stream,
 the inlet ran away on the hybrid collision up to τ − ½ = 3 × 10⁻³ and on TRT up to 10⁻².
-`"absorbing": {}` adds the default layer.
+`"absorbing": {}` adds the default layer. With heat in the fluid or a free surface, where a layer
+is refused, there is no warning.
 
 ## Theory
 
