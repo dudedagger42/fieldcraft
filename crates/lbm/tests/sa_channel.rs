@@ -309,3 +309,81 @@ fn the_sa_wall_function_s_request_is_read() {
         assert!(on_node || r.budget_ok, "{wall:?}");
     }
 }
+
+/// One run of the C7 pair at Re_τ 1000: SA on MRT under `wall`, `cells` per δ.
+fn c7(wall: WallModel, on_node: bool, cells: usize, max_steps: u64) -> ChannelResult {
+    Channel {
+        re_tau: 1000.0,
+        cells,
+        bulk_guess: LEE_MOSER_1000_BULK,
+        lattice_bulk: 0.1,
+        collision: Collision::Mrt,
+        turbulence: Some(sa(wall)),
+        on_node,
+        max_steps,
+        sample: 100,
+        settling: GATED,
+    }
+    .run()
+}
+
+/// Board task C7: the Spalart–Allmaras RANS channel at Re_τ 1000 on MRT, on Han, Ooka &
+/// Kikumoto's on-node wall (Spalding's law, primary) and on Musker's halfway wall (control), each on
+/// two grids with the first fluid node at y⁺ ≈ 50 and 31. Gates, on the primary: carried C_f within
+/// 5 % of Lee & Moser's 5.005 × 10⁻³, the wall function's request within 1 % of the carried stress.
+/// Every run: settled under [`GATED`] with the drag balancing the body force, ν̃ ≥ 0 (so ν_t ≥ 0).
+///
+/// Measured when written (MRT, 4 threads, 35 s for all four):
+///
+/// | wall | cells per δ (y⁺₁) | steps | U_b⁺ | C_f carried | requested / carried |
+/// |---|---|---|---|---|---|
+/// | Han on-node | 20 (50) | 93 700 | 19.79 (−1.0 %) | 5.104e-3 (+2.0 %) | 1.00001 |
+/// | Han on-node | 32 (31) | 218 900 | 19.78 (−1.0 %) | 5.110e-3 (+2.1 %) | 1.00000 |
+/// | Musker halfway | 10 (50) | 137 700 | 22.57 (+12.9 %) | 3.927e-3 (−21.5 %) | 1.383 |
+/// | Musker halfway | 16 (31) | 239 300 | 23.83 (+19.2 %) | 3.521e-3 (−29.6 %) | 1.541 |
+///
+/// The control fails both gates, as Musker's halfway wall does under LES (docs/verification.md,
+/// "Requested, applied and carried wall stress"): the stress it requests (Musker's u_τ, 8 % above
+/// Lee & Moser here) is not what its reconstruction carries, and the gap grows as the grid is
+/// refined. Its budget closes every step, so the gap is in the wall, not the measure. It is
+/// recorded here, not gated, until the wall layer's own task takes it up. On Han's on-node wall the
+/// carried stress is the request to 10⁻⁵ once settled; its per-step #829 budget is not exact
+/// during the start-up (its control volume leaves out the boundary nodes), so it is not asserted.
+#[test]
+#[ignore = "heavy: cargo xtask test --heavy (CI heavy job)"]
+fn sa_rans_channel_at_re_tau_1000_meets_lee_and_moser() {
+    let runs = [
+        (WallModel::SpaldingBounce, true, 20),
+        (WallModel::SpaldingBounce, true, 32),
+        (WallModel::Musker, false, 10),
+        (WallModel::Musker, false, 16),
+    ];
+    let mut score = Score::default();
+    let mut failures = Vec::new();
+    for (wall, on_node, cells) in runs {
+        let r = c7(wall, on_node, cells, 2_000_000);
+        let y_plus = if on_node { 1000.0 / cells as f64 } else { 500.0 / cells as f64 };
+        let name = format!("SA {wall:?}, {cells} cells per δ (first node y⁺ {y_plus:.0})");
+        report(&name, &r, LEE_MOSER_1000_BULK, LEE_MOSER_1000_CF);
+        let ratio = r.requested.unwrap_or(f64::NAN) / r.carried;
+        if on_node {
+            score.push(Gate::new("C7 channel", &format!("{name}: C_f carried"), r.carried, LEE_MOSER_1000_CF, 0.05));
+            score.push(Gate::new("C7 channel", &format!("{name}: requested / carried"), ratio, 1.0, 0.01));
+        } else {
+            println!(
+                "control, not gated: C_f carried {:+.1} % against Lee & Moser, requested / carried {ratio:.3}",
+                100.0 * (r.carried / LEE_MOSER_1000_CF - 1.0)
+            );
+            assert!(r.budget_ok, "{name}: the halfway wall's budget closes every step");
+        }
+        if !r.settled {
+            failures.push(format!("{name}: not settled in {} steps", r.steps));
+        }
+        if !r.min_nu_tilde.is_some_and(|v| v >= 0.0) {
+            failures.push(format!("{name}: ν̃ below 0 ({:?})", r.min_nu_tilde));
+        }
+    }
+    println!("{}", score.table());
+    assert!(failures.is_empty(), "{failures:?}");
+    assert!(score.passes());
+}
