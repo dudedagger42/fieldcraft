@@ -1982,10 +1982,10 @@ pub(crate) mod tests {
         assert_eq!(s.model, before);
     }
 
-    /// The Spalart–Allmaras model: hostile parameters refused with a message naming them, the GPU
-    /// "not supported yet"; never a panic, the model unchanged, nothing solved. An unknown field is
-    /// refused by the command. A valid model solves on the CPU, with and without DDES, reporting
-    /// its largest ν_t/ν and, with DDES, its LES fraction and largest f_d.
+    /// The Spalart–Allmaras model: hostile parameters refused with a message naming them, DDES on
+    /// the GPU "not supported yet"; never a panic, the model unchanged, nothing solved. An unknown
+    /// field is refused by the command. A valid model solves on the CPU, with and without DDES,
+    /// reporting its largest ν_t/ν and, with DDES, its LES fraction and largest f_d.
     #[test]
     fn spalart_allmaras_solves_on_the_cpu_and_hostile_parameters_are_named() {
         use fieldcraft_model::{Ddes, Procedure, Turbulence};
@@ -1997,8 +1997,8 @@ pub(crate) mod tests {
             inflow_ratio,
             ddes: c_des.map(|c_des| Ddes { c_des }),
         };
-        let mut cases = vec![(sa(0.9, 3.0, None), "not supported yet"), (sa(0.9, 3.0, Some(0.65)), "not supported yet")];
-        let gpu_only = [format!("{:?}", cases[0].0), format!("{:?}", cases[1].0)];
+        let mut cases = vec![(sa(0.9, 3.0, Some(0.65)), "not supported yet")];
+        let gpu_only = [format!("{:?}", cases[0].0)];
         for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0, 0.0, 1e300] {
             cases.push((sa(bad, 3.0, None), "turbulent Prandtl number"));
             if bad != 0.0 {
