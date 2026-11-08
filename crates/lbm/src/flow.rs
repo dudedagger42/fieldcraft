@@ -614,6 +614,10 @@ struct SaState {
     wall: Vec<(usize, f64, f64)>,
     /// With DDES: each cell's length d̃, which the destruction term reads instead of the distance.
     ddes: Option<DdesState>,
+    /// A fixed sub-step count ([`Flow::set_sa_substeps`]); none: as many as the bound needs.
+    substeps: Option<u32>,
+    /// Whether the model's sources act ([`Flow::set_sa_model`]; off: ν̃'s transport alone).
+    model: bool,
 }
 
 /// DDES on the Spalart–Allmaras model ([`crate::ddes`]): its C_DES, each cell's length d̃ of the
@@ -1214,7 +1218,7 @@ impl Flow {
                     Some(c_des) => Some(DdesState { c_des, length: filled(n, 0.0, "DDES lengths")?, stats: crate::ddes::DdesStats::default() }),
                     None => None,
                 };
-                Some(SaState { field, distance, vorticity: filled(n, 0.0, "vorticities")?, law, wall: Vec::new(), ddes })
+                Some(SaState { field, distance, vorticity: filled(n, 0.0, "vorticities")?, law, wall: Vec::new(), ddes, substeps: None, model: true })
             }
         };
         open.shrink_to_fit();
@@ -1617,6 +1621,32 @@ impl Flow {
     /// so that ν_t is the law's at y⁺ = y u_τ/ν ([`crate::sa::WallLaw`]).
     pub fn sa_wall_function(&self) -> (Option<crate::sa::WallLaw>, &[(usize, f64, f64)]) {
         self.sa.as_ref().map_or((None, &[][..]), |s| (s.law, &s.wall[..]))
+    }
+
+    /// With the Spalart–Allmaras model: take exactly `n` equal sub-steps of ν̃ per lattice step
+    /// ([`SaInput::substeps`]), the reference a device backend with a fixed count is checked
+    /// against; `None` (the default) takes as many as the monotone bound needs.
+    pub fn set_sa_substeps(&mut self, n: Option<u32>) {
+        if let Some(sa) = &mut self.sa {
+            sa.substeps = n;
+        }
+    }
+
+    /// With the Spalart–Allmaras model: whether its production and destruction act (on by
+    /// default); off, ν̃ is only transported, for verification ([`SaInput::model`]).
+    pub fn set_sa_model(&mut self, on: bool) {
+        if let Some(sa) = &mut self.sa {
+            sa.model = on;
+        }
+    }
+
+    /// With the Spalart–Allmaras model: set ν̃ in every cell (lattice units; one finite value per
+    /// cell, 0 kept outside the fluid), for verification and restarts from another field.
+    pub fn set_sa_nu_tilde(&mut self, values: &[f64]) -> Result<()> {
+        match &mut self.sa {
+            Some(sa) => sa.field.set_nu_tilde(values),
+            None => Err(Error::Invalid("the flow has no Spalart–Allmaras model".into())),
+        }
     }
 
     /// With the Spalart–Allmaras model, each cell's wall distance it reads (lattice units).
@@ -2265,7 +2295,7 @@ impl Flow {
             d.stats = stats;
         }
         let length = sa.ddes.as_ref().map_or(sa.distance.as_slice(), |d| d.length.as_slice());
-        let input = SaInput { u, vorticity: &sa.vorticity, length, nu, model: true, source: None, substeps: None };
+        let input = SaInput { u, vorticity: &sa.vorticity, length, nu, model: sa.model, source: None, substeps: sa.substeps };
         sa.field.advance(&input).map_err(|e| match e {
             Error::Unstable(m) => Error::Unstable(format!("{m} (at time step {})", steps + 1)),
             other => other,
@@ -3253,6 +3283,10 @@ impl crate::backend::Backend for Flow {
     }
     fn eddy_viscosity_ratio(&self) -> f64 {
         Flow::eddy_viscosity_ratio(self)
+    }
+
+    fn nu_tilde(&mut self) -> Result<Option<Vec<f64>>> {
+        Ok(self.spalart_allmaras().map(|f| f.nu_tilde().to_vec()))
     }
 
     fn wall_y_plus(&self) -> Option<f64> {
