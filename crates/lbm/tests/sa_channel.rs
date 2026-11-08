@@ -14,7 +14,9 @@
 //!   function's u_τ at each first fluid node (`Flow::sa_wall_function`, Spalding's law on Han's
 //!   on-node bounce, Musker's under the Musker wall); with a subgrid model under Musker's wall,
 //!   Musker's request through `wall_balance::musker_request`;
-//! - U_b, the bulk velocity, and C_f = τ_w / (½ ρ U_b²) from the carried stress.
+//! - U_b, the bulk velocity, and C_f = τ_w / (½ ρ U_b²) from the carried stress. On on-node walls
+//!   the interval between each wall and its first fluid node is integrated from the wall law
+//!   (common::cases::WallInterval, board WL3 P1), with the trapezoid from u = 0 reported beside it.
 //!
 //! Settling ([`GATED`], common::cases): a flow-through is 2πδ/U_b, the length of the usual channel
 //! box at the bulk speed. Two checks must both hold on means over the averaging window:
@@ -73,10 +75,15 @@ struct Channel {
 /// A channel run's time means over its last averaging window.
 #[derive(Debug, Clone)]
 struct ChannelResult {
-    /// U_b / u_τ, with u_τ from the carried stress.
+    /// U_b / u_τ, with u_τ from the carried stress. On on-node walls the interval between each
+    /// wall and its first node is integrated from the wall law (common::cases::WallInterval,
+    /// board WL3 P1); `bulk_trapezoid` is the same with the trapezoid from u = 0 at the wall.
     bulk: f64,
-    /// C_f from the carried, applied and requested wall stress, on the measured U_b.
+    bulk_trapezoid: f64,
+    /// C_f from the carried, applied and requested wall stress, on the measured U_b (the law's);
+    /// `carried_trapezoid` the carried C_f on the trapezoid's U_b.
     carried: f64,
+    carried_trapezoid: f64,
     applied: f64,
     requested: Option<f64>,
     /// The applied wall drag over the body force (1 when fully developed).
@@ -146,8 +153,9 @@ impl Channel {
         let musker = matches!(self.turbulence, Some(Turbulence::Smagorinsky { wall_model: Some(WallModel::Musker), .. }))
             || matches!(self.turbulence, Some(Turbulence::SpalartAllmaras { wall_model: Some(WallModel::Musker), .. }));
         // The bulk velocity: the mean over the rows between the walls (the on-node walls' rows,
-        // on the walls themselves, at half weight).
-        let bulk = |flow: &Flow| {
+        // on the walls themselves, at half weight), `[with the wall intervals from the wall law,
+        // with the trapezoid]`: the two differ on on-node walls only (WL3 P1).
+        let bulk = |flow: &Flow| -> [f64; 2] {
             let row = |j: usize| {
                 (0..grid.cells[0] * grid.cells[2])
                     .map(|k| flow.moments(grid.index([k % grid.cells[0], j + first, k / grid.cells[0]])).map_or(0.0, |(_, u)| u[0]))
@@ -155,7 +163,14 @@ impl Channel {
                     / (grid.cells[0] * grid.cells[2]) as f64
             };
             let sum: f64 = (0..rows).map(|j| if self.on_node && (j == 0 || j + 1 == rows) { 0.5 * row(j) } else { row(j) }).sum();
-            sum / if self.on_node { (rows - 1) as f64 } else { rows as f64 }
+            let height = if self.on_node { (rows - 1) as f64 } else { rows as f64 };
+            // Each wall's interval, one cell (lattice units) from its node to its first fluid node.
+            let law: f64 = if self.on_node {
+                [row(1), row(rows - 2)].iter().filter_map(|&u1| WallInterval::new(u1, 1.0, nu)).map(|w| w.law[0] - w.trapezoid[0]).sum()
+            } else {
+                0.0
+            };
+            [(sum + law) / height, sum / height]
         };
         let acoustic = 2.0 * rows as f64 * 3f64.sqrt();
         let bulk_lattice = self.lattice_bulk;
@@ -163,14 +178,15 @@ impl Channel {
         let window = ((flow_through.max(2.0 * acoustic) / self.sample as f64).round() as usize).max(1);
         let min_steps = (self.settling.min_flow_throughs * flow_through).ceil() as u64;
         let mut blocks = Blocks::new(window, min_steps / self.sample).unwrap();
-        // Per sample interval: [carried, applied, requested, body, U_b] summed, then averaged.
-        let mut history: Vec<[f64; 5]> = Vec::new();
-        let mut sums = [0.0; 5];
+        // Per sample interval: [carried, applied, requested, body, U_b (law), U_b (trapezoid)]
+        // summed, then averaged.
+        let mut history: Vec<[f64; 6]> = Vec::new();
+        let mut sums = [0.0; 6];
         let mut any_requested = false;
         let mut budget_ok = true;
         let mut p = wall_balance::population_momentum(&flow);
         let mut steps = 0;
-        let mean = |rows: &[[f64; 5]]| -> [f64; 5] { [0, 1, 2, 3, 4].map(|c| rows.iter().map(|r| r[c]).sum::<f64>() / rows.len().max(1) as f64) };
+        let mean = |rows: &[[f64; 6]]| -> [f64; 6] { [0, 1, 2, 3, 4, 5].map(|c| rows.iter().map(|r| r[c]).sum::<f64>() / rows.len().max(1) as f64) };
         let cf = |stress: f64, ub: f64, rho: f64| 2.0 * stress / (rho * ub * ub);
         let rho = flow.mass() / (0..grid.len()).filter(|&c| flow.is_fluid(c)).count() as f64;
         let mut settled = false;
@@ -201,15 +217,16 @@ impl Channel {
                 wall_balance::closed_step(p, next, a.map(|a| a * m), wall, requested.map(|r| r / area), area, m, 1e-12, f64::EPSILON).unwrap();
             budget_ok &= report.budget_ok;
             p = next;
-            for (s, v) in sums.iter_mut().zip([report.carried[0], report.applied[0], requested[0] / area, a[0] * m, 0.0]) {
+            for (s, v) in sums.iter_mut().zip([report.carried[0], report.applied[0], requested[0] / area, a[0] * m, 0.0, 0.0]) {
                 *s += v;
             }
             if steps % self.sample != 0 {
                 continue;
             }
             let n = self.sample as f64;
-            let row = [sums[0] / n, sums[1] / n, sums[2] / n, sums[3] / n, bulk(&flow)];
-            sums = [0.0; 5];
+            let [law, trapezoid] = bulk(&flow);
+            let row = [sums[0] / n, sums[1] / n, sums[2] / n, sums[3] / n, law, trapezoid];
+            sums = [0.0; 6];
             assert!(row.iter().all(|v| v.is_finite()), "the channel is not finite after {steps} steps: {row:?}");
             // Past MAX_BLOCKS the stream refuses more samples; the statistics keep what they hold.
             blocks.push(cf(row[0], row[4], rho)).ok();
@@ -226,7 +243,9 @@ impl Channel {
         let u_tau = (last[0] / rho).sqrt();
         ChannelResult {
             bulk: last[4] / u_tau,
+            bulk_trapezoid: last[5] / u_tau,
             carried: cf(last[0], last[4], rho),
+            carried_trapezoid: cf(last[0], last[5], rho),
             applied: cf(last[1], last[4], rho),
             requested: any_requested.then(|| cf(last[2], last[4], rho)),
             balance: last[1] * area / last[3],
@@ -244,13 +263,16 @@ impl Channel {
 fn report(name: &str, r: &ChannelResult, bulk_reference: f64, cf_reference: f64) {
     let a = r.blocks.acceptance();
     println!(
-        "{name}: {} steps, settled {}; U_b⁺ {:.4} (ref {bulk_reference:.4}, {:+.2} %); C_f carried {:.5e} (ref {cf_reference:.5e}, {:+.2} %), applied {:.5e}, requested {}; drag / body force {:.6}; budget closed {}; min ν̃ {:?}; {} blocks, half-width {:.2e}, accepted {}",
+        "{name}: {} steps, settled {}; U_b⁺ {:.4} (ref {bulk_reference:.4}, {:+.2} %; trapezoid {:.4}, {:+.2} %); C_f carried {:.5e} (ref {cf_reference:.5e}, {:+.2} %; trapezoid {:+.2} %), applied {:.5e}, requested {}; drag / body force {:.6}; budget closed {}; min ν̃ {:?}; {} blocks, half-width {:.2e}, accepted {}",
         r.steps,
         r.settled,
         r.bulk,
         100.0 * (r.bulk / bulk_reference - 1.0),
+        r.bulk_trapezoid,
+        100.0 * (r.bulk_trapezoid / bulk_reference - 1.0),
         r.carried,
         100.0 * (r.carried / cf_reference - 1.0),
+        100.0 * (r.carried_trapezoid / cf_reference - 1.0),
         r.applied,
         r.requested.map_or("—".into(), |c| format!("{c:.5e}")),
         r.balance,
@@ -291,6 +313,52 @@ fn a_laminar_channel_reads_poiseuille_friction() {
     assert!((r.bulk / bulk - 1.0).abs() < 5e-3, "U_b⁺ {}", r.bulk);
     assert!((r.carried / cf - 1.0).abs() < 5e-3, "C_f {}", r.carried);
     assert!((r.applied / r.carried - 1.0).abs() < 1e-3, "applied {} vs carried {}", r.applied, r.carried);
+}
+
+/// The wall interval of an on-node wall (common::cases::WallInterval): its closed forms equal a
+/// fine midpoint quadrature of Spalding's profile (inverted by bisection at each point) to 1e-9
+/// relative over y₁⁺ 1–500. In the viscous sublayer the law is linear, so it equals the trapezoid
+/// there. Unusable inputs give none.
+#[test]
+fn the_wall_interval_integrates_the_law_the_wall_applies() {
+    use fieldcraft_lbm::wall::{BOUNCE_B, BOUNCE_KAPPA};
+    let (k, e) = (BOUNCE_KAPPA, (-BOUNCE_KAPPA * BOUNCE_B).exp());
+    let y_of = |u: f64| u + e * ((k * u).exp() - 1.0 - k * u - (k * u).powi(2) / 2.0 - (k * u).powi(3) / 6.0);
+    let u_of = |y: f64| {
+        let (mut lo, mut hi) = (0.0, y.max(1.0));
+        for _ in 0..200 {
+            let mid = 0.5 * (lo + hi);
+            if y_of(mid) < y { lo = mid } else { hi = mid }
+        }
+        0.5 * (lo + hi)
+    };
+    let nu = 1e-3;
+    for y_plus in [1.0, 5.0, 11.0, 31.0, 50.0, 83.0, 200.0, 500.0] {
+        let u_tau = 0.05;
+        let y1 = y_plus * nu / u_tau;
+        let u1 = u_tau * u_of(y_plus);
+        let w = WallInterval::new(u1, y1, nu).unwrap();
+        assert!((w.u_tau / u_tau - 1.0).abs() < 1e-12, "u_τ {} vs {u_tau}", w.u_tau);
+        let n = 20_000;
+        let h = y_plus / n as f64;
+        let (mut i1, mut i2) = (0.0, 0.0);
+        for j in 0..n {
+            let u = u_of((j as f64 + 0.5) * h);
+            i1 += u * h;
+            i2 += u * u * h;
+        }
+        let want = [nu * i1, nu * u_tau * i2];
+        for c in 0..2 {
+            assert!((w.law[c] / want[c] - 1.0).abs() < 1e-7, "y⁺ {y_plus}: {:?} vs {want:?}", w.law);
+        }
+        println!("y⁺₁ {y_plus}: ∫u dy law / trapezoid {:.5}", w.law[0] / w.trapezoid[0]);
+        if y_plus <= 1.0 {
+            assert!((w.law[0] / w.trapezoid[0] - 1.0).abs() < 1e-3, "the sublayer is linear");
+        }
+    }
+    for (u1, y1, nu) in [(0.0, 1.0, 1e-3), (f64::NAN, 1.0, 1e-3), (1.0, -1.0, 1e-3), (1.0, 1.0, 0.0), (1.0, f64::INFINITY, 1e-3)] {
+        assert!(WallInterval::new(u1, y1, nu).is_none(), "{u1} {y1} {nu}");
+    }
 }
 
 /// The reference numbers are Lee & Moser's header values (u_τ = 0.0500256 at U_b = 1).
@@ -371,6 +439,15 @@ fn c7_on(wall: WallModel, on_node: bool, slabs: bool, cells: usize, max_steps: u
 /// |---|---|---|---|---|---|
 /// | Han on-node | 20 (50) | 93 700 | 19.79 (−1.0 %) | 5.104e-3 (+2.0 %) | 1.00001 |
 /// | Han on-node | 32 (31) | 218 900 | 19.78 (−1.0 %) | 5.110e-3 (+2.1 %) | 1.00000 |
+///
+/// Those Han U_b⁺ took the interval between each on-node wall and its first node as a trapezoid
+/// from u = 0. Since board WL3 P1 the gate integrates it from the wall law
+/// (common::cases::WallInterval) and reports the trapezoid beside it. Rerun (FIELDCRAFT_THREADS=4,
+/// 42 s with the obstacle pair): Han 20 cells per δ U_b⁺ 19.979 (−0.05 %), C_f 5.011e-3 (+0.11 %;
+/// trapezoid +1.99 %); 32 cells per δ U_b⁺ 19.868 (−0.61 %), C_f 5.067e-3 (+1.23 %; trapezoid
+/// +2.09 %); the same settling steps. SA's own error against Lee & Moser is +1.43 % (agent-hub
+/// notes/cfd-wall-accuracy.md): the 20-cell figure is nearer DNS than SA itself because the wall
+/// law's and the first interval's errors still cancel in part.
 /// | Musker halfway | 10 (50) | 137 700 | 22.57 (+12.9 %) | 3.927e-3 (−21.5 %) | 1.383 |
 /// | Musker halfway | 16 (31) | 239 300 | 23.83 (+19.2 %) | 3.521e-3 (−29.6 %) | 1.541 |
 ///

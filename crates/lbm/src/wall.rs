@@ -79,9 +79,10 @@ pub const RESOLVED_WALL_Y_PLUS: f64 = 5.0;
 const KAPPA: f64 = 0.4;
 const B: f64 = 5.5;
 
-/// Han, Ooka and Kikumoto's constants of Spalding's law in their wall-function bounce.
-pub(crate) const BOUNCE_KAPPA: f64 = 0.41;
-pub(crate) const BOUNCE_B: f64 = 5.5;
+/// Han, Ooka and Kikumoto's constants of Spalding's law in their wall-function bounce (public so
+/// that measurements can integrate the law the wall applies without a second copy of them).
+pub const BOUNCE_KAPPA: f64 = 0.41;
+pub const BOUNCE_B: f64 = 5.5;
 
 /// The most times the spreading may lower each cell's distance on average before it is stopped.
 const MAX_UPDATES_PER_CELL: usize = 64;
@@ -647,8 +648,9 @@ pub fn friction_velocity(speed: f64, y: f64, nu: f64) -> f64 {
     spalding_friction(speed, y, nu, KAPPA, B)
 }
 
-/// [`friction_velocity`] with Kármán's constant `kappa` and the intercept `b`.
-pub(crate) fn spalding_friction(speed: f64, y: f64, nu: f64, kappa: f64, b: f64) -> f64 {
+/// [`friction_velocity`] with Kármán's constant `kappa` and the intercept `b` (with
+/// [`BOUNCE_KAPPA`] and [`BOUNCE_B`], the law of Han et al.'s on-node bounce).
+pub fn spalding_friction(speed: f64, y: f64, nu: f64, kappa: f64, b: f64) -> f64 {
     let re = speed * y / nu;
     if !(re.is_finite() && re > 0.0) {
         return 0.0;

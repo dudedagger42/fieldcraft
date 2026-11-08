@@ -32,6 +32,68 @@ pub fn displacement_thickness(u: &[f64], spacing: f64, edge: f64) -> f64 {
     u.iter().map(|&v| 1.0 - v / edge).sum::<f64>() * spacing
 }
 
+/// The unresolved interval between an on-node wall (Han et al.'s `spalding_bounce`, the wall at
+/// the boundary node's centre) and the first fluid node at distance `y1`, whose speed parallel to
+/// the wall is `u1`: its integrals `∫₀^{y1} u dy` and `∫₀^{y1} u² dy`, from the wall law the wall
+/// applies (Spalding's, κ and B of [`fieldcraft_lbm::wall::BOUNCE_KAPPA`] and `BOUNCE_B`), and
+/// from the trapezoid between u = 0 at the wall and u1 (what a sum over the rows with the wall
+/// row at u = 0 gives). Board WL3 P1 (agent-hub notes/cfd-wall-accuracy.md): every reading that
+/// integrates a profile from the wall reports both, and gates on the law's.
+///
+/// Spalding's law gives y⁺(u⁺) explicitly, so the integrals are closed forms by parts:
+/// `∫₀^{y⁺₁} u⁺ dy⁺ = u⁺₁ y⁺₁ − ∫₀^{u⁺₁} y⁺ du⁺` and `∫₀^{y⁺₁} u⁺² dy⁺ = u⁺₁² y⁺₁ − 2 ∫₀^{u⁺₁} u⁺ y⁺ du⁺`;
+/// in physical units `∫ u dy = ν ∫ u⁺ dy⁺` and `∫ u² dy = ν u_τ ∫ u⁺² dy⁺`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WallInterval {
+    /// The friction velocity the law gives at the first node (what the wall applies).
+    pub u_tau: f64,
+    pub y1: f64,
+    /// `[∫ u dy, ∫ u² dy]` from the wall law.
+    pub law: [f64; 2],
+    /// The same from the trapezoid, `[u1 y1 / 2, u1² y1 / 2]`.
+    pub trapezoid: [f64; 2],
+}
+
+impl WallInterval {
+    /// `None` for a speed, distance or viscosity that is not a positive finite number.
+    pub fn new(u1: f64, y1: f64, nu: f64) -> Option<WallInterval> {
+        use fieldcraft_lbm::wall::{BOUNCE_B, BOUNCE_KAPPA, spalding_friction};
+        if !(u1.is_finite() && y1.is_finite() && nu.is_finite() && u1 > 0.0 && y1 > 0.0 && nu > 0.0) {
+            return None;
+        }
+        let u_tau = spalding_friction(u1, y1, nu, BOUNCE_KAPPA, BOUNCE_B);
+        if !(u_tau > 0.0) {
+            return None;
+        }
+        let (k, e) = (BOUNCE_KAPPA, (-BOUNCE_KAPPA * BOUNCE_B).exp());
+        let u = u1 / u_tau;
+        let ku = k * u;
+        let y_plus = u + e * (ku.exp() - 1.0 - ku - ku * ku / 2.0 - ku * ku * ku / 6.0);
+        // ∫₀^u y⁺ du⁺ and ∫₀^u u⁺ y⁺ du⁺.
+        let y1_int = u * u / 2.0 + e * ((ku.exp() - 1.0) / k - u - k * u * u / 2.0 - k * k * u.powi(3) / 6.0 - k.powi(3) * u.powi(4) / 24.0);
+        let y2_int = u.powi(3) / 3.0
+            + e * (ku.exp() * (u / k - 1.0 / (k * k)) + 1.0 / (k * k)
+                - u * u / 2.0
+                - k * u.powi(3) / 3.0
+                - k * k * u.powi(4) / 8.0
+                - k.powi(3) * u.powi(5) / 30.0);
+        let first = u * y_plus - y1_int;
+        let second = u * u * y_plus - 2.0 * y2_int;
+        Some(WallInterval { u_tau, y1, law: [nu * first, nu * u_tau * second], trapezoid: [0.5 * u1 * y1, 0.5 * u1 * u1 * y1] })
+    }
+
+    /// The interval's share of the momentum thickness `∫ (u/U_e)(1 − u/U_e) dy` at edge speed
+    /// `edge`: `[law, trapezoid]`.
+    pub fn momentum_thickness(&self, edge: f64) -> [f64; 2] {
+        [self.law, self.trapezoid].map(|[a, b]| a / edge - b / (edge * edge))
+    }
+
+    /// The interval's share of the displacement thickness `∫ (1 − u/U_e) dy`: `[law, trapezoid]`.
+    pub fn displacement_thickness(&self, edge: f64) -> [f64; 2] {
+        [self.law, self.trapezoid].map(|[a, _]| self.y1 - a / edge)
+    }
+}
+
 /// `y` at `x` by linear interpolation between the samples `(xs, ys)`, `xs` increasing; `None`
 /// outside them.
 pub fn interpolate(xs: &[f64], ys: &[f64], x: f64) -> Option<f64> {
