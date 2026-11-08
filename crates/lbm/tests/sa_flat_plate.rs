@@ -269,6 +269,7 @@ impl Plate {
             if steps % self.sample != 0 {
                 continue;
             }
+            println!("{}", open_faces(&flow, self.lattice_velocity, steps));
             let stations: Vec<Station> = strips
                 .iter()
                 .enumerate()
@@ -323,6 +324,30 @@ impl Plate {
         }
         (mean(&samples), false, steps)
     }
+}
+
+/// The open faces' state at `step`, one line: the largest |ρ − 1| in the inlet's first four columns
+/// (where a grid-scale mode along the face shows first), and the outlet column's mean ρ − 1 and
+/// mean u/U − 1 (the quarter wave's swing, read over a period from the log).
+fn open_faces(flow: &Flow, lattice_velocity: f64, step: u64) -> String {
+    let g = *flow.grid();
+    let [nx, _, nz] = g.cells;
+    let mut inlet: f64 = 0.0;
+    let (mut rho, mut u, mut count) = (0.0, 0.0, 0usize);
+    for k in 0..nz {
+        for i in 0..4.min(nx) {
+            if let Some((r, _)) = flow.moments(g.index([i, 0, k])) {
+                inlet = inlet.max((r - 1.0).abs());
+            }
+        }
+        if let Some((r, v)) = flow.moments(g.index([nx.saturating_sub(1), 0, k])) {
+            rho += r - 1.0;
+            u += v[0] / lattice_velocity - 1.0;
+            count += 1;
+        }
+    }
+    let n = count.max(1) as f64;
+    format!("open faces at {step}: inlet columns 0–3 max |ρ − 1| {inlet:.3e}; outlet mean ρ − 1 {:+.4e}, u/U − 1 {:+.4e}", rho / n, u / n)
 }
 
 /// A restart file for [`Plate::run`]: the flow's own state (`Backend::checkpoint`), then the
@@ -611,10 +636,14 @@ impl PlateGrid {
     /// The wall-function grid: Δ = 1/2000, so the first cell centre lies at y⁺ ≈ 40–55 over the
     /// gated range (Re_θ 4000–13000), with U = 0.1 in lattice units. The hybrid collision at fixed
     /// σ 0.99: on MRT the velocity inlet runs away at τ − ½ = 1.2 × 10⁻⁴ (step 1366), on the hybrid
-    /// collision at σ 0.99 and 0.95 it holds. An absorbing layer 0.05 thick (100 cells) at the inlet
-    /// and the outlet drains the quarter-wave mode the two faces trap (about 33 000 steps long here,
-    /// barely damped otherwise); 0.05 is as far as the outlet's layer can reach without touching the
-    /// last gated strip (x ≤ 1.95).
+    /// collision it holds longer. An absorbing layer 0.05 thick (100 cells) at the inlet and the
+    /// outlet drains the quarter-wave mode the two faces trap (about 33 000 steps long here, barely
+    /// damped otherwise); 0.05 is as far as the outlet's layer can reach without touching the last
+    /// gated strip (x ≤ 1.95). At strength 4, the cap: the layer's profile vanishes at the face and
+    /// its default strength is c_s per thickness in cells, so at 100 cells it damps the column next to
+    /// the inlet by only 7 × 10⁻⁴ per step, and a grid-scale density mode along the inlet's first
+    /// columns grew there until the run went unstable at step 9311. A free stream on this grid with
+    /// the layer at strength 4 holds 20 000 steps.
     fn wall_function() -> PlateGrid {
         PlateGrid {
             cells_per_unit: 2000.0,
@@ -625,7 +654,7 @@ impl PlateGrid {
             pressure_top: false,
             collision: Collision::Hrr,
             sigma: Some(0.99),
-            absorbing: Some(AbsorbingLayer { thickness: 0.05, strength: None, filter_time: None }),
+            absorbing: Some(AbsorbingLayer { thickness: 0.05, strength: Some(4.0), filter_time: None }),
             max_steps: 400_000,
             sample: 2000,
         }
