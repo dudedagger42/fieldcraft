@@ -942,6 +942,9 @@ pub const FLUID_DOMAIN: &[Field] = &[
     rows("fans", "Fans", FAN).help("Fans: zones that raise the pressure by their pressure–flow curve; the solve finds the operating point."),
     FREE_SURFACE,
     ABSORBING,
+    positive("moving_wall_ramp", "Moving-wall ramp", D::Time)
+        .help("How long every moving wall takes to reach its velocity from rest, with a smooth (cosine) start: a wall or inlet face switched on at full speed sends a pressure pulse through the box. Left out or 0, the walls move at full speed from the first step.")
+        .hint("none"),
 ];
 
 pub const FLUID_BOUNDARY: &[Field] = &[

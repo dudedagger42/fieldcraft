@@ -17,7 +17,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::fluid_zones::{Fan, PorousZone};
 use crate::geometry::{Entity, GeometryRef};
-use crate::{Error, Material, Model, Result, context, finite, insert_new, not_in_use, positive, remove_existing, replace_existing, require};
+use crate::{
+    Error, Material, Model, Result, context, finite, insert_new, nonnegative, not_in_use, positive, remove_existing, replace_existing, require,
+};
 
 /// Most obstacle bodies in one domain.
 pub const MAX_OBSTACLES: usize = 1000;
@@ -781,6 +783,11 @@ pub struct FluidDomain {
     /// none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub absorbing: Option<AbsorbingLayer>,
+    /// How long every moving wall takes to reach its velocity from rest (a time): box faces and
+    /// obstacle faces alike move at `r(t) u_w` with `r = ½ (1 − cos(π t / T))` until `T`, then at
+    /// `u_w`. `None` or 0 for the full velocity from the first step.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub moving_wall_ramp: Option<f64>,
 }
 
 fn is_zero(v: &[f64; 3]) -> bool {
@@ -887,6 +894,9 @@ impl FluidDomain {
         if let Some(layer) = &self.absorbing {
             let open = BoxFace::ALL.iter().any(|f| matches!(self.faces.get(*f), FaceCondition::Velocity { .. } | FaceCondition::Pressure { .. }));
             layer.validate(open).map_err(|e| context("absorbing layer", "settings", e))?;
+        }
+        if let Some(t) = self.moving_wall_ramp {
+            nonnegative("moving wall ramp", t)?;
         }
         Ok(())
     }
@@ -1057,6 +1067,7 @@ mod tests {
             fans: vec![],
             free_surface: None,
             absorbing: None,
+            moving_wall_ramp: None,
         }
     }
 
@@ -1290,6 +1301,24 @@ mod tests {
             assert_eq!(&serde_json::from_str::<FluidDomain>(&json).unwrap(), m.fluid_domain(name).unwrap());
         }
         assert!(!serde_json::to_string(&FluidThermal::default()).unwrap().contains("contacts"));
+    }
+
+    #[test]
+    fn a_moving_wall_ramp_is_a_time_of_at_least_zero_and_optional_in_files() {
+        for t in [0.0, 1e-3, 2.0] {
+            assert!(FluidDomain { moving_wall_ramp: Some(t), ..channel() }.validate().is_ok(), "{t}");
+        }
+        for t in [-1e-3, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let e = FluidDomain { moving_wall_ramp: Some(t), ..channel() }.validate().unwrap_err().to_string();
+            assert!(e.contains("moving wall ramp"), "{t}: {e}");
+        }
+        // Left out, it is absent from the file, and a file without it reads as none.
+        let json = serde_json::to_string(&channel()).unwrap();
+        assert!(!json.contains("moving_wall_ramp"), "{json}");
+        assert_eq!(serde_json::from_str::<FluidDomain>(&json).unwrap().moving_wall_ramp, None);
+        let ramped = FluidDomain { moving_wall_ramp: Some(1e-3), ..channel() };
+        let json = serde_json::to_string(&ramped).unwrap();
+        assert_eq!(serde_json::from_str::<FluidDomain>(&json).unwrap(), ramped);
     }
 
     #[test]

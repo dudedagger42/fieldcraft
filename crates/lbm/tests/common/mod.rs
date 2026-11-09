@@ -30,6 +30,7 @@ pub fn domain(min: [f64; 3], max: [f64; 3], spacing: f64) -> FluidDomain {
         fans: vec![],
         free_surface: None,
         absorbing: None,
+        moving_wall_ramp: None,
     }
 }
 
