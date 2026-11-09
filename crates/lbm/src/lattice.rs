@@ -83,6 +83,31 @@ pub fn equilibrium(q: usize, rho: f64, u: [f64; 3]) -> f64 {
     W.get(q).copied().unwrap_or(0.0) * rho * (1.0 + 3.0 * cu + 4.5 * cu * cu - 1.5 * uu)
 }
 
+/// The moving walls' speed factor for time step `step` (1 for the first) of a ramp `ramp_steps`
+/// long (the domain's `moving_wall_ramp` over the time step): `½ (1 − cos(π step / ramp_steps))`
+/// before its end, exactly 1 from its last step on and without a ramp (`ramp_steps` 0). A
+/// standard smooth start (the walls' acceleration is zero at both ends), from no particular
+/// paper. It depends only on the step number, so a resumed run continues it and every backend
+/// gets the same factors.
+pub fn wall_ramp(step: u64, ramp_steps: u64) -> f64 {
+    if step >= ramp_steps {
+        return 1.0;
+    }
+    0.5 * (1.0 - (std::f64::consts::PI * step as f64 / ramp_steps as f64).cos())
+}
+
+/// The ramp's length in time steps: `ramp` (a time) over `dt`, rounded, at least 1 for any ramp
+/// above 0; 0 without one.
+pub fn ramp_steps(ramp: Option<f64>, dt: f64) -> u64 {
+    match ramp {
+        Some(t) if t > 0.0 && dt > 0.0 => {
+            let n = (t / dt).round();
+            if n.is_finite() { (n as u64).max(1) } else { u64::MAX }
+        }
+        _ => 0,
+    }
+}
+
 /// Ladd's moving-wall term for a population bounced back into direction `q` off a wall moving
 /// with `u` (lattice units, reference density 1): `2 w_q c_q·u / c_s²` (Ladd 1994).
 #[inline(always)]

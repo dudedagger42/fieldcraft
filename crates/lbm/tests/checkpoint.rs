@@ -254,6 +254,18 @@ fn checkpoints_split_existing_advance_chunks_without_changing_bits() {
     parity_at(&m, &[], 1009);
 }
 
+/// The moving walls' ramp depends only on the step number: a run stopped mid-ramp (the save at
+/// step 22 of a 40-step ramp) resumes on the same factors, bit for bit.
+#[test]
+fn a_moving_wall_ramp_resumes_mid_ramp_with_every_bit() {
+    for collision in [Collision::Trt, Collision::Hrr] {
+        let mut d = domain([0.0; 3], [3.0; 3], 1.0);
+        d.faces.y_max = FaceCondition::MovingWall { velocity: [0.05, 0.0, 0.0] };
+        d.moving_wall_ramp = Some(40.0);
+        parity(&model(1.0, 0.1, d, collide(60.0, 1.0, None, collision)), &[]);
+    }
+}
+
 #[test]
 fn an_advance_failure_keeps_the_uninterrupted_reporting_boundary() {
     let dx = 0.1;

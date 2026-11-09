@@ -560,6 +560,10 @@ pub struct Flow {
     offset: [isize; Q],
     fluid_cells: usize,
     steps_done: u64,
+    /// The moving walls' ramp in time steps (`lattice::wall_ramp`; 0 without one), and this
+    /// step's factor on every link's moving-wall term.
+    ramp_steps: u64,
+    wall_ramp: f64,
     /// Obstacles that cover no cell centre (smaller than the spacing, or outside the box).
     empty_obstacles: Vec<String>,
     /// The temperature lattice, with thermal settings.
@@ -693,6 +697,7 @@ impl Flow {
         // would otherwise put them all in one).
         let lines = n.div_ceil(8);
         let stride = 8 * (lines + 1 - lines % 2);
+        let ramp_steps = crate::lattice::ramp_steps(setup.domain.moving_wall_ramp, setup.time_step);
         let q_n = stride.checked_mul(Q).ok_or_else(|| Error::Limit("the grid is too large".into()))?;
 
         // Solid cells, obstacle by obstacle (the first obstacle that covers a cell owns it).
@@ -1272,6 +1277,13 @@ impl Flow {
             setup.van_driest.map(|a| Walls::on_node(&grid, &bulk, &cells, Some(a), nu)).transpose()?
         } else if setup.van_driest.is_some() || setup.wall_model.is_some() {
             let groups: Vec<Option<[f64; 3]>> = BoxFace::ALL.iter().map(|f| wall_velocity(*f)).chain(obstacle_walls.iter().copied()).collect();
+            // The wall model and the damping take a moving wall's own velocity, which the ramp
+            // does not scale.
+            if ramp_steps > 0 && groups.iter().flatten().any(|u| *u != [0.0; 3]) {
+                return Err(Error::Invalid(
+                    "not supported yet: a moving-wall ramp (`moving_wall_ramp`) with a wall model or Van Driest's damping on a moving wall; leave the ramp out or the walls at rest".into(),
+                ));
+            }
             Some(Walls::new(&grid, &fluid, &links, &groups, setup.van_driest, nu)?)
         } else {
             None
@@ -1380,6 +1392,8 @@ impl Flow {
             offset,
             fluid_cells,
             steps_done: 0,
+            ramp_steps,
+            wall_ramp: crate::lattice::wall_ramp(1, ramp_steps),
             empty_obstacles,
             thermal,
             cell_force,
@@ -1704,6 +1718,11 @@ impl Flow {
         self.steps_done
     }
 
+    /// The moving walls' ramp in time steps (0 without one; `lattice::wall_ramp`).
+    pub fn ramp_steps(&self) -> u64 {
+        self.ramp_steps
+    }
+
     /// The links that do not stream from the neighbour at `−c_q`, in cell order.
     pub fn links(&self) -> &[Link] {
         &self.links
@@ -1923,6 +1942,7 @@ impl Flow {
     /// One time step. Fails with [`Error::Unstable`] when a density stops being a positive
     /// number or a lattice speed exceeds [`MAX_LATTICE_SPEED`].
     pub fn step(&mut self) -> Result<()> {
+        self.wall_ramp = crate::lattice::wall_ramp(self.steps_done.saturating_add(1), self.ramp_steps);
         self.targets()?;
         self.refresh_buoyancy();
         self.refresh_fans();
@@ -2801,7 +2821,7 @@ impl Flow {
         let block = self.block;
         let n = self.n;
         let s = self.stride;
-        let (f, links, offset) = (&self.f, &self.links, &self.offset);
+        let (f, links, offset, ramp) = (&self.f, &self.links, &self.offset, self.wall_ramp);
         let mut blocks = cell_blocks(&mut self.g, s, n, block);
         parallel::for_each_mut(&mut blocks, |b, g| {
             let start = b * block;
@@ -2823,7 +2843,7 @@ impl Flow {
                 let (cell, q) = (link.cell as usize, link.q as usize);
                 let v = match link.rule {
                     Rule::Pull { from } => f.get(q * s + from as usize).copied(),
-                    Rule::Bounce { du, .. } => f.get(opposite(q) * s + cell).map(|out| out + du),
+                    Rule::Bounce { du, .. } => f.get(opposite(q) * s + cell).map(|out| out + du * ramp),
                     Rule::Reflect { from, q: q2, .. } => f.get(q2 as usize * s + from as usize).copied(),
                     // A placeholder the open boundary replaces.
                     Rule::Open => f.get(opposite(q) * s + cell).copied(),
@@ -2840,7 +2860,7 @@ impl Flow {
             match link.rule {
                 Rule::Bounce { group, du } => {
                     let out = self.f[opposite(q) * s + cell];
-                    let back = out + du;
+                    let back = out + du * self.wall_ramp;
                     if let Some(force) = self.forces.get_mut(group as usize) {
                         // c_out f* − c_in f' with c_out = −c_q.
                         for a in 0..3 {
@@ -3132,6 +3152,9 @@ impl crate::backend::Backend for Flow {
             offset: _,
             fluid_cells: _,
             steps_done,
+            // The ramp's length is the setup's; its factor is set from `steps_done` each step.
+            ramp_steps: _,
+            wall_ramp: _,
             empty_obstacles: _,
             thermal,
             cell_force,

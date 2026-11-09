@@ -79,6 +79,21 @@ the inlet ran away on the hybrid collision up to τ − ½ = 3 × 10⁻³ and on
 `"absorbing": {}` adds the default layer. With heat in the fluid or a free surface, where a layer
 is refused, there is no warning.
 
+The domain's `moving_wall_ramp` (a time, `model.fluid_domain.create` and `.edit`) starts **every
+moving wall** of the domain, box faces and obstacle faces alike, from rest:
+- **The ramp:** each wall moves at r(t) u_w, with r(t) = ½ (1 − cos(π t / T)) until T, then exactly
+  at u_w.
+- **Without one:** left out or 0, the walls move at full speed from the first step.
+- **Why it helps:** a wall switched on at full speed sends a pressure pulse through the box.
+  Through narrow passages at small τ − ½, that pulse can run away before any outflow forms. So can
+  an obstacle face whose velocity has a normal part, which injects or removes mass.
+- **The shape:** the cosine start is a standard smooth start (the walls' acceleration is zero at
+  both ends); it comes from no particular paper.
+- **Where it is refused:** with a wall model or Van Driest's damping while a wall moves: they
+  take the wall's own velocity, which is not ramped.
+- **On the GPU:** the same factors, one per step, as on the CPU; while the walls ramp, the GPU
+  submits two steps at a time.
+
 ## Theory
 
 ### Walls: halfway bounce-back
@@ -91,10 +106,11 @@ f_q(x, t + Δt) = f*_q̄(x, t) + 6 w_q ρ₀ c_q·u_w
 ```
 
 with q̄ the opposite of q and u_w the wall velocity (Ladd's moving-wall term; zero for a wall at
-rest). The wall lies halfway between the fluid cell and the solid one. With the two-relaxation-time
-collision and Λ = 3/16 that position is exact for the Poiseuille parabola; with the other
-collisions it is second-order accurate ([Collision operators](collision.md)). Obstacle walls are
-staircase: they follow the cell faces, and curved walls are first order in position.
+rest; times r(t) during a `moving_wall_ramp`). The wall lies halfway between the fluid cell and
+the solid one. With the two-relaxation-time collision and Λ = 3/16 that position is exact for
+the Poiseuille parabola; with the other collisions it is second-order accurate
+([Collision operators](collision.md)). Obstacle walls are staircase: they follow the cell faces,
+and curved walls are first order in position.
 
 A link into a fluid cell from an obstacle cell belongs to the obstacle face of the triangle nearest
 the link's midpoint, and takes that face's wall velocity.
