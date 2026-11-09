@@ -48,6 +48,7 @@ mod common;
 
 use common::cases::*;
 use common::*;
+use fieldcraft_lbm::backend::Backend;
 use fieldcraft_lbm::statistics::Blocks;
 use fieldcraft_lbm::{Flow, Limits, Obstacle};
 use fieldcraft_model::{AbsorbingLayer, BoxFaces, Collision, FaceCondition, HrrSigma, Outflow, Procedure, Turbulence, WallModel};
@@ -74,6 +75,9 @@ struct Step {
     block: usize,
     startup: f64,
     max_steps: u64,
+    /// A restart file: loaded when it exists, rewritten (atomically) every [`CHECKPOINT_STEPS`]
+    /// steps, so an hours-long run survives a crash or a restart of the machine.
+    checkpoint: Option<std::path::PathBuf>,
 }
 
 /// A wall strip: its body, its x range and whether it is on the floor (downstream) or the step's
@@ -394,10 +398,54 @@ impl Step {
         let floor_of = |v: &[f64]| strips.iter().zip(v).filter(|(s, _)| s.floor).map(|(_, &t)| t).collect::<Vec<f64>>();
         let mut settled = false;
         let clock = std::time::Instant::now();
-        while steps < self.max_steps {
+        // Every sample so far, kept for the restart file: a resumed run replays them into fresh
+        // statistics, so it ends where an unbroken run would.
+        let mut samples: Vec<Vec<f64>> = Vec::new();
+        // One sample into the statistics; true once the reattachments pass the acceptance. Each
+        // completed block prints a line: its reattachment, the running mean and, when given, the
+        // inlet's largest |ρ − 1| (its first four columns).
+        let take = |sample: &[f64],
+                    steps: u64,
+                    inlet: Option<f64>,
+                    shear: &mut Shear,
+                    blocks: &mut Blocks,
+                    missing: &mut (usize, Option<NoReattachment>)| {
+            if !shear.push(sample) {
+                return false;
+            }
+            let last = reattachment(&floor_x, &floor_of(&shear.last_block()));
+            match &last {
+                Ok(x_r) => blocks.push(*x_r).unwrap(),
+                Err(why) => *missing = (missing.0 + 1, Some(why.clone())),
+            }
+            println!(
+                "step {steps}: block {} x_r {last:?}, mean {:.3} H over {} blocks ({} refused), inlet |ρ − 1| {}, {:.0} s",
+                shear.blocks(),
+                blocks.mean(),
+                blocks.means().len(),
+                missing.0,
+                inlet.map_or("(replayed)".into(), |v| format!("{v:.2e}")),
+                clock.elapsed().as_secs_f64()
+            );
+            blocks.acceptance().accepted
+        };
+        if let Some(path) = self.checkpoint.as_ref().filter(|p| p.exists()) {
+            let (at, kept) = load(path, &mut flow);
+            steps = at;
+            println!("resumed {} at step {steps} ({} samples)", path.display(), kept.len());
+            let first = startup + self.sample;
+            for (n, sample) in kept.iter().enumerate() {
+                settled = take(sample, first + n as u64 * self.sample, None, &mut shear, &mut blocks, &mut missing);
+            }
+            samples = kept;
+        }
+        while steps < self.max_steps && !settled {
             flow.step().unwrap();
             steps += 1;
             if steps <= startup {
+                if let Some(path) = self.checkpoint.as_ref().filter(|_| steps.is_multiple_of(CHECKPOINT_STEPS)) {
+                    save(path, &mut flow, steps, &samples);
+                }
                 continue;
             }
             let forces = flow.forces();
@@ -411,30 +459,15 @@ impl Step {
             let sample: Vec<f64> = interval.iter().map(|t| t / self.sample as f64).collect();
             assert!(sample.iter().all(|s| s.is_finite()), "the wall shear is not finite after {steps} steps");
             interval.iter_mut().for_each(|v| *v = 0.0);
-            if shear.push(&sample) {
-                let last = reattachment(&floor_x, &floor_of(&shear.last_block()));
-                match &last {
-                    Ok(x_r) => blocks.push(*x_r).unwrap(),
-                    Err(why) => missing = (missing.0 + 1, Some(why.clone())),
-                }
-                // A long run says where it is once per block: the block's reattachment, the
-                // running mean, and the inlet's largest |ρ − 1| (its first four columns).
-                let inlet = (0..4.min(nx))
-                    .flat_map(|i| (0..nz).flat_map(move |k| (0..ny).map(move |j| [i, j, k])))
-                    .filter_map(|c| flow.moments(grid.index(c)).map(|m| (m.0 - 1.0).abs()))
-                    .fold(0.0, f64::max);
-                println!(
-                    "step {steps}: block {} x_r {last:?}, mean {:.3} H over {} blocks ({} refused), inlet |ρ − 1| {inlet:.2e}, {:.0} s",
-                    shear.blocks(),
-                    blocks.mean(),
-                    blocks.means().len(),
-                    missing.0,
-                    clock.elapsed().as_secs_f64()
-                );
-                if blocks.acceptance().accepted {
-                    settled = true;
-                    break;
-                }
+            let inlet = (0..4.min(nx))
+                .flat_map(|i| (0..nz).flat_map(move |k| (0..ny).map(move |j| [i, j, k])))
+                .filter_map(|c| flow.moments(grid.index(c)).map(|m| (m.0 - 1.0).abs()))
+                .fold(0.0, f64::max);
+            settled = take(&sample, steps, Some(inlet), &mut shear, &mut blocks, &mut missing);
+            samples.push(sample);
+            // Sample boundaries carry no partial interval, so the file holds the whole state.
+            if let Some(path) = self.checkpoint.as_ref().filter(|_| steps.is_multiple_of(CHECKPOINT_STEPS)) {
+                save(path, &mut flow, steps, &samples);
             }
         }
         println!(
@@ -459,6 +492,71 @@ impl Step {
         let u_ref_inlet = u_ref / self.lattice_velocity;
         Run { cf, cp, x_r, reattachment: blocks, missing, inflow: (u_ref_inlet * theta * self.re_h, delta, u_ref_inlet), steps, settled }
     }
+}
+
+/// Steps between two restart files of a run with [`Step::checkpoint`]: a multiple of the case's
+/// sample interval, so a file is written only where no partial sample is pending.
+const CHECKPOINT_STEPS: u64 = 2000;
+
+/// A restart file for [`Step::run`]: the flow's own state (`Backend::checkpoint`), then the step
+/// count and every sample (each strip's mean shear), little-endian.
+struct Restart {
+    read: Option<std::io::BufReader<std::fs::File>>,
+    write: Option<std::io::BufWriter<std::fs::File>>,
+}
+
+impl fieldcraft_lbm::checkpoint::Archive for Restart {
+    fn loading(&self) -> bool {
+        self.read.is_some()
+    }
+    fn bytes(&mut self, value: &mut [u8]) -> fieldcraft_lbm::Result<()> {
+        use std::io::{Read, Write};
+        let r = match (&mut self.read, &mut self.write) {
+            (Some(r), _) => r.read_exact(value),
+            (_, Some(w)) => w.write_all(value),
+            _ => Ok(()),
+        };
+        r.map_err(|e| fieldcraft_lbm::Error::Invalid(format!("step restart file: {e}")))
+    }
+}
+
+impl Restart {
+    /// Read `v` back when loading, write it when saving.
+    fn u64(&mut self, v: u64) -> u64 {
+        let mut b = v.to_le_bytes();
+        fieldcraft_lbm::checkpoint::Archive::bytes(self, &mut b).unwrap();
+        u64::from_le_bytes(b)
+    }
+}
+
+/// Write the restart file: to `path` with `.tmp` added, then renamed over `path`.
+fn save(path: &std::path::Path, flow: &mut Flow, steps: u64, samples: &[Vec<f64>]) {
+    use std::io::Write;
+    let tmp = path.with_extension("tmp");
+    let mut a = Restart { read: None, write: Some(std::io::BufWriter::new(std::fs::File::create(&tmp).unwrap())) };
+    flow.checkpoint(&mut a).unwrap();
+    a.u64(steps);
+    a.u64(samples.len() as u64);
+    for row in samples {
+        a.u64(row.len() as u64);
+        for v in row {
+            a.u64(v.to_bits());
+        }
+    }
+    if let Some(w) = a.write.as_mut() {
+        w.flush().unwrap();
+    }
+    drop(a);
+    std::fs::rename(&tmp, path).unwrap();
+}
+
+/// Read a restart file into `flow`: the step count and the samples.
+fn load(path: &std::path::Path, flow: &mut Flow) -> (u64, Vec<Vec<f64>>) {
+    let mut a = Restart { read: Some(std::io::BufReader::new(std::fs::File::open(path).unwrap())), write: None };
+    flow.checkpoint(&mut a).unwrap();
+    let steps = a.u64(0);
+    let samples = (0..a.u64(0)).map(|_| (0..a.u64(0)).map(|_| f64::from_bits(a.u64(0))).collect()).collect();
+    (steps, samples)
 }
 
 fn report(step: &Step, r: &Run) -> Score {
@@ -536,6 +634,7 @@ fn laminar(max_steps: u64) -> Step {
         block: 2,
         startup: 0.0,
         max_steps,
+        checkpoint: None,
         ..Step::case(0.0)
     }
 }
@@ -631,6 +730,7 @@ impl Step {
             block: 10,
             startup: 2.0,
             max_steps: 2_000_000,
+            checkpoint: None,
         }
     }
 
@@ -661,13 +761,36 @@ fn driver_seegmiller(step: &Step) -> (Run, Score) {
 }
 
 /// Spalart–Allmaras RANS on Han's wall in 2D (one cell of span), the case's grid and inlet: the
-/// first model run toward x_r / H. Hours on 5 threads:
+/// first model run toward x_r / H. Hours on 5 threads; `FIELDCRAFT_STEP_CHECKPOINT=<file>` keeps a
+/// restart file there every 2000 steps, and a run started with it resumes from it:
 /// `FIELDCRAFT_THREADS=5 cargo test --release -p fieldcraft-lbm --test ddes_backstep sa_rans_on_han_s_wall -- --ignored --nocapture`.
 #[test]
 #[ignore = "hours: tests/oracle/ddes-backstep-driver-seegmiller/README.md"]
 fn sa_rans_on_han_s_wall_reattaches_where_measured() {
     let sa = Turbulence::SpalartAllmaras { prandtl: 0.9, wall_model: Some(WallModel::SpaldingBounce), inflow_ratio: 3.0, ddes: None };
     let steps = std::env::var("FIELDCRAFT_STEP_MAX_STEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(400_000);
-    let (run, score) = driver_seegmiller(&Step { max_steps: steps, ..Step::driver_seegmiller(sa, 0.0) });
+    let checkpoint = std::env::var_os("FIELDCRAFT_STEP_CHECKPOINT").map(std::path::PathBuf::from);
+    let (run, score) = driver_seegmiller(&Step { max_steps: steps, checkpoint, ..Step::driver_seegmiller(sa, 0.0) });
     assert!(run.settled && score.passes(), "x_r {:?}, settled {}", run.x_r, run.settled);
+}
+
+/// A run with a restart file resumes bit for bit: a small laminar step run 2000 steps, which
+/// writes its restart file, then resumed to 2400, gives the same shear profile and block
+/// reattachments as an unbroken run of 2400 steps.
+#[test]
+fn a_step_run_resumes_from_its_restart_file_bit_for_bit() {
+    let dir = std::env::temp_dir().join(format!("fieldcraft-step-restart-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("step.restart");
+    let base = Step { re_h: 50.0, cells_per_h: 8, upstream: 6.0, expansion_ratio: 1.5, sample: 20, block: 5, ..laminar(0) };
+    let whole = Step { max_steps: 2400, ..base.clone() }.run();
+    let first = Step { max_steps: 2000, checkpoint: Some(path.clone()), ..base.clone() }.run();
+    assert!(path.exists(), "a restart file at step 2000");
+    assert_eq!(first.steps, 2000);
+    let resumed = Step { max_steps: 2400, checkpoint: Some(path.clone()), ..base }.run();
+    std::fs::remove_dir_all(&dir).ok();
+    assert_eq!(resumed.steps, whole.steps);
+    let bits = |r: &Run| r.cf.iter().map(|(x, c)| (x.to_bits(), c.to_bits())).collect::<Vec<_>>();
+    assert_eq!(bits(&resumed), bits(&whole), "the resumed run's shear differs");
+    assert_eq!(resumed.reattachment.means(), whole.reattachment.means());
 }
