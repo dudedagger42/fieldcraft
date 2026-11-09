@@ -187,6 +187,9 @@ struct Params {
     // bits, and flags (w): bit 0 whether the model's sources act (or the transport alone), bit 1
     // DDES (with C_DES Δ in `les.w`).
     sa: vec4<u32>,
+    // The moving walls' ramp: this step's factor on every link's moving-wall term (x; 1 without
+    // a ramp and after it, `fieldcraft_lbm::lattice::wall_ramp`), padding (yzw).
+    ramp: vec4<f32>,
 };
 
 // Each kernel's bind group holds only the bindings it reaches (native.rs reads them from this
@@ -2053,7 +2056,7 @@ fn gather_link(l: u32, exchange: bool) {
     if kind == KIND_PULL {
         v = post(q, lu.y);
     } else if kind == KIND_BOUNCE {
-        v = post(opp(q), cell) + link_f[l];
+        v = post(opp(q), cell) + link_f[l] * params.ramp.x;
     } else if kind == KIND_REFLECT {
         // The mirrored direction has the same weight, so h reflects like f.
         v = post(q2, lu.y);
@@ -2328,7 +2331,7 @@ fn momentum_exchange(l: u32, lu: vec4<u32>, q: u32, kind: u32, q2: u32) -> vec3<
     var v = vec3<f32>(0.0);
     if kind == KIND_BOUNCE {
         let out = post(opp(q), lu.w);
-        let back = out + link_f[l];
+        let back = out + link_f[l] * params.ramp.x;
         v = -vec3<f32>(c_of(q)) * (out + back);
     } else if kind == KIND_REFLECT {
         let out = post(q2, lu.y);

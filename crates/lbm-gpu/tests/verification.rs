@@ -718,6 +718,52 @@ fn compare_incremental(mut cpu: Flow, heated: bool, streaming: Streaming) {
     }
 }
 
+/// The moving walls' ramp on the GPU: a lid-driven cavity and a closed box whose block face
+/// moves out along its normal (a mass source), ramped over 40 steps, read back mid-ramp, across
+/// its end and after it, match the CPU within the stated tolerances (the factors are the CPU's,
+/// one per step, while the GPU submits two steps at a time).
+#[test]
+fn a_moving_wall_ramp_matches_the_cpu_through_and_after_it() {
+    for (collision, streaming) in [(Collision::Trt, Streaming::InPlace), (Collision::Hrr, Streaming::TwoBuffers)] {
+        let mut lid = domain([0.0; 3], [8.0; 3], 1.0);
+        lid.faces.y_max = FaceCondition::MovingWall { velocity: [0.05, 0.0, 0.0] };
+        let mut source = domain([0.0; 3], [8.0; 3], 1.0);
+        source.obstacles = vec!["Block".into()];
+        source.surfaces.push(fieldcraft_model::SurfaceBoundary {
+            face: fieldcraft_model::GeometryRef::face("Block", "x_max").unwrap(),
+            condition: fieldcraft_model::SurfaceCondition::MovingWall { velocity: [0.01, 0.0, 0.0] },
+        });
+        let block = obstacle("Block", cuboid([2.0; 3], [4.0; 3]), &CUBOID_FACES);
+        for (mut d, obstacles) in [(lid, vec![]), (source, vec![block])] {
+            d.moving_wall_ramp = Some(40.0);
+            let m = model(1.0, 0.1, d, collide(200.0, 1.0, None, collision));
+            let (_, mut cpu) = prepare(&m, &obstacles);
+            assert_eq!(cpu.ramp_steps(), 40);
+            let Some(mut gpu) = gpu(&cpu, streaming) else { return };
+            let m0 = Backend::mass(&mut cpu).unwrap();
+            let mut total = 0;
+            for steps in [1, 4, 17, 15, 3, 64, 30] {
+                cpu.advance(steps).unwrap();
+                gpu.advance(steps).unwrap();
+                total += steps;
+                let (du, drho) = field_difference(&mut cpu, &mut gpu);
+                let (mc, mg) = (Backend::mass(&mut cpu).unwrap(), gpu.mass().unwrap());
+                println!(
+                    "{collision:?} ramp, step {total}: velocity {du:.3e}, density {drho:.3e}, mass {:+.3e} vs {:+.3e}",
+                    mc / m0 - 1.0,
+                    mg / m0 - 1.0
+                );
+                assert!(du < 2e-5 && drho < 1e-6, "step {total}: {du} {drho}");
+                assert!((mg - mc).abs() < 1e-6 * mc, "step {total}: mass {mg} vs {mc}");
+                let (a, b) = (Backend::forces(&mut cpu).unwrap(), gpu.forces().unwrap());
+                let scale = a.iter().flatten().map(|v| v.abs()).fold(0.0, f64::max).max(1e-30);
+                let error = a.iter().flatten().zip(b.iter().flatten()).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max);
+                assert!(error < 5e-5 * scale, "step {total}: force {error} / {scale}");
+            }
+        }
+    }
+}
+
 #[test]
 fn odd_even_and_chunk_readbacks_match_the_cpu_with_heat_open_and_slip_faces() {
     // Both collisions and both layouts (the default layout depends on the device, see `Streaming`).

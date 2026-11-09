@@ -240,6 +240,12 @@ pub struct GpuFlow {
     groups: Vec<Group>,
     empty_obstacles: Vec<String>,
     steps_done: u64,
+    /// The moving walls' ramp in time steps (`fieldcraft_lbm::lattice::wall_ramp`; 0 without
+    /// one), counted from the flow's own steps before this backend took it over, and whether
+    /// both phases' uniforms hold its final factor 1 yet.
+    ramp_steps: u64,
+    ramp_from: u64,
+    ramp_done: bool,
     // Last uploaded uniform acceleration, used only by the momentum diagnostic.
     diagnostic_acceleration: [f64; 3],
     /// With Smagorinsky's model: the fluid's own viscosity (lattice units), and the largest eddy
@@ -321,6 +327,11 @@ const SA_STOP: f64 = 2.0;
 /// `params.sa`'s byte offset in the uniforms, and the sub-step dt's within it.
 const SA_PARAMS: u64 = 192;
 const SA_DT: u64 = SA_PARAMS + 8;
+/// `params.ramp`'s byte offset: the moving walls' factor for the step that reads that phase.
+const RAMP: u64 = SA_PARAMS + 16;
+/// The steps per submission while the moving walls ramp: one per phase's uniforms, so each step
+/// reads its own factor (a step's kernels see one phase's `params`).
+const RAMP_CHUNK: u64 = 2;
 
 /// The Spalart–Allmaras model's box-face kinds for `lbm.wgsl` (2 bits per face: 1 wall,
 /// 2 inflow, 3 open), checked against every fluid cell's faces on the CPU: the device's rule is a
@@ -1319,6 +1330,8 @@ impl GpuFlow {
                 1.0f32.to_bits(),
                 sa_flags(true, c_des.is_some()),
             ]));
+            // `ramp` (RAMP): full speed until a chunk writes the ramp's factors.
+            bytes.extend_from_slice(&bytes_f32(&[1.0, 0.0, 0.0, 0.0]));
             device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("lbm params"),
                 contents: &bytes,
@@ -1527,6 +1540,9 @@ impl GpuFlow {
             groups: flow.groups().to_vec(),
             empty_obstacles: flow.empty_obstacles().to_vec(),
             steps_done: 0,
+            ramp_steps: flow.ramp_steps(),
+            ramp_from: flow.steps_done(),
+            ramp_done: flow.ramp_steps() == 0,
             diagnostic_acceleration: flow.acceleration().map(|a| f64::from(a as f32)),
             nu0: (1.0 / omega_plus - 0.5) / 3.0,
             eddy_ratio: 0.0,
@@ -1625,6 +1641,29 @@ impl GpuFlow {
     /// before the first chunk plans them).
     pub fn sa_substeps(&self) -> Option<u32> {
         self.sa.as_ref().and_then(|s| s.substeps)
+    }
+
+    /// While the moving walls ramp: each step of the chunk (at most [`RAMP_CHUNK`], one per
+    /// phase) gets its factor in the phase's uniforms it reads, from the same f64 factor as the
+    /// CPU's, rounded to f32. Once both phases hold 1, nothing more is written.
+    fn write_ramp(&mut self, steps: u64) -> Result<()> {
+        if self.ramp_done {
+            return Ok(());
+        }
+        if steps > RAMP_CHUNK {
+            return Err(gpu_error("a chunk of the moving walls' ramp holds at most two steps"));
+        }
+        let base = self.ramp_from.saturating_add(self.steps_done);
+        let mut done = true;
+        for k in 0..RAMP_CHUNK {
+            let r = fieldcraft_lbm::lattice::wall_ramp(base.saturating_add(k + 1), self.ramp_steps);
+            done &= r == 1.0;
+            let phase = self.current ^ (k as usize & 1);
+            let p = self.params.get(phase).ok_or_else(|| gpu_error("no uniforms for a phase"))?;
+            self.queue.write_buffer(p, RAMP, &(r as f32).to_bits().to_le_bytes());
+        }
+        self.ramp_done = done;
+        Ok(())
     }
 
     /// Write the sub-step dt = 1/n into both phases' uniforms.
@@ -1865,6 +1904,7 @@ impl GpuFlow {
         if sa_substeps > 0 {
             self.set_sa_dt(sa_substeps);
         }
+        self.write_ramp(steps)?;
         self.queue.write_buffer(&self.stats, 0, &bytes_u32(&[0; 8]));
         let mut commands = Vec::with_capacity(self.dispatches_per_step() * steps as usize + 7);
         for step in 0..steps {
@@ -2073,7 +2113,7 @@ impl Backend for GpuFlow {
         };
         let mut left = steps;
         while left > 0 {
-            let chunk = left.min(most);
+            let chunk = left.min(if self.ramp_done { most } else { RAMP_CHUNK.min(most) });
             self.advance_chunk(chunk)?;
             left -= chunk;
         }
