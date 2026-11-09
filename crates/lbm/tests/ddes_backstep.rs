@@ -154,7 +154,51 @@ struct Run {
     /// Re_θ, δ₉₉ (in H) and U_ref (in units of the inlet speed) at x = −4 H, at the end.
     inflow: (f64, f64, f64),
     steps: u64,
+    /// Whether a stop rule settled the run: `rule` is `Some`.
     settled: bool,
+    /// The rule that settled it, if one did.
+    rule: Option<Settled>,
+}
+
+/// The rule that settled a run.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Settled {
+    /// A steady RANS run ([`STEADY_BLOCKS`]): at `block`, the last blocks' x_r and floor shear
+    /// spreads (max − min over |mean|; for the shear, the largest over the floor's strips).
+    Steady { block: usize, x_r: f64, shear: f64 },
+    /// The `Blocks` acceptance on the reattachments, for scale-resolving runs.
+    Blocks,
+}
+
+/// A steady run stops once the x_r of its last `STEADY_BLOCKS` completed blocks agree within
+/// `STEADY_X_R` (max − min over |mean|) and every floor strip's block-mean shear agrees within
+/// `STEADY_SHEAR` over the same blocks. A converged RANS run's block means differ only by round-off,
+/// which the `Blocks` acceptance (made for turbulent statistics) reads as correlated noise and never
+/// accepts; the shear condition catches a slow drift elsewhere on the floor that x_r would miss.
+const STEADY_BLOCKS: usize = 5;
+const STEADY_X_R: f64 = 1e-5;
+const STEADY_SHEAR: f64 = 1e-4;
+
+/// The spread of `values`: (max − min) / |mean|; 0 when they are all equal (even all zero).
+fn spread(values: &[f64]) -> f64 {
+    let (lo, hi) = values.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), &v| (a.min(v), b.max(v)));
+    if hi == lo {
+        return 0.0;
+    }
+    let mean = values.iter().sum::<f64>() / values.len() as f64;
+    (hi - lo) / mean.abs()
+}
+
+/// The steady rule over the last completed blocks, each (x_r, the floor strips' block-mean shear),
+/// oldest first: the x_r and largest shear spread when the last `STEADY_BLOCKS` blocks pass, else
+/// `None` (fewer blocks, or a spread over its tolerance).
+fn steady(recent: &[(f64, Vec<f64>)]) -> Option<(f64, f64)> {
+    let window = recent.get(recent.len().checked_sub(STEADY_BLOCKS)?..)?;
+    let x_r = spread(&window.iter().map(|(x, _)| *x).collect::<Vec<f64>>());
+    let strips = window.first()?.1.len();
+    let shear =
+        (0..strips).map(|s| spread(&window.iter().map(|(_, t)| t.get(s).copied().unwrap_or(f64::NAN)).collect::<Vec<f64>>())).fold(0.0, f64::max);
+    (x_r < STEADY_X_R && shear < STEADY_SHEAR).then_some((x_r, shear))
 }
 
 /// Lengths within this of each other are equal (grid coordinates are sums of cell sizes).
@@ -399,12 +443,17 @@ impl Step {
         let mut interval = vec![0.0; strips.len()];
         let floor_x: Vec<f64> = strips.iter().filter(|s| s.floor).map(|s| 0.5 * (s.x.0 + s.x.1)).collect();
         let floor_of = |v: &[f64]| strips.iter().zip(v).filter(|(s, _)| s.floor).map(|(_, &t)| t).collect::<Vec<f64>>();
-        let mut settled = false;
+        let mut rule = None;
+        // A steady (RANS, no DDES) run stops by the steady rule; a scale-resolving one by `Blocks`.
+        let steady_run = matches!(self.turbulence, Some(Turbulence::SpalartAllmaras { ddes: None, .. }));
+        // The last completed blocks' (x_r, floor shear), for the steady rule; a refused block
+        // empties it, so the window is consecutive blocks that each reattach.
+        let mut recent: Vec<(f64, Vec<f64>)> = Vec::new();
         let clock = std::time::Instant::now();
         // Every sample so far, kept for the restart file: a resumed run replays them into fresh
         // statistics, so it ends where an unbroken run would.
         let mut samples: Vec<Vec<f64>> = Vec::new();
-        // One sample into the statistics; true once the reattachments pass the acceptance. Each
+        // One sample into the statistics; the rule that settles the run, if one does. Each
         // completed block prints a line: its reattachment, the running mean and, when given, the
         // inlet's largest |ρ − 1| (its first four columns).
         let take = |sample: &[f64],
@@ -412,14 +461,25 @@ impl Step {
                     inlet: Option<f64>,
                     shear: &mut Shear,
                     blocks: &mut Blocks,
-                    missing: &mut (usize, Option<NoReattachment>)| {
+                    missing: &mut (usize, Option<NoReattachment>),
+                    recent: &mut Vec<(f64, Vec<f64>)>| {
             if !shear.push(sample) {
-                return false;
+                return None;
             }
-            let last = reattachment(&floor_x, &floor_of(&shear.last_block()));
+            let floor = floor_of(&shear.last_block());
+            let last = reattachment(&floor_x, &floor);
             match &last {
-                Ok(x_r) => blocks.push(*x_r).unwrap(),
-                Err(why) => *missing = (missing.0 + 1, Some(why.clone())),
+                Ok(x_r) => {
+                    blocks.push(*x_r).unwrap();
+                    recent.push((*x_r, floor));
+                    if recent.len() > STEADY_BLOCKS {
+                        recent.remove(0);
+                    }
+                }
+                Err(why) => {
+                    *missing = (missing.0 + 1, Some(why.clone()));
+                    recent.clear();
+                }
             }
             println!(
                 "step {steps}: block {} x_r {last:?}, mean {:.3} H over {} blocks ({} refused), inlet |ρ − 1| {}, {:.0} s",
@@ -430,7 +490,11 @@ impl Step {
                 inlet.map_or("(replayed)".into(), |v| format!("{v:.2e}")),
                 clock.elapsed().as_secs_f64()
             );
-            blocks.acceptance().accepted
+            if steady_run {
+                steady(recent).map(|(x_r, spread)| Settled::Steady { block: shear.blocks(), x_r, shear: spread })
+            } else {
+                blocks.acceptance().accepted.then_some(Settled::Blocks)
+            }
         };
         if let Some(path) = self.checkpoint.as_ref().filter(|p| p.exists()) {
             let (at, kept) = load(path, &mut flow);
@@ -438,11 +502,12 @@ impl Step {
             println!("resumed {} at step {steps} ({} samples)", path.display(), kept.len());
             let first = startup + self.sample;
             for (n, sample) in kept.iter().enumerate() {
-                settled = take(sample, first + n as u64 * self.sample, None, &mut shear, &mut blocks, &mut missing);
+                let now = take(sample, first + n as u64 * self.sample, None, &mut shear, &mut blocks, &mut missing, &mut recent);
+                rule = rule.or(now);
             }
             samples = kept;
         }
-        while steps < self.max_steps && !settled {
+        while steps < self.max_steps && rule.is_none() {
             flow.step().unwrap();
             steps += 1;
             if steps <= startup {
@@ -466,7 +531,7 @@ impl Step {
                 .flat_map(|i| (0..nz).flat_map(move |k| (0..ny).map(move |j| [i, j, k])))
                 .filter_map(|c| flow.moments(grid.index(c)).map(|m| (m.0 - 1.0).abs()))
                 .fold(0.0, f64::max);
-            settled = take(&sample, steps, Some(inlet), &mut shear, &mut blocks, &mut missing);
+            rule = take(&sample, steps, Some(inlet), &mut shear, &mut blocks, &mut missing, &mut recent);
             samples.push(sample);
             // Sample boundaries carry no partial interval, so the file holds the whole state.
             if let Some(path) = self.checkpoint.as_ref().filter(|_| steps.is_multiple_of(CHECKPOINT_STEPS)) {
@@ -494,7 +559,18 @@ impl Step {
         // U_ref in units of the inlet speed (the lattice speeds are scaled by U_lat).
         let u_ref_inlet = u_ref / self.lattice_velocity;
         let crossing = wall_crossing(&flow, self);
-        Run { cf, cp, x_r, crossing, reattachment: blocks, missing, inflow: (u_ref_inlet * theta * self.re_h, delta, u_ref_inlet), steps, settled }
+        Run {
+            cf,
+            cp,
+            x_r,
+            crossing,
+            reattachment: blocks,
+            missing,
+            inflow: (u_ref_inlet * theta * self.re_h, delta, u_ref_inlet),
+            steps,
+            settled: rule.is_some(),
+            rule,
+        }
     }
 }
 
@@ -661,7 +737,14 @@ fn wall_crossing(flow: &Flow, step: &Step) -> Result<WallCrossing, String> {
 
 fn report(step: &Step, r: &Run) -> Score {
     let experiment = experiment();
-    println!("{} steps, settled: {}", r.steps, r.settled);
+    match r.rule {
+        Some(Settled::Steady { block, x_r, shear }) => println!(
+            "{} steps, settled by the steady rule at block {block}: the last {STEADY_BLOCKS} blocks' x_r spread {x_r:.1e} (< {STEADY_X_R:.0e}), largest floor shear spread {shear:.1e} (< {STEADY_SHEAR:.0e})",
+            r.steps
+        ),
+        Some(Settled::Blocks) => println!("{} steps, settled by the Blocks acceptance", r.steps),
+        None => println!("{} steps, not settled", r.steps),
+    }
     println!(
         "inflow at x = −4 H: Re_θ {:.0} (5000), δ₉₉ {:.2} H (≈ 1.5), U_ref {:.4}, Re_H {:.0}",
         r.inflow.0,
@@ -952,4 +1035,24 @@ fn the_wall_crossing_fits_recover_lines_and_parabolas() {
     assert!((intercept(&line[..2], 1) - 6.2).abs() < 1e-12);
     let parabola: Vec<(f64, f64)> = [1.0, 2.0, 3.0, 4.0].iter().map(|&y| (y / 16.0, 6.2 - 8.0 * y / 16.0 + 30.0 * (y / 16.0) * (y / 16.0))).collect();
     assert!((intercept(&parabola, 2) - 6.2).abs() < 1e-10);
+}
+
+/// The steady rule: five identical blocks pass (a strip at zero shear too), four do not; an x_r
+/// spread or one floor strip's shear spread over its tolerance fails.
+#[test]
+fn the_steady_rule_needs_five_agreeing_blocks_in_x_r_and_every_floor_strip() {
+    let block = |x_r: f64, drift: f64| (x_r, vec![-7.0e-4, 0.0, 3.0e-4 * (1.0 + drift)]);
+    let still: Vec<(f64, Vec<f64>)> = (0..5).map(|_| block(5.7834, 0.0)).collect();
+    assert_eq!(steady(&still), Some((0.0, 0.0)));
+    assert_eq!(steady(&still[..4]), None);
+    let round_off: Vec<(f64, Vec<f64>)> = (0..5).map(|n| block(5.7834 * (1.0 + 1e-8 * n as f64), 1e-7 * n as f64)).collect();
+    assert!(steady(&round_off).is_some_and(|(x, t)| x < 1e-7 && t < 1e-6));
+    let moving: Vec<(f64, Vec<f64>)> = (0..5).map(|n| block(5.7834 * (1.0 + 5e-6 * n as f64), 0.0)).collect();
+    assert_eq!(steady(&moving), None, "x_r spread 2e-5");
+    let drifting: Vec<(f64, Vec<f64>)> = (0..5).map(|n| block(5.7834, 5e-5 * n as f64)).collect();
+    assert_eq!(steady(&drifting), None, "one strip's shear spread 2e-4");
+    // The window is the last five: an older moving block no longer counts.
+    let settled_late: Vec<(f64, Vec<f64>)> = std::iter::once(block(5.0, 0.0)).chain(still).collect();
+    assert_eq!(steady(&settled_late), Some((0.0, 0.0)));
+    assert_eq!(spread(&[0.0, 0.0]), 0.0);
 }
