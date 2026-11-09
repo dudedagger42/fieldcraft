@@ -166,6 +166,9 @@ whose forces are read back (a submission's last). The temperature lattice is two
    samples every step of a run shorter than 10 000 steps (`MAX_HISTORY`), so such a run submits
    one step at a time and reads the forces back after each. A cancel takes effect
    between submissions. A device that does not answer within 120 s fails the solve.
+   While the moving walls ramp (`moving_wall_ramp`) the chunks are two steps long, each step with
+   its own ramp factor, so a ramp of N steps costs about N/2 submissions: about 185 for a 1 ms ramp
+   at 0.5 mm. After the ramp the chunks are 64 steps again.
 6. **Readback**: populations stay on the device; frames (density, velocity, temperature), force and
    heat histories, monitor samples and the stability check come back. The time loop, frames,
    histories and stop rule are the CPU's `run`, driven through the `Backend` trait.
