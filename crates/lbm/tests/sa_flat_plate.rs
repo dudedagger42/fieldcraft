@@ -73,8 +73,10 @@ struct Plate {
     checkpoint: Option<std::path::PathBuf>,
 }
 
-/// Samples between two restart files of a run with [`Plate::checkpoint`].
-const CHECKPOINT_SAMPLES: usize = 10;
+/// Samples between two restart files of a run with [`Plate::checkpoint`]: every sample, so a
+/// reboot costs at most one sample's steps (2000 on the wall-function grid, about half an hour).
+/// The file is rewritten in place, so this costs time, not disk.
+const CHECKPOINT_SAMPLES: usize = 1;
 
 /// One strip's time-mean reading.
 #[derive(Debug, Clone, Copy)]
