@@ -144,6 +144,9 @@ struct Run {
     cp: Vec<(f64, f64)>,
     /// x_r / H from the time-mean floor shear, or why there is none.
     x_r: Result<f64, NoReattachment>,
+    /// A diagnostic beside it, not gated: where u = 0 meets the floor, extrapolated from the first
+    /// rows above it in the final field ([`WallCrossing`]), or why there is none.
+    crossing: Result<WallCrossing, String>,
     /// The reattachment of each completed block's mean floor shear, for the stop rule.
     reattachment: Blocks,
     /// Blocks whose mean floor shear was refused (left out of `reattachment`), and the last refusal.
@@ -490,7 +493,8 @@ impl Step {
         let delta = u.iter().position(|&v| v >= 0.99 * u_ref).map_or(f64::NAN, |k| (k as f64 + 0.5) * h);
         // U_ref in units of the inlet speed (the lattice speeds are scaled by U_lat).
         let u_ref_inlet = u_ref / self.lattice_velocity;
-        Run { cf, cp, x_r, reattachment: blocks, missing, inflow: (u_ref_inlet * theta * self.re_h, delta, u_ref_inlet), steps, settled }
+        let crossing = wall_crossing(&flow, self);
+        Run { cf, cp, x_r, crossing, reattachment: blocks, missing, inflow: (u_ref_inlet * theta * self.re_h, delta, u_ref_inlet), steps, settled }
     }
 }
 
@@ -559,6 +563,102 @@ fn load(path: &std::path::Path, flow: &mut Flow) -> (u64, Vec<Vec<f64>>) {
     (steps, samples)
 }
 
+/// Where u = 0 meets the floor behind the step, from the final field's first four rows above the
+/// wall: a diagnostic reported beside the gated x_r, never gated.
+///
+/// The gated x_r is where the floor's carried shear changes sign. On Han's on-node wall that shear
+/// comes from the node's interior neighbour one cell up, so its sign change is where u = 0 crosses
+/// the row at y = Δ, upstream of where u = 0 meets the wall: near reattachment the u = 0 line
+/// leans downstream towards the wall (about 8 H along per H down on the 16/H SA run). This reads
+/// each row's last negative → non-negative change of u (linear between cell centres) and
+/// extrapolates those crossings to y = 0 four ways; their spread is the sensitivity band. The
+/// field is the last step's, which is the mean for a settled RANS run, not for a scale-resolving
+/// one.
+#[derive(Debug, Clone)]
+struct WallCrossing {
+    /// (y, x) of each row's crossing, in H, y above the wall (Han's wall: the node row's centre).
+    rows: Vec<(f64, f64)>,
+    /// x at y = 0: linear through rows 1–2, 1–3 and 1–4 (least squares), quadratic through 1–4.
+    fits: [f64; 4],
+}
+
+impl WallCrossing {
+    /// The band the fits span.
+    fn range(&self) -> (f64, f64) {
+        self.fits.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), &x| (a.min(x), b.max(x)))
+    }
+}
+
+impl std::fmt::Display for WallCrossing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let rows: Vec<String> = self.rows.iter().map(|(y, x)| format!("y {y:.4}: {x:.3}")).collect();
+        let [l2, l3, l4, q4] = self.fits;
+        let (a, b) = self.range();
+        write!(
+            f,
+            "u = 0 at the floor (diagnostic, not gated): rows {}; at y = 0: linear 1–2 {l2:.3}, 1–3 {l3:.3}, 1–4 {l4:.3}, quadratic 1–4 {q4:.3}; band {a:.3} … {b:.3} H",
+            rows.join(", ")
+        )
+    }
+}
+
+/// The value at 0 of the least-squares polynomial of `degree` (1 or 2) through `(y, x)`.
+fn intercept(points: &[(f64, f64)], degree: usize) -> f64 {
+    let n = degree + 1;
+    // Normal equations A c = r, row j: A_jk = Σ y^(j+k) and r_j = Σ x y^j (the last column),
+    // solved by Gauss–Jordan elimination with partial pivoting.
+    let mut a: Vec<Vec<f64>> = (0..n)
+        .map(|j| {
+            let mut row: Vec<f64> = (0..n).map(|k| points.iter().map(|&(y, _)| y.powi((j + k) as i32)).sum()).collect();
+            row.push(points.iter().map(|&(y, x)| x * y.powi(j as i32)).sum());
+            row
+        })
+        .collect();
+    for c in 0..n {
+        let pivot = (c..n).max_by(|&i, &j| a[i][c].abs().total_cmp(&a[j][c].abs())).unwrap_or(c);
+        a.swap(c, pivot);
+        let p = a[c].clone();
+        if p[c] == 0.0 {
+            continue;
+        }
+        for (r, row) in a.iter_mut().enumerate() {
+            if r != c {
+                let m = row[c] / p[c];
+                row.iter_mut().zip(&p).skip(c).for_each(|(v, q)| *v -= m * q);
+            }
+        }
+    }
+    a[0][n] / a[0][0]
+}
+
+/// The floor's u = 0 crossing behind the step in the final field ([`WallCrossing`]).
+fn wall_crossing(flow: &Flow, step: &Step) -> Result<WallCrossing, String> {
+    let g = flow.grid();
+    let h = step.spacing();
+    let [nx, ny, _] = g.cells;
+    // Cell row k's centre is at z = (k − ½) Δ (the box starts at z = −Δ). The floor's halfway wall
+    // is at z = 0, so its first rows are 1…4 at y = Δ/2 …; Han's wall is the node row 1 at z = Δ/2,
+    // so its first rows are 2…5 at y = Δ … 4Δ.
+    let (first, wall) = if flow.on_node_bounce() { (2, 0.5 * h) } else { (1, 0.0) };
+    let x = |i: usize| -step.upstream + (i as f64 + 0.5) * h;
+    let u = |i: usize, k: usize| (0..ny).filter_map(|j| flow.moments(g.index([i, j, k])).map(|m| m.1[0])).sum::<f64>() / ny as f64;
+    let mut rows = Vec::new();
+    for k in first..first + 4 {
+        let y = (k as f64 - 0.5) * h - wall;
+        let crossing = (0..nx.saturating_sub(1))
+            .rev()
+            .filter(|&i| x(i) > 0.0)
+            .find_map(|i| {
+                let (a, b) = (u(i, k), u(i + 1, k));
+                (a < 0.0 && b >= 0.0).then(|| x(i) + h * a / (a - b))
+            })
+            .ok_or_else(|| format!("no negative → non-negative change of u in the row at y = {y:.4} H"))?;
+        rows.push((y, crossing));
+    }
+    let fits = [intercept(&rows[..2], 1), intercept(&rows[..3], 1), intercept(&rows, 1), intercept(&rows, 2)];
+    Ok(WallCrossing { rows, fits })
+}
+
 fn report(step: &Step, r: &Run) -> Score {
     let experiment = experiment();
     println!("{} steps, settled: {}", r.steps, r.settled);
@@ -570,6 +670,10 @@ fn report(step: &Step, r: &Run) -> Score {
         r.inflow.2 * step.re_h
     );
     println!("x_r from the time-mean floor shear: {:?}", r.x_r);
+    match &r.crossing {
+        Ok(c) => println!("{c}"),
+        Err(why) => println!("u = 0 at the floor: none ({why})"),
+    }
     println!(
         "reattachment blocks: {} ({} refused, last {:?}), mean {:.3} H, 95 % half-width {:.3}, lag-1 {:.2}",
         r.reattachment.means().len(),
@@ -760,17 +864,59 @@ fn driver_seegmiller(step: &Step) -> (Run, Score) {
     (r, score)
 }
 
+/// The SA run's step: the case at `FIELDCRAFT_STEP_CELLS_PER_H` cells per H (16 by default).
+fn sa_step(sa: Turbulence) -> Step {
+    let cells_per_h = std::env::var("FIELDCRAFT_STEP_CELLS_PER_H").ok().and_then(|v| v.parse().ok()).unwrap_or(16);
+    Step { cells_per_h, ..Step::driver_seegmiller(sa, 0.0) }
+}
+
+/// The SA run's model.
+fn sa_rans() -> Turbulence {
+    Turbulence::SpalartAllmaras { prandtl: 0.9, wall_model: Some(WallModel::SpaldingBounce), inflow_ratio: 3.0, ddes: None }
+}
+
+/// The floor's u = 0 crossing ([`WallCrossing`]) in an SA run's restart file
+/// (`FIELDCRAFT_STEP_RESTART`, a copy: a running job rewrites its own), with the floor shear's
+/// sign change after 500 more steps beside it. Seconds:
+/// `FIELDCRAFT_STEP_RESTART=<copy> cargo test --release -p fieldcraft-lbm --test ddes_backstep the_floor_crossing_of_a_restart_file -- --ignored --nocapture`.
+#[test]
+#[ignore = "reads a restart file: FIELDCRAFT_STEP_RESTART"]
+fn the_floor_crossing_of_a_restart_file() {
+    let file = std::path::PathBuf::from(std::env::var("FIELDCRAFT_STEP_RESTART").unwrap());
+    let step = sa_step(sa_rans());
+    let (mut flow, strips, _) = step.build();
+    let (at, samples) = load(&file, &mut flow);
+    println!("{}: step {at}, {} samples", file.display(), samples.len());
+    println!("{}", wall_crossing(&flow, &step).unwrap());
+    // The floor shear's sign change over the next 500 steps, as the run reads it.
+    let h = step.spacing();
+    let floor: Vec<&Strip> = strips.iter().filter(|s| s.floor).collect();
+    let groups: Vec<Vec<usize>> = floor.iter().map(|s| body_groups(&flow, &s.body)).collect();
+    let mut shear = vec![0.0; floor.len()];
+    for _ in 0..500 {
+        flow.step().unwrap();
+        let forces = flow.forces();
+        for (t, g) in shear.iter_mut().zip(&groups) {
+            *t += g.iter().map(|&g| forces.get(g).map_or(f64::NAN, |f| f[0])).sum::<f64>();
+        }
+    }
+    let x: Vec<f64> = floor.iter().map(|s| 0.5 * (s.x.0 + s.x.1)).collect();
+    let per_area: Vec<f64> = shear.iter().zip(&floor).map(|(t, s)| t / ((s.x.1 - s.x.0) / h).round()).collect();
+    println!("the floor shear's sign change over the next 500 steps: {:?}", reattachment(&x, &per_area));
+}
+
 /// Spalart–Allmaras RANS on Han's wall in 2D (one cell of span), the case's grid and inlet: the
 /// first model run toward x_r / H. Hours on 5 threads; `FIELDCRAFT_STEP_CHECKPOINT=<file>` keeps a
-/// restart file there every 2000 steps, and a run started with it resumes from it:
+/// restart file there every 2000 steps, and a run started with it resumes from it;
+/// `FIELDCRAFT_STEP_CELLS_PER_H` refines it (16 by default):
 /// `FIELDCRAFT_THREADS=5 cargo test --release -p fieldcraft-lbm --test ddes_backstep sa_rans_on_han_s_wall -- --ignored --nocapture`.
 #[test]
 #[ignore = "hours: tests/oracle/ddes-backstep-driver-seegmiller/README.md"]
 fn sa_rans_on_han_s_wall_reattaches_where_measured() {
-    let sa = Turbulence::SpalartAllmaras { prandtl: 0.9, wall_model: Some(WallModel::SpaldingBounce), inflow_ratio: 3.0, ddes: None };
+    let sa = sa_rans();
     let steps = std::env::var("FIELDCRAFT_STEP_MAX_STEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(400_000);
     let checkpoint = std::env::var_os("FIELDCRAFT_STEP_CHECKPOINT").map(std::path::PathBuf::from);
-    let (run, score) = driver_seegmiller(&Step { max_steps: steps, checkpoint, ..Step::driver_seegmiller(sa, 0.0) });
+    let (run, score) = driver_seegmiller(&Step { max_steps: steps, checkpoint, ..sa_step(sa) });
     assert!(run.settled && score.passes(), "x_r {:?}, settled {}", run.x_r, run.settled);
 }
 
@@ -793,4 +939,17 @@ fn a_step_run_resumes_from_its_restart_file_bit_for_bit() {
     let bits = |r: &Run| r.cf.iter().map(|(x, c)| (x.to_bits(), c.to_bits())).collect::<Vec<_>>();
     assert_eq!(bits(&resumed), bits(&whole), "the resumed run's shear differs");
     assert_eq!(resumed.reattachment.means(), whole.reattachment.means());
+}
+
+/// The wall-crossing fits: points on a line give its intercept by every fit, points on a parabola
+/// give its intercept by the quadratic fit.
+#[test]
+fn the_wall_crossing_fits_recover_lines_and_parabolas() {
+    let line: Vec<(f64, f64)> = [1.0, 2.0, 3.0, 4.0].iter().map(|&y| (y / 16.0, 6.2 - 8.0 * y / 16.0)).collect();
+    for degree in [1, 2] {
+        assert!((intercept(&line, degree) - 6.2).abs() < 1e-12);
+    }
+    assert!((intercept(&line[..2], 1) - 6.2).abs() < 1e-12);
+    let parabola: Vec<(f64, f64)> = [1.0, 2.0, 3.0, 4.0].iter().map(|&y| (y / 16.0, 6.2 - 8.0 * y / 16.0 + 30.0 * (y / 16.0) * (y / 16.0))).collect();
+    assert!((intercept(&parabola, 2) - 6.2).abs() < 1e-10);
 }
