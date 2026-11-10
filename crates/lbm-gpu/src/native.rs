@@ -923,6 +923,11 @@ impl GpuFlow {
                 "not supported yet on the GPU: the absorbing layer (`absorbing`) at the velocity and pressure faces; solve on the CPU (`backend: \"cpu\"`)".into(),
             ));
         }
+        if flow.wall_nodes().is_some_and(|n| n.law() != fieldcraft_lbm::sa::WallLaw::Spalding) {
+            return Err(Error::Invalid(
+                "not supported yet on the GPU: the Spalart–Allmaras wall law (`wall_model: \"spalart_allmaras_bounce\"`); solve on the CPU (`backend: \"cpu\"`) or use `spalding_bounce`".into(),
+            ));
+        }
         // The Spalart–Allmaras model's parts not on the device yet, and its faces.
         let sa_faces = match flow.spalart_allmaras() {
             None => None,

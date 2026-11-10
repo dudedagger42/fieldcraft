@@ -792,7 +792,12 @@ impl Flow {
         // layer; at an obstacle, the fluid layer next to it. A node with one wall direction has a
         // normal; its links take their roles from its neighbours (`bounce::roles`): Han's eq. 14
         // where its fluid side is whole, bounce-back on every other link to the fluid.
-        let on_node = setup.wall_model == Some(WallModel::SpaldingBounce);
+        let on_node = matches!(setup.wall_model, Some(WallModel::SpaldingBounce | WallModel::SpalartAllmarasBounce));
+        let node_law = if setup.wall_model == Some(WallModel::SpalartAllmarasBounce) {
+            crate::sa::WallLaw::SpalartAllmaras
+        } else {
+            crate::sa::WallLaw::Spalding
+        };
         let mut node_list: Vec<WallNode> = Vec::new();
         let mut bulk = Vec::new();
         // The open-face cells on a wall's node row (a junction, below), which lie on the wall.
@@ -1394,11 +1399,7 @@ impl Flow {
                 let distance = crate::distance::WallDistance::new(&grid, mask, &surface, periodic, &caps)?;
                 let inflow = sa.inflow_ratio * nu;
                 let field = SaField::new(sides, mask.to_vec(), inflow, inflow)?;
-                let law = if on_node {
-                    Some(crate::sa::WallLaw::Spalding)
-                } else {
-                    (setup.wall_model == Some(WallModel::Musker)).then_some(crate::sa::WallLaw::Musker)
-                };
+                let law = if on_node { Some(node_law) } else { (setup.wall_model == Some(WallModel::Musker)).then_some(crate::sa::WallLaw::Musker) };
 
                 let ddes = match sa.c_des {
                     Some(c_des) => Some(DdesState { c_des, length: filled(n, 0.0, "DDES lengths")?, stats: crate::ddes::DdesStats::default() }),
@@ -1429,7 +1430,7 @@ impl Flow {
             walls,
             wall_model: setup.wall_model == Some(WallModel::Musker),
             wall_bounce: setup.wall_model == Some(WallModel::SpaldingBounceHalfway),
-            nodes: on_node.then(|| WallNodes::new(node_list, nu)),
+            nodes: on_node.then(|| WallNodes::new(node_list, nu, node_law)),
             bulk,
             rheology: setup.rheology,
             clamps: Clamps::default(),
@@ -2513,6 +2514,13 @@ impl Flow {
         if let Some(law) = sa.law {
             let mut fixed = Vec::with_capacity(wall.len());
             for &(c, y, ut) in &wall {
+                // The model's own layer has ν̃ = κ u_τ y exactly; another law's ν̃ is the inverse
+                // of ν̃ f_v1 at its eddy viscosity.
+                if law == crate::sa::WallLaw::SpalartAllmaras {
+                    let v = crate::sa::KAPPA * ut * y;
+                    fixed.push((c, if v.is_finite() { v } else { 0.0 }));
+                    continue;
+                }
                 let nu_t = nu * crate::sa::law_eddy_viscosity(law, y * ut / nu)?;
                 fixed.push((c, crate::sa::nu_tilde_for(nu_t, nu)?));
             }

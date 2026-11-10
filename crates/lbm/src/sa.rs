@@ -154,6 +154,9 @@ pub enum WallLaw {
     Spalding,
     /// Musker's profile, as the Musker wall model applies it.
     Musker,
+    /// The model's own constant-stress layer ([`crate::sa_law`]): ν̃ = κ u_τ y at the node, so
+    /// ν_t⁺ = κ y⁺ f_v1(κ y⁺), and the stress of the u⁺ that goes with it.
+    SpalartAllmaras,
 }
 
 /// The law's eddy viscosity ν_t⁺ = dy⁺/du⁺ − 1 at `y_plus`, analytically: Spalding's from its
@@ -181,6 +184,7 @@ pub fn law_eddy_viscosity(law: WallLaw, y_plus: f64) -> crate::Result<f64> {
             let (_, slope) = crate::wall::musker(y_plus);
             if slope > 0.0 { 1.0 / slope - 1.0 } else { 0.0 }
         }
+        WallLaw::SpalartAllmaras => crate::sa_law::eddy_viscosity_plus(y_plus),
     };
     Ok(if out.is_finite() { out } else { 0.0 })
 }
