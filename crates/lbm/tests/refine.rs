@@ -625,3 +625,89 @@ fn the_interface_report_names_the_les_share() {
     eprintln!("interface with DDES: nu_t/nu max {:.2e}, LES share {:?}", report.nu_t_over_nu_max, report.les_share);
     assert!(report.les_share.is_some_and(|s| (0.0..=1.0).contains(&s)));
 }
+
+// ---- a turbulent channel -----------------------------------------------------------------------
+
+/// A channel of 24 coarse cells between walls (y), periodic along x and z, driven by a body force
+/// for Re_τ = 180 at half-height 12 cells, with the Spalart–Allmaras model. Lattice units are
+/// converted to the model's SI ones through dx = 0.05 m and dt = 0.025 s (speeds ×2, viscosity ×0.1,
+/// acceleration ×80).
+fn turbulent_channel() -> Model {
+    let (u_tau, h, re_tau): (f64, f64, f64) = (0.003, 12.0, 180.0);
+    let nu_lat = u_tau * h / re_tau;
+    let g_lat = u_tau * u_tau / h;
+    let mut d = all_periodic([64, 24, 4]);
+    d.faces.y_min = FaceCondition::Wall {};
+    d.faces.y_max = FaceCondition::Wall {};
+    d.acceleration = [g_lat * 80.0, 0.0, 0.0];
+    let sa = Turbulence::SpalartAllmaras { prandtl: 0.9, wall_model: None, inflow_ratio: 3.0, ddes: None };
+    model(1.0, nu_lat * 0.1, d, procedure(Collision::Hrr, Some(sa)))
+}
+
+/// The strip across the turbulent channel, refined against unrefined, both with the model: mean
+/// velocity within 1.5 % of the peak and ν_t within 10 % at the interface columns, and ν̃ not
+/// growing. Prints the interface report.
+#[test]
+#[ignore = "heavy: cargo xtask test --heavy"]
+fn a_turbulent_channel_through_the_strip_matches_the_unrefined_one() {
+    let m = turbulent_channel();
+    let strip = Strip { first: 24, last: 40, linear: true };
+    let build = || Refined::new(&m, None, &[], &Limits::default(), strip).unwrap_or_else(|e| panic!("{e}"));
+    let (mut with, mut without) = (build(), build());
+    let nu = (1.0 / with.coarse().omegas().0 - 0.5) / 3.0;
+    let steps: usize = std::env::var("STUDY_STEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(40000);
+    let g = *with.coarse().grid();
+    let report = |label: &str, with: &Refined, without: &Refined| -> (f64, f64) {
+        let (a, b) = (with.composite_moments(), without.coarse_moments());
+        let (na, nb) = (with.composite_nu_tilde(), without.coarse_nu_tilde());
+        let peak = (0..24).map(|y| b[g.index([10, y, 1])].1[0]).fold(0.0f64, f64::max);
+        let (mut du, mut dn) = (0.0f64, 0.0f64);
+        for x in [10, 20, 23, 24, 30, 40, 41, 50] {
+            let mut cu = 0.0f64;
+            let mut cn = 0.0f64;
+            let nt_max = (0..24).map(|y| fieldcraft_lbm::sa::nu_t(nb[g.index([x, y, 1])], nu)).fold(0.0f64, f64::max);
+            for y in 0..24 {
+                let c = g.index([x, y, 1]);
+                cu = cu.max((a[c].1[0] - b[c].1[0]).abs() / peak);
+                let (ta, tb) = (fieldcraft_lbm::sa::nu_t(na[c], nu), fieldcraft_lbm::sa::nu_t(nb[c], nu));
+                if tb > 0.1 * nt_max {
+                    cn = cn.max((ta - tb).abs() / tb);
+                }
+            }
+            eprintln!("  {label} column {x:2}: velocity {cu:.2e} of the peak {peak:.3e}, nu_t {cn:.2e} (of cells above a tenth of the largest)");
+            du = du.max(cu);
+            if [23, 40].contains(&x) {
+                dn = dn.max(cn);
+            }
+        }
+        let max_nt = nb.iter().cloned().fold(0.0f64, f64::max);
+        let max_nt_w = na.iter().cloned().fold(0.0f64, f64::max);
+        eprintln!("  {label}: largest nu_tilde {max_nt_w:.4e} refined, {max_nt:.4e} unrefined; nu {nu:.3e}");
+        (du, dn)
+    };
+    // Start from a turbulent-looking state: a log-law profile and the matching ν̃, so the run spends
+    // its steps settling, not spinning up.
+    let (u_tau, kappa): (f64, f64) = (0.003, 0.41);
+    for r in [&mut with, &mut without] {
+        r.initialise(&|x| {
+            let d = x[1].min(24.0 - x[1]).max(0.5);
+            let yplus = (d * u_tau / nu).max(1.0);
+            (1.0, [u_tau * (yplus.ln() / kappa + 5.0).min(25.0), 0.0, 0.0])
+        });
+        r.initialise_nu_tilde(&|x| (kappa * u_tau * x[1].min(24.0 - x[1]).max(0.5)).max(3.0 * nu)).unwrap_or_else(|e| panic!("{e}"));
+    }
+    let mut history = Vec::new();
+    for step in 0..steps {
+        with.step().unwrap();
+        without.step_unrefined().unwrap();
+        if step % (steps / 4).max(1) == (steps / 4).max(1) - 1 {
+            eprintln!("step {}", step + 1);
+            history.push(report(&format!("step {}", step + 1), &with, &without));
+        }
+    }
+    if let Some(r) = with.interface_report() {
+        eprintln!("interface: nu_t/nu max {:.3e} mean {:.3e}, LES share {:?}", r.nu_t_over_nu_max, r.nu_t_over_nu_mean, r.les_share);
+    }
+    let (du, dn) = history.last().copied().unwrap_or((1.0, 1.0));
+    assert!(du <= 0.015 && dn <= 0.10, "velocity {du:e} of the peak, nu_t {dn:e}");
+}
