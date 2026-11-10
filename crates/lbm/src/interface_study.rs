@@ -29,9 +29,22 @@ use crate::regularized::rebuild;
 /// Cells per coarse cell along z (the coarse box is one cell thick).
 const NZ_F: usize = 2;
 
+/// The coarse velocity the ghost cells' strain stencil sees at the second fine step.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum TimeMode {
+    /// The coarse velocity of the start of the step (half a coarse step old).
+    Stale,
+    /// Extrapolated linearly in time from the last two coarse steps (covered cells: the current fine average).
+    Linear,
+}
+
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Scheme {
     A,
+    /// A with a conservative linear reconstruction of the crossing populations along the interface
+    /// (the two fine cells of a coarse cell get `f ∓ slope / 4`, the slope from the neighbouring
+    /// coarse cells along y): no smearing across the coarse cell, mass still exact.
+    ALin,
     /// σ = 0 in the first `rows` cells on each side of the interface.
     APrime(usize),
     B,
@@ -193,10 +206,15 @@ pub struct Pair {
     pub scheme: Scheme,
     /// Whether the ghost cells collide too in the second fine step (the question the 1D tests settle).
     pub ghost_collision: bool,
+    pub time: TimeMode,
     pub sigma: f64,
     omega_c: f64,
     omega_f: f64,
     uc: Vec<[f64; 3]>,
+    uc_prev: Vec<[f64; 3]>,
+    /// The coarse velocity the ghost interpolation reads.
+    ug: Vec<[f64; 3]>,
+    started: bool,
     uf: Vec<[f64; 3]>,
     /// ρ and u of the interface cells at the collision, `[side][y]`.
     edge: [Vec<(f64, [f64; 3])>; 2],
@@ -247,6 +265,10 @@ impl Pair {
             omega_c,
             omega_f,
             uc: vec![[0.0; 3]; nc],
+            uc_prev: vec![[0.0; 3]; nc],
+            ug: vec![[0.0; 3]; nc],
+            started: false,
+            time: TimeMode::Linear,
             uf: vec![[0.0; 3]; nf],
             edge: [vec![(1.0, [0.0; 3]); nyc], vec![(1.0, [0.0; 3]); nyc]],
         }
@@ -290,7 +312,7 @@ impl Pair {
             for (dy, wy) in [(0isize, 1.0 - ty), (1, ty)] {
                 let x = (x0 as isize + dx).rem_euclid(self.c.nx as isize) as usize;
                 let y = (y0 as isize + dy).rem_euclid(ny) as usize;
-                let u = self.uc[self.c.at(x, y, 0)];
+                let u = self.ug[self.c.at(x, y, 0)];
                 for a in 0..3 {
                     out[a] += wx * wy * u[a];
                 }
@@ -299,7 +321,44 @@ impl Pair {
         out
     }
 
-    fn refresh_fine(&mut self) {
+    /// The velocity of a covered coarse cell: the average of the fine cells in it.
+    fn covered_u(&self, x: usize, y: usize) -> [f64; 3] {
+        let mut s = [0.0; 3];
+        for dz in 0..NZ_F {
+            for dy in 0..2 {
+                for dx in 0..2 {
+                    let u = macros(&self.f.f[self.f.at(2 * (x - (self.ia - 1)) + dx, 2 * y + dy, dz)]).1;
+                    for a in 0..3 {
+                        s[a] += u[a] / 8.0;
+                    }
+                }
+            }
+        }
+        s
+    }
+
+    /// The coarse velocity the ghosts read: at the second fine step (`half`) with `Linear`, the
+    /// coarse state half a step on (a linear extrapolation of the active cells, the current fine
+    /// average in the covered ones).
+    fn refresh_ghost_source(&mut self, half: bool) {
+        self.ug.clone_from(&self.uc);
+        if half && self.time == TimeMode::Linear {
+            for y in 0..self.c.ny {
+                for x in 0..self.c.nx {
+                    let i = self.c.at(x, y, 0);
+                    self.ug[i] = if self.covered(x) {
+                        self.covered_u(x, y)
+                    } else {
+                        let (n, o) = (self.uc[i], self.uc_prev[i]);
+                        [n[0] + 0.5 * (n[0] - o[0]), n[1] + 0.5 * (n[1] - o[1]), n[2] + 0.5 * (n[2] - o[2])]
+                    };
+                }
+            }
+        }
+    }
+
+    fn refresh_fine(&mut self, half: bool) {
+        self.refresh_ghost_source(half);
         for z in 0..self.f.nz {
             for y in 0..self.f.ny {
                 for x in 0..self.f.nx {
@@ -317,26 +376,18 @@ impl Pair {
     }
 
     fn refresh_coarse(&mut self) {
+        if self.started {
+            self.uc_prev.clone_from(&self.uc);
+        }
         for y in 0..self.c.ny {
             for x in 0..self.c.nx {
                 let i = self.c.at(x, y, 0);
-                self.uc[i] = if self.covered(x) {
-                    let mut s = [0.0; 3];
-                    for dz in 0..NZ_F {
-                        for dy in 0..2 {
-                            for dx in 0..2 {
-                                let u = macros(&self.f.f[self.f.at(2 * (x - (self.ia - 1)) + dx, 2 * y + dy, dz)]).1;
-                                for a in 0..3 {
-                                    s[a] += u[a] / 8.0;
-                                }
-                            }
-                        }
-                    }
-                    s
-                } else {
-                    macros(&self.c.f[i]).1
-                };
+                self.uc[i] = if self.covered(x) { self.covered_u(x, y) } else { macros(&self.c.f[i]).1 };
             }
+        }
+        if !self.started {
+            self.uc_prev.clone_from(&self.uc);
+            self.started = true;
         }
     }
 
@@ -355,8 +406,8 @@ impl Pair {
         }
     }
 
-    fn collide_fine(&mut self) {
-        self.refresh_fine();
+    fn collide_fine(&mut self, half: bool) {
+        self.refresh_fine(half);
         let mut out = [0.0; Q];
         for z in 0..self.f.nz {
             for y in 0..self.f.ny {
@@ -411,12 +462,15 @@ impl Pair {
                 let (r, u) = macros(&a);
                 self.edge[side][y] = (r, u);
                 let g = self.transform(&a, r, u, self.post_ratio(), inbound);
+                let ny = self.c.ny;
+                let (up, dn) = (self.c.f[self.c.at(xa, (y + 1) % ny, 0)], self.c.f[self.c.at(xa, (y + ny - 1) % ny, 0)]);
                 for dz in 0..NZ_F {
                     for dy in 0..2 {
                         for dx in 0..2 {
                             let i = self.f.at(xf0 + dx, 2 * y + dy, dz);
+                            let offset = if dy == 0 { -0.25 } else { 0.25 };
                             for q in (0..Q).filter(|&q| inbound(q)) {
-                                self.f.f[i][q] = g[q];
+                                self.f.f[i][q] = if self.scheme == Scheme::ALin { g[q] + offset * 0.5 * (up[q] - dn[q]) } else { g[q] };
                             }
                         }
                     }
@@ -499,11 +553,11 @@ impl Pair {
     /// One coarse step (two fine steps).
     pub fn step(&mut self) {
         self.collide_coarse();
-        self.collide_fine();
+        self.collide_fine(false);
         self.fill_ghosts();
         self.stream_coarse();
         self.stream_fine();
-        self.collide_fine();
+        self.collide_fine(true);
         self.stream_fine();
         self.restrict();
     }
@@ -556,7 +610,8 @@ mod tests {
     fn sigma() -> f64 {
         std::env::var("STUDY_SIGMA").ok().and_then(|v| v.parse().ok()).unwrap_or(0.95)
     }
-    const SCHEMES: [(&str, Scheme); 4] = [("A", Scheme::A), ("A'1", Scheme::APrime(1)), ("A'2", Scheme::APrime(2)), ("B", Scheme::B)];
+    const SCHEMES: [(&str, Scheme); 5] =
+        [("A", Scheme::A), ("ALin", Scheme::ALin), ("A'1", Scheme::APrime(1)), ("A'2", Scheme::APrime(2)), ("B", Scheme::B)];
 
     /// A Gaussian density pulse in a pseudo-1D box (coarse units).
     fn pulse(amp: f64) -> impl Fn(f64, f64) -> (f64, [f64; 3]) {
@@ -623,77 +678,82 @@ mod tests {
         (2.0 * (c * c + s * s).sqrt() / n, s.atan2(c))
     }
 
-    /// The convected shear wave crossing the strip normally (flow along x) and parallel (flow along y).
+    /// The convected shear wave crossing the strip normally (flow along x) and parallel (flow along
+    /// y): the extra error of each interface treatment over a coarse-only box, against a uniform fine
+    /// box (amplitude change as a share of the reference amplitude, phase, the spurious velocity of
+    /// the flow component as a share of the wave amplitude, and the density error).
     #[test]
     #[ignore = "study: cargo test -p fieldcraft-lbm --release interface_study -- --ignored --nocapture"]
     fn the_shear_wave_crosses_the_interface() {
         let (a, u0) = (5e-3, 0.05);
-        let tau = 2.0 * std::f64::consts::PI;
+        let two_pi = 2.0 * std::f64::consts::PI;
+        let steps = 900;
+        let taus: Vec<f64> = match std::env::var("STUDY_TAU") {
+            Ok(v) => v.split(',').filter_map(|t| t.parse().ok()).collect(),
+            Err(_) => vec![2.4e-4, 1e-3, 1e-2],
+        };
+        let lambdas: Vec<usize> = match std::env::var("STUDY_LAMBDA") {
+            Ok(v) => v.split(',').filter_map(|t| t.parse().ok()).collect(),
+            Err(_) => vec![16, 32],
+        };
         for normal in [true, false] {
-            // Normal: u = (U, a sin(kx)), wave along x, box 64 x 4. Parallel: u = (a sin(ky), U), box 64 x 16.
-            let (nxc, nyc) = if normal { (64, 4) } else { (64, 16) };
-            let init = move |x: f64, y: f64| -> (f64, [f64; 3]) {
-                if normal { (1.0, [u0, a * (tau * x / 16.0).sin(), 0.0]) } else { (1.0, [a * (tau * y / 16.0).sin(), u0, 0.0]) }
-            };
-            let steps = 900;
-            let mut r = Uniform::new(2 * nxc, 2 * nyc, NZ_F, 2.0 * tau_half(), sigma(), init, 0.5);
-            for _ in 0..2 * steps {
-                r.step();
-            }
-            let rc = r.coarsened(2);
-            // The wave component and the profile it is read along.
-            let read = |f: &[(f64, [f64; 3])]| -> (f64, f64, f64, f64) {
-                let (mut v, comp, n, m) = if normal { (vec![0.0; nxc], 1, nxc, 4) } else { (vec![0.0; nyc], 0, nyc, 1) };
-                for y in 0..nyc {
-                    for x in 0..nxc {
-                        let i = if normal { x } else { y };
-                        v[i] += f[y * nxc + x].1[comp] / if normal { nyc as f64 } else { nxc as f64 };
+            for &lambda in &lambdas {
+                for &tau in &taus {
+                    let (nxc, nyc) = if normal { (64, 4) } else { (64, lambda) };
+                    let lam = lambda as f64;
+                    let init = move |x: f64, y: f64| -> (f64, [f64; 3]) {
+                        if normal { (1.0, [u0, a * (two_pi * x / lam).sin(), 0.0]) } else { (1.0, [a * (two_pi * y / lam).sin(), u0, 0.0]) }
+                    };
+                    // The wave component averaged along the wave's crests, its Fourier mode, and the flow component's departure from U.
+                    let read = |f: &[(f64, [f64; 3])]| -> (f64, f64, f64, f64) {
+                        let (mut v, comp, m) = if normal { (vec![0.0; nxc], 1, 64 / lambda) } else { (vec![0.0; nyc], 0, 1) };
+                        for y in 0..nyc {
+                            for x in 0..nxc {
+                                let i = if normal { x } else { y };
+                                v[i] += f[y * nxc + x].1[comp] / if normal { nyc as f64 } else { nxc as f64 };
+                            }
+                        }
+                        let (amp, ph) = mode(&v, m);
+                        let spur = f.iter().map(|(_, u)| (u[if normal { 0 } else { 1 }] - u0).abs()).fold(0.0f64, f64::max);
+                        let rho = f.iter().map(|(r, _)| (r - 1.0).abs()).fold(0.0f64, f64::max);
+                        (amp, ph, spur, rho)
+                    };
+                    let mut r = Uniform::new(2 * nxc, 2 * nyc, NZ_F, 2.0 * tau, 0.95, init, 0.5);
+                    for _ in 0..2 * steps {
+                        r.step();
+                    }
+                    let (ra, rp, _, _) = read(&r.coarsened(2));
+                    let mut b = Uniform::new(nxc, nyc, 1, tau, 0.95, init, 1.0);
+                    for _ in 0..steps {
+                        b.step();
+                    }
+                    let (ba, bp, _, _) = read(&b.coarsened(1));
+                    println!(
+                        "{} lambda {lambda} tau-1/2 {tau:.1e}: reference amp {ra:.3e}; coarse-only box: amp {:+.2}% phase {:+.4}",
+                        if normal { "normal  " } else { "parallel" },
+                        100.0 * (ba - ra) / ra,
+                        bp - rp
+                    );
+                    for (name, scheme) in SCHEMES {
+                        for time in [TimeMode::Stale, TimeMode::Linear] {
+                            let mut p = Pair::new(nxc, nyc, 24, 40, tau, 0.95, scheme, init);
+                            p.time = time;
+                            let m0 = p.mass();
+                            for _ in 0..steps {
+                                p.step();
+                            }
+                            let (pa, pp, ps, pr) = read(&p.composite());
+                            println!(
+                                "    {name:5} {:6} extra amp {:+.2}%  phase {:+.4}  spurious {:.1}% of a  drho {pr:.1e}  mass {:.0e}",
+                                format!("{time:?}"),
+                                100.0 * (pa - ba) / ra,
+                                pp - bp,
+                                100.0 * ps / a,
+                                (p.mass() - m0) / m0
+                            );
+                        }
                     }
                 }
-                let (amp, ph) = mode(&v, m);
-                let other = f.iter().map(|(_, u)| (u[if normal { 0 } else { 1 }] - u0).abs()).fold(0.0f64, f64::max);
-                let rho = f.iter().map(|(r, _)| (r - 1.0).abs()).fold(0.0f64, f64::max);
-                let _ = n;
-                (amp, ph, other, rho)
-            };
-            let (ra, rp, ro, rr) = read(&rc);
-            println!(
-                "{} flow: reference amp {:.3e} phase {rp:.3} (spurious |du_flow| {ro:.1e}, |drho| {rr:.1e})",
-                if normal { "normal  " } else { "parallel" },
-                ra
-            );
-            {
-                let mut b = Uniform::new(nxc, nyc, 1, tau_half(), sigma(), init, 1.0);
-                for _ in 0..steps {
-                    b.step();
-                }
-                let bc = b.coarsened(1);
-                let (ba, bp, bo, br) = read(&bc);
-                let l2 = bc.iter().zip(&rc).map(|(x, y)| (x.1[0] - y.1[0]).powi(2) + (x.1[1] - y.1[1]).powi(2)).sum::<f64>().sqrt()
-                    / (rc.len() as f64).sqrt()
-                    / a;
-                println!(
-                    "  coarse-only (no strip) amp ratio {:.4} phase diff {:+.4} rad  spurious |du_flow| {bo:.1e} |drho| {br:.1e}  L2(du)/a {l2:.3}",
-                    ba / ra,
-                    bp - rp
-                );
-            }
-            for (name, scheme) in SCHEMES {
-                let mut p = Pair::new(nxc, nyc, 24, 40, tau_half(), sigma(), scheme, init);
-                let m0 = p.mass();
-                for _ in 0..steps {
-                    p.step();
-                }
-                let (pa, pp, po, pr) = read(&p.composite());
-                let l2 = p.composite().iter().zip(&rc).map(|(x, y)| (x.1[0] - y.1[0]).powi(2) + (x.1[1] - y.1[1]).powi(2)).sum::<f64>().sqrt()
-                    / (rc.len() as f64).sqrt()
-                    / a;
-                println!(
-                    "  {name:5} amp ratio {:.4} phase diff {:+.4} rad  spurious |du_flow| {po:.1e} |drho| {pr:.1e}  L2(du)/a {l2:.3}  mass drift {:.1e}",
-                    pa / ra,
-                    pp - rp,
-                    (p.mass() - m0) / m0
-                );
             }
         }
     }
