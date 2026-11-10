@@ -879,3 +879,49 @@ fn turbulent_channel_job_report() {
     std::fs::write(out.join("results.txt"), lines.join("\n") + "\n").unwrap_or_else(|e| panic!("{e}"));
     eprintln!("{}", lines.join("\n"));
 }
+
+/// A strip across y or z is the strip across x turned: the closed box (walls on every face, a
+/// body force and a velocity that has a component along each axis) with its axes permuted gives
+/// the same composite field and the same mass, to round-off, and the mass stays exact.
+#[test]
+fn a_strip_across_y_or_z_is_the_x_strip_turned() {
+    let base = closed_box();
+    let mut reference = refined(base.clone(), STRIP).unwrap_or_else(|e| panic!("{e}"));
+    for _ in 0..300 {
+        reference.step().unwrap();
+    }
+    let (cm, cg, reference_mass) = (reference.composite_moments(), *reference.coarse().grid(), reference.mass());
+    for axis in [1usize, 2] {
+        let perm = if axis == 1 { [1, 2, 0] } else { [2, 0, 1] };
+        let mut d = base.clone();
+        for (i, &a) in perm.iter().enumerate() {
+            d.min[a] = base.min[i];
+            d.max[a] = base.max[i];
+            d.initial_velocity[a] = base.initial_velocity[i];
+            d.acceleration[a] = base.acceleration[i];
+        }
+        let mut r = Refined::new_along(&box_model(d, procedure(Collision::Hrr, None)), None, &[], &Limits::default(), STRIP, axis)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let m0 = r.mass();
+        assert!((m0 - reference_mass).abs() < 1e-9 * m0);
+        for _ in 0..300 {
+            r.step().unwrap();
+        }
+        assert!(((r.mass() - m0) / m0).abs() <= 1e-10, "axis {axis}: mass drift");
+        let (tm, tg) = (r.composite_moments(), *r.coarse().grid());
+        let mut worst = 0.0f64;
+        for (cell, a) in cm.iter().enumerate() {
+            let l = cg.coords(cell);
+            let mut p = [0; 3];
+            for (i, &a) in perm.iter().enumerate() {
+                p[a] = l[i];
+            }
+            let b = tm[tg.index(p)];
+            worst = worst.max((a.0 - b.0).abs());
+            for (c, &pc) in perm.iter().enumerate() {
+                worst = worst.max((a.1[c] - b.1[pc]).abs());
+            }
+        }
+        assert!(worst <= 1e-12, "axis {axis}: the turned strip differs from the x strip by {worst:e}");
+    }
+}

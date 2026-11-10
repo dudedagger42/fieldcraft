@@ -1,5 +1,7 @@
 //! Local grid refinement: a fine strip across a coarse flow (ratio 2, acoustic scaling).
 //!
+//! (Written for a strip across x; a strip across y or z is the same code on permuted axes: `perm`.)
+//!
 //! The coarse flow is an ordinary [`Flow`] over the whole box. A strip of coarse columns
 //! `first..last` (all of y and z) is refined by 2: the fine flow is a second [`Flow`] over those
 //! columns plus one coarse column on each side (its ghost cells), periodic along x, with the same
@@ -52,7 +54,7 @@
 //! refused.
 //!
 //! # Not supported yet
-//! One strip with interfaces normal to x, spanning the box in y and z; the hybrid recursive
+//! One strip with interfaces normal to one box axis ([`Refined::new_along`]; x for [`Refined::new`]), spanning the box in the other two; the hybrid recursive
 //! regularised or regularised collision with no eddy-viscosity model but Spalart–Allmaras (also
 //! with DDES; a Smagorinsky constant below 1e-3 is allowed: it is how a low τ is admitted); no heat, free surface, porous zone, fan,
 //! absorbing layer, moving wall or obstacle surface condition; no wall-function bounce. Each is
@@ -87,6 +89,9 @@ pub struct Refined {
     coarse: Flow,
     fine: Flow,
     strip: Strip,
+    /// Local axis `i` (0: across the strip) is box axis `perm[i]`; the cell counts and every index
+    /// below are local, only the public accessors are in box order.
+    perm: [usize; 3],
     /// The coarse cell counts and the fine ones.
     nc: [usize; 3],
     nf: [usize; 3],
@@ -144,17 +149,42 @@ fn refuse<T>(what: &str) -> Result<T> {
     Err(Error::Invalid(format!("not supported yet in a refined flow: {what}")))
 }
 
-impl Strip {
-    /// Whether the interface populations of the coarse column on `side` (0: `first − 1`, 1: `last`)
-    /// point into the strip.
-    fn into_strip(side: usize, q: usize) -> bool {
-        if side == 0 { C[q][0] > 0 } else { C[q][0] < 0 }
+/// Component `i` (0: across the strip, 1 and 2: along its faces) of lattice direction `q`, with
+/// `perm[i]` the box axis that local axis `i` is.
+fn cdir(perm: [usize; 3], q: usize, i: usize) -> i32 {
+    perm.get(i).and_then(|&a| C[q].get(a)).copied().unwrap_or(0)
+}
+
+/// Whether the interface populations of the coarse layer on `side` (0: `first − 1`, 1: `last`)
+/// point into the strip.
+fn into_strip(perm: [usize; 3], side: usize, q: usize) -> bool {
+    if side == 0 { cdir(perm, q, 0) > 0 } else { cdir(perm, q, 0) < 0 }
+}
+
+/// The two faces of the box along `axis`.
+fn faces_along(faces: &fieldcraft_model::BoxFaces, axis: usize) -> [&FaceCondition; 2] {
+    match axis {
+        0 => [&faces.x_min, &faces.x_max],
+        1 => [&faces.y_min, &faces.y_max],
+        _ => [&faces.z_min, &faces.z_max],
     }
 }
 
 impl Refined {
     /// Build the coarse flow of `model`'s fluid step and the fine strip over it.
     pub fn new(model: &Model, step: Option<&str>, obstacles: &[Obstacle], limits: &Limits, strip: Strip) -> Result<Refined> {
+        Refined::new_along(model, step, obstacles, limits, strip, 0)
+    }
+
+    /// As [`Refined::new`], the strip's interfaces normal to box axis `axis` (0: x, 1: y, 2: z), the
+    /// strip spanning the box in the other two.
+    pub fn new_along(model: &Model, step: Option<&str>, obstacles: &[Obstacle], limits: &Limits, strip: Strip, axis: usize) -> Result<Refined> {
+        let perm = match axis {
+            0 => [0, 1, 2],
+            1 => [1, 2, 0],
+            2 => [2, 0, 1],
+            _ => return Err(Error::Invalid(format!("the strip axis {axis} is not 0, 1 or 2"))),
+        };
         let (s, domain) = fluid_step(model, step)?;
         let Procedure::Fluid { domain: domain_name, steps, time_step, collision, turbulence, steady, .. } = &s.procedure else {
             return refuse("a step that is not a fluid step");
@@ -192,9 +222,11 @@ impl Refined {
         if domain.moving_wall_ramp.is_some() {
             return refuse("a moving wall");
         }
-        for face in [&domain.faces.y_min, &domain.faces.y_max, &domain.faces.z_min, &domain.faces.z_max] {
-            if matches!(face, FaceCondition::MovingWall { .. }) {
-                return refuse("a moving face along y or z");
+        for axis in [perm[1], perm[2]] {
+            for face in faces_along(&domain.faces, axis) {
+                if matches!(face, FaceCondition::MovingWall { .. }) {
+                    return refuse("a moving face along the strip");
+                }
             }
         }
         let (coarse_setup, coarse) = {
@@ -209,7 +241,8 @@ impl Refined {
         if coarse.on_node_bounce() {
             return refuse("the on-node wall-function bounce");
         }
-        let nc = coarse_setup.grid.cells;
+        let loc = |p: [usize; 3]| [p[perm[0]], p[perm[1]], p[perm[2]]];
+        let nc = loc(coarse_setup.grid.cells);
         let Strip { first, last, .. } = strip;
         if first < 3 || last.saturating_add(3) > nc[0] {
             return Err(Error::Invalid(format!(
@@ -223,11 +256,14 @@ impl Refined {
         // The fine model: the strip and a ghost column on each side, half the spacing and time step.
         let dx = domain.spacing;
         let mut fine_domain = domain.clone();
-        fine_domain.min[0] = domain.min[0] + (first - 1) as f64 * dx;
-        fine_domain.max[0] = domain.min[0] + (last + 1) as f64 * dx;
+        fine_domain.min[perm[0]] = domain.min[perm[0]] + (first - 1) as f64 * dx;
+        fine_domain.max[perm[0]] = domain.min[perm[0]] + (last + 1) as f64 * dx;
         fine_domain.spacing = dx / RATIO as f64;
-        fine_domain.faces.x_min = FaceCondition::Periodic {};
-        fine_domain.faces.x_max = FaceCondition::Periodic {};
+        match perm[0] {
+            0 => (fine_domain.faces.x_min, fine_domain.faces.x_max) = (FaceCondition::Periodic {}, FaceCondition::Periodic {}),
+            1 => (fine_domain.faces.y_min, fine_domain.faces.y_max) = (FaceCondition::Periodic {}, FaceCondition::Periodic {}),
+            _ => (fine_domain.faces.z_min, fine_domain.faces.z_max) = (FaceCondition::Periodic {}, FaceCondition::Periodic {}),
+        }
         let mut fine_model = model.clone();
         fine_model.replace_fluid_domain(domain_name, fine_domain)?;
         let mut fine_step = s.clone();
@@ -238,18 +274,16 @@ impl Refined {
         fine_model.replace_step(fine_step)?;
         let fine_setup = Setup::new(&fine_model, step, obstacles, limits)?;
         let fine = Flow::new(&fine_setup, obstacles)?;
-        let nf = fine_setup.grid.cells;
+        let nf = loc(fine_setup.grid.cells);
         if nf != [RATIO * (last - first + 2), RATIO * nc[1], RATIO * nc[2]] {
             return Err(Error::Invalid(format!("the fine grid {nf:?} does not cover the strip {first}..{last} of the coarse grid {nc:?}")));
         }
-        let periodic = [
-            matches!(domain.faces.y_min, FaceCondition::Periodic {}) && matches!(domain.faces.y_max, FaceCondition::Periodic {}),
-            matches!(domain.faces.z_min, FaceCondition::Periodic {}) && matches!(domain.faces.z_max, FaceCondition::Periodic {}),
-        ];
+        let periodic = [perm[1], perm[2]].map(|a| faces_along(&domain.faces, a).iter().all(|f| matches!(f, FaceCondition::Periodic {})));
         let mut refined = Refined {
             coarse,
             fine,
             strip,
+            perm,
             nc,
             nf,
             periodic,
@@ -268,6 +302,44 @@ impl Refined {
         Ok(refined)
     }
 
+    /// Box coordinates of a local cell, and local ones of a box cell.
+    fn nat(&self, l: [usize; 3]) -> [usize; 3] {
+        let mut p = [0; 3];
+        for (i, &a) in self.perm.iter().enumerate() {
+            p[a] = l[i];
+        }
+        p
+    }
+
+    fn loc(&self, p: [usize; 3]) -> [usize; 3] {
+        [p[self.perm[0]], p[self.perm[1]], p[self.perm[2]]]
+    }
+
+    /// The coarse and the fine cell at local coordinates.
+    fn cidx(&self, l: [usize; 3]) -> usize {
+        self.coarse.grid().index(self.nat(l))
+    }
+
+    fn fidx(&self, l: [usize; 3]) -> usize {
+        self.fine.grid().index(self.nat(l))
+    }
+
+    /// The position in coarse cells, in box order, of a fine cell centre given by its box coordinates
+    /// (the fine grid starts at the interface layer `first − 1`, in half cells).
+    fn position(&self, fine: [usize; 3]) -> [f64; 3] {
+        let l = self.loc(fine);
+        let x = [
+            (self.strip.first - 1) as f64 + (l[0] as f64 + 0.5) / RATIO as f64,
+            (l[1] as f64 + 0.5) / RATIO as f64,
+            (l[2] as f64 + 0.5) / RATIO as f64,
+        ];
+        let mut p = [0.0; 3];
+        for (i, &a) in self.perm.iter().enumerate() {
+            p[a] = x[i];
+        }
+        p
+    }
+
     fn clear_ghosts(&mut self) {
         for (cell, _) in self.save_ghosts() {
             self.fine.set_cell_populations(cell, &[0.0; Q]);
@@ -281,7 +353,7 @@ impl Refined {
         for x in [first - 2, first - 1, last, last + 1] {
             for z in 0..nz {
                 for y in 0..ny {
-                    if !self.coarse.is_fluid(self.coarse.grid().index([x, y, z])) {
+                    if !self.coarse.is_fluid(self.cidx([x, y, z])) {
                         return Err(Error::Invalid(format!(
                             "coarse cell ({x}, {y}, {z}) next to the interface is not a fluid cell: the interface must lie in open fluid, at least 2 coarse cells from a solid"
                         )));
@@ -293,7 +365,7 @@ impl Refined {
         for x in (0..4).chain(nxf - 4..nxf) {
             for z in 0..self.nf[2] {
                 for y in 0..self.nf[1] {
-                    if !self.fine.is_fluid(self.fine.grid().index([x, y, z])) {
+                    if !self.fine.is_fluid(self.fidx([x, y, z])) {
                         return Err(Error::Invalid(format!(
                             "fine cell ({x}, {y}, {z}) next to the interface is not a fluid cell: the interface must lie in open fluid"
                         )));
@@ -340,13 +412,10 @@ impl Refined {
             }
         }
         self.coarse.sa_impose(&c)?;
-        let offset = (self.strip.first - 1) as f64;
         let mut f = Vec::new();
         for cell in 0..self.fine.grid().len() {
             if self.fine.is_fluid(cell) {
-                let p = self.fine.grid().coords(cell);
-                let x = [offset + (p[0] as f64 + 0.5) / RATIO as f64, (p[1] as f64 + 0.5) / RATIO as f64, (p[2] as f64 + 0.5) / RATIO as f64];
-                f.push((cell, RATIO as f64 * value(x)));
+                f.push((cell, RATIO as f64 * value(self.position(self.fine.grid().coords(cell)))));
             }
         }
         self.fine.sa_impose(&f)
@@ -358,13 +427,13 @@ impl Refined {
         let g = self.coarse.grid();
         (0..g.len())
             .map(|cell| {
-                let [x, y, z] = g.coords(cell);
+                let [x, y, z] = self.loc(g.coords(cell));
                 if !(first..last).contains(&x) {
                     return self.coarse.sa_value(cell).unwrap_or(0.0);
                 }
                 let mut sum = 0.0;
                 for k in 0..8 {
-                    let fc = self.fine.grid().index([RATIO * (x - (first - 1)) + k % 2, RATIO * y + (k / 2) % 2, RATIO * z + k / 4]);
+                    let fc = self.fidx([RATIO * (x - (first - 1)) + k % 2, RATIO * y + (k / 2) % 2, RATIO * z + k / 4]);
                     sum += self.fine.sa_value(fc).unwrap_or(0.0);
                 }
                 sum / 8.0 / RATIO as f64
@@ -393,7 +462,7 @@ impl Refined {
     /// column on `side` (the ghost cells of that side).
     fn ghost(&self, side: usize, y: usize, z: usize, d: [usize; 3]) -> usize {
         let x0 = if side == 0 { 0 } else { self.nf[0] - RATIO };
-        self.fine.grid().index([x0 + d[0], RATIO * y + d[1], RATIO * z + d[2]])
+        self.fidx([x0 + d[0], RATIO * y + d[1], RATIO * z + d[2]])
     }
 
     /// Whether the neighbour of coarse cell `(y, z)` along `(cy, cz)` exists: inside the box, or
@@ -414,7 +483,7 @@ impl Refined {
         for z in 0..nz {
             for y in 0..ny {
                 for x in first..last {
-                    let cell = self.coarse.grid().index([x, y, z]);
+                    let cell = self.cidx([x, y, z]);
                     if !self.coarse.is_fluid(cell) {
                         continue;
                     }
@@ -422,7 +491,7 @@ impl Refined {
                     for dz in 0..RATIO {
                         for dy in 0..RATIO {
                             for dx in 0..RATIO {
-                                let fc = self.fine.grid().index([RATIO * (x - (first - 1)) + dx, RATIO * y + dy, RATIO * z + dz]);
+                                let fc = self.fidx([RATIO * (x - (first - 1)) + dx, RATIO * y + dy, RATIO * z + dz]);
                                 if !self.fine.is_fluid(fc) {
                                     continue;
                                 }
@@ -460,7 +529,7 @@ impl Refined {
                 let mut v = Vec::with_capacity(ny * nz);
                 for z in 0..nz {
                     for y in 0..ny {
-                        v.push(moments_of(&self.coarse.cell_populations(self.coarse.grid().index([x, y, z]))));
+                        v.push(moments_of(&self.coarse.cell_populations(self.cidx([x, y, z]))));
                     }
                 }
                 v
@@ -481,7 +550,7 @@ impl Refined {
                 let mut v = Vec::with_capacity(ny * nz);
                 for z in 0..nz {
                     for y in 0..ny {
-                        v.push(self.coarse.sa_value(self.coarse.grid().index([x, y, z])).unwrap_or(0.0));
+                        v.push(self.coarse.sa_value(self.cidx([x, y, z])).unwrap_or(0.0));
                     }
                 }
                 v
@@ -569,7 +638,7 @@ impl Refined {
                     for dx in 0..RATIO {
                         let xf = if side == 0 { dx } else { self.nf[0] - RATIO + dx };
                         let (rho, u) = self.interpolate(side, dx, yf, zf);
-                        let cell = self.fine.grid().index([xf, yf, zf]);
+                        let cell = self.fidx([xf, yf, zf]);
                         self.fine.set_cell_populations(cell, &equilibrium(rho, u));
                         if self.sa {
                             let nu = self.interpolate_nu_tilde(side, dx, yf, zf, later);
@@ -589,7 +658,14 @@ impl Refined {
         let linear = self.strip.linear;
         for side in 0..2 {
             let xa = self.interface_column(side);
-            let at = |y: usize, z: usize| self.coarse.grid().index([xa, y, z]);
+            let (g, perm) = (*self.coarse.grid(), self.perm);
+            let at = move |y: usize, z: usize| {
+                let mut p = [0; 3];
+                for (i, &a) in perm.iter().enumerate() {
+                    p[a] = [xa, y, z][i];
+                }
+                g.index(p)
+            };
             for z in 0..nz {
                 for y in 0..ny {
                     let a = self.coarse.cell_populations(at(y, z));
@@ -620,7 +696,7 @@ impl Refined {
                     };
                     let sy = if linear { slope(y.checked_sub(1).map(|y| at(y, z)), (y + 1 < ny).then(|| at(y + 1, z))) } else { [0.0; Q] };
                     let sz = if linear { slope(z.checked_sub(1).map(|z| at(y, z)), (z + 1 < nz).then(|| at(y, z + 1))) } else { [0.0; Q] };
-                    let sent: Vec<usize> = (0..Q).filter(|&q| Strip::into_strip(side, q)).collect();
+                    let sent: Vec<usize> = (0..Q).filter(|&q| into_strip(self.perm, side, q)).collect();
                     for dz in 0..RATIO {
                         for dy in 0..RATIO {
                             let (oy, oz) = (if dy == 0 { -0.25 } else { 0.25 }, if dz == 0 { -0.25 } else { 0.25 });
@@ -636,7 +712,9 @@ impl Refined {
                             for &q in &sent {
                                 let behind =
                                     |i: i64, c: i32, n: usize, periodic: bool| !periodic && (i - i64::from(c) < 0 || i - i64::from(c) >= n as i64);
-                                if behind(yf, C[q][1], self.nf[1], self.periodic[0]) || behind(zf, C[q][2], self.nf[2], self.periodic[1]) {
+                                if behind(yf, cdir(self.perm, q, 1), self.nf[1], self.periodic[0])
+                                    || behind(zf, cdir(self.perm, q, 2), self.nf[2], self.periodic[1])
+                                {
                                     self.replenish.push((fine_cell, q, g[q], (side * nz + z) * ny + y));
                                 }
                             }
@@ -664,7 +742,7 @@ impl Refined {
                             let cell = self.ghost(side, y, z, [if side == 0 { 0 } else { RATIO - 1 }, dy, dz]);
                             let mut f = self.fine.cell_populations(cell);
                             let Some(slot) = self.pending.get_mut((side * nz + z) * ny + y) else { continue };
-                            for q in (0..Q).filter(|&q| !Strip::into_strip(side, q) && C[q][0] != 0) {
+                            for q in (0..Q).filter(|&q| !into_strip(self.perm, side, q) && cdir(self.perm, q, 0) != 0) {
                                 slot[q] += f[q] / (RATIO * RATIO * RATIO) as f64;
                                 f[q] = 0.0;
                             }
@@ -698,7 +776,7 @@ impl Refined {
                 for yf in 0..self.nf[1] {
                     for dx in 0..RATIO {
                         let xf = if side == 0 { dx } else { self.nf[0] - RATIO + dx };
-                        let cell = self.fine.grid().index([xf, yf, zf]);
+                        let cell = self.fidx([xf, yf, zf]);
                         saved.push((cell, self.fine.cell_populations(cell)));
                     }
                 }
@@ -716,7 +794,7 @@ impl Refined {
             let xa = self.interface_column(side);
             for z in 0..nz {
                 for y in 0..ny {
-                    let cell = self.coarse.grid().index([xa, y, z]);
+                    let cell = self.cidx([xa, y, z]);
                     let mut a = self.coarse.cell_populations(cell);
                     let mut sum = [0.0; Q];
                     for dz in 0..RATIO {
@@ -724,7 +802,7 @@ impl Refined {
                             for dx in 0..RATIO {
                                 let g = self.ghost(side, y, z, [dx, dy, dz]);
                                 let f = self.fine.cell_populations(g);
-                                for q in (0..Q).filter(|&q| C[q][0] != 0) {
+                                for q in (0..Q).filter(|&q| cdir(self.perm, q, 0) != 0) {
                                     sum[q] += f[q] / norm;
                                 }
                                 self.fine.set_cell_populations(g, &[0.0; Q]);
@@ -735,11 +813,11 @@ impl Refined {
                     // that wall reflection turned around inside a ghost cell is back in the inward
                     // direction: it belongs to the coarse cell's outgoing population of the opposite
                     // direction, which the coarse step reflects at the wall itself.
-                    for q in (0..Q).filter(|&q| C[q][0] != 0 && !Strip::into_strip(side, q)) {
+                    for q in (0..Q).filter(|&q| cdir(self.perm, q, 0) != 0 && !into_strip(self.perm, side, q)) {
                         a[q] = sum[q] + self.pending.get((side * nz + z) * ny + y).map_or(0.0, |p| p[q]);
                     }
-                    for q in (0..Q).filter(|&q| C[q][0] != 0 && Strip::into_strip(side, q)) {
-                        if !self.neighbour_exists(y, z, -C[q][1], -C[q][2]) {
+                    for q in (0..Q).filter(|&q| cdir(self.perm, q, 0) != 0 && into_strip(self.perm, side, q)) {
+                        if !self.neighbour_exists(y, z, -cdir(self.perm, q, 1), -cdir(self.perm, q, 2)) {
                             a[q] += sum[q] - self.replenished.get((side * nz + z) * ny + y).map_or(0.0, |r| r[q]);
                         }
                     }
@@ -792,11 +870,8 @@ impl Refined {
         };
         at(&mut self.coarse, 1.0);
         // The fine grid starts at the interface column `first − 1`, in half cells.
-        let offset = (self.strip.first - 1) as f64;
         for cell in 0..self.fine.grid().len() {
-            let c = self.fine.grid().coords(cell);
-            let x = [offset + (c[0] as f64 + 0.5) / RATIO as f64, (c[1] as f64 + 0.5) / RATIO as f64, (c[2] as f64 + 0.5) / RATIO as f64];
-            let (rho, u) = state(x);
+            let (rho, u) = state(self.position(self.fine.grid().coords(cell)));
             self.fine.set_cell_populations(cell, &equilibrium(rho, u));
         }
         self.clear_ghosts();
@@ -828,7 +903,7 @@ impl Refined {
         for side in 0..2 {
             for z in 0..nz {
                 for y in 0..ny {
-                    let cell = self.coarse.grid().index([self.interface_column(side), y, z]);
+                    let cell = self.cidx([self.interface_column(side), y, z]);
                     if !self.coarse.is_fluid(cell) {
                         continue;
                     }
@@ -858,7 +933,7 @@ impl Refined {
         let g = self.coarse.grid();
         let mut m = 0.0;
         for cell in 0..g.len() {
-            let [x, _, _] = g.coords(cell);
+            let [x, _, _] = self.loc(g.coords(cell));
             if (first..last).contains(&x) || !self.coarse.is_fluid(cell) {
                 continue;
             }
@@ -879,7 +954,7 @@ impl Refined {
         let g = self.coarse.grid();
         (0..g.len())
             .map(|cell| {
-                let [x, y, z] = g.coords(cell);
+                let [x, y, z] = self.loc(g.coords(cell));
                 if !(first..last).contains(&x) {
                     return if self.coarse.is_fluid(cell) { moments_of(&self.coarse.cell_populations(cell)) } else { (0.0, [0.0; 3]) };
                 }
@@ -887,7 +962,7 @@ impl Refined {
                 for dz in 0..RATIO {
                     for dy in 0..RATIO {
                         for dx in 0..RATIO {
-                            let fc = self.fine.grid().index([RATIO * (x - (first - 1)) + dx, RATIO * y + dy, RATIO * z + dz]);
+                            let fc = self.fidx([RATIO * (x - (first - 1)) + dx, RATIO * y + dy, RATIO * z + dz]);
                             if self.fine.is_fluid(fc) {
                                 let (r, u) = moments_of(&self.fine.cell_populations(fc));
                                 rho += r;
