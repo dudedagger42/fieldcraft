@@ -128,6 +128,7 @@ fn a_seed_in_the_slotted_channel_at_low_tau() {
             println!("== u_lat {ulat} tau-1/2 {tau_half:e} (tau- {:.3e}), seed {SEED:e} in cell {seed}, {steps} steps", setup.tau_minus - 0.5);
             let (mut last, mut peak_ratio, mut done, mut verdict) = (0.0f64, 0.0f64, 0u64, "ran all steps");
             let mut history: Vec<f64> = Vec::new();
+            let mut jet = (0.0f64, 0.0f64);
             while done < steps {
                 if let Err(e) = Backend::advance(&mut a, 100).and_then(|()| Backend::advance(&mut b, 100)) {
                     println!("  steps {}..{}: advance failed: {e}", done + 1, done + 100);
@@ -136,6 +137,10 @@ fn a_seed_in_the_slotted_channel_at_low_tau() {
                 }
                 done += 100;
                 let ((ua, oka), (ub, okb)) = (health(&mut a, scale), health(&mut b, scale));
+                if done == 400 {
+                    jet.0 = ua;
+                }
+                jet.1 = jet.1.max(ua);
                 if !(oka && okb) {
                     println!("  step {done}: FAILED (umax unseeded {ua:.4}, seeded {ub:.4}, ok {oka}/{okb})");
                     verdict = "FAILED";
@@ -143,6 +148,7 @@ fn a_seed_in_the_slotted_channel_at_low_tau() {
                 }
                 let (Ok(fa), Ok(fb)) = (Backend::fields(&mut a), Backend::fields(&mut b)) else { break };
                 let (mut dr, mut du, mut at, mut umax_at) = (0.0f64, 0.0f64, 0usize, (0.0f64, 0usize));
+                let mean_rho = fluid.iter().map(|&c| fa.density[c]).sum::<f64>() / fluid.len().max(1) as f64;
                 for &c in &fluid {
                     let e = (fa.density[c] - fb.density[c]).abs();
                     if e > dr {
@@ -160,7 +166,8 @@ fn a_seed_in_the_slotted_channel_at_low_tau() {
                     peak_ratio = peak_ratio.max(ratio);
                 }
                 println!(
-                    "  step {done}: umax {ua:.4} / {ub:.4}; max |d_rho| {dr:.3e}; max |d_u| {du:.3e}; growth over 100 steps {ratio:.2}x; nu_t/nu max {:.2}; max d_rho at {:?}, max |u| at {:?}",
+                    "  step {done}: umax {ua:.4} / {ub:.4}; max |d_rho| {dr:.3e}; max |d_u| {du:.3e}; growth over 100 steps {ratio:.2}x; mean rho-1 {:.2e}; nu_t/nu max {:.2}; max d_rho at {:?}, max |u| at {:?}",
+                    mean_rho - 1.0,
                     a.eddy_viscosity_ratio(),
                     a.grid().centre(at).map(|v| (v * 100.0).round() / 100.0),
                     a.grid().centre(umax_at.1).map(|v| (v * 100.0).round() / 100.0)
@@ -185,7 +192,9 @@ fn a_seed_in_the_slotted_channel_at_low_tau() {
                 "GROWING"
             };
             println!(
-                "  SCORE u_lat {ulat} tau-1/2 {tau_half:e}: {class} (stopped at step {done} of {steps}; last max |d_rho| {last:.3e}; mean growth per 100 steps over the last {} steps {growth:.3})",
+                "  SCORE u_lat {ulat} tau-1/2 {tau_half:e}: {class} (unseeded max |u|: {:.4} at step 400, {:.4} largest; stopped at step {done} of {steps}; last max |d_rho| {last:.3e}; mean growth per 100 steps over the last {} steps {growth:.3})",
+                jet.0,
+                jet.1,
                 100 * history.len().saturating_sub(start + 1)
             );
             println!("  -> {verdict} at step {done}; peak growth per 100 steps after step 300: {peak_ratio:.2}x; last max |d_rho| {last:.3e}");
