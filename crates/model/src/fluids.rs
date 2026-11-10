@@ -1693,6 +1693,9 @@ mod tests {
         let sa = turbulence(serde_json::json!({"type": "spalart_allmaras"})).unwrap();
         assert_eq!(sa, crate::Turbulence::SpalartAllmaras { prandtl: 0.9, wall_model: None, inflow_ratio: 3.0, ddes: None });
         assert_eq!((sa.name(), sa.constant(), sa.van_driest(), sa.wall_model()), ("spalart_allmaras", None, None, None));
+        let own = turbulence(serde_json::json!({"type": "spalart_allmaras", "wall_model": "spalart_allmaras_bounce"})).unwrap();
+        assert_eq!(own.wall_model(), Some(crate::WallModel::SpalartAllmarasBounce));
+        assert_eq!(serde_json::from_str::<crate::Turbulence>(&serde_json::to_string(&own).unwrap()).unwrap(), own);
         let ddes = turbulence(serde_json::json!({"type": "spalart_allmaras", "ddes": {}, "wall_model": "musker", "inflow_ratio": 5})).unwrap();
         assert_eq!(
             ddes,

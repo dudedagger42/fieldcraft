@@ -82,6 +82,38 @@ impl WallInterval {
         Some(WallInterval { u_tau, y1, law: [nu * first, nu * u_tau * second], trapezoid: [0.5 * u1 * y1, 0.5 * u1 * u1 * y1] })
     }
 
+    /// [`WallInterval::new`] with the Spalart–Allmaras constant-stress law: the friction velocity
+    /// from [`fieldcraft_lbm::sa_law::friction_velocity`] and the integrals `∫ u⁺ dy⁺`, `∫ u⁺² dy⁺`
+    /// of the tabulated u⁺ by Simpson's rule on 2000 uniform panels (u⁺ is smooth on [0, y⁺₁]).
+    pub fn new_sa_law(u1: f64, y1: f64, nu: f64) -> Option<WallInterval> {
+        use fieldcraft_lbm::sa_law::{friction_velocity, u_plus};
+        if !(u1.is_finite() && y1.is_finite() && nu.is_finite() && u1 > 0.0 && y1 > 0.0 && nu > 0.0) {
+            return None;
+        }
+        let u_tau = friction_velocity(u1, y1, nu);
+        if !(u_tau > 0.0) {
+            return None;
+        }
+        let y_plus = y1 * u_tau / nu;
+        let panels = 2000;
+        let h = y_plus / panels as f64;
+        let (mut first, mut second) = (0.0, 0.0);
+        for k in 0..=panels {
+            let w = if k == 0 || k == panels {
+                1.0
+            } else if k % 2 == 1 {
+                4.0
+            } else {
+                2.0
+            };
+            let u = u_plus(k as f64 * h);
+            first += w * u;
+            second += w * u * u;
+        }
+        let (first, second) = (first * h / 3.0, second * h / 3.0);
+        Some(WallInterval { u_tau, y1, law: [nu * first, nu * u_tau * second], trapezoid: [0.5 * u1 * y1, 0.5 * u1 * u1 * y1] })
+    }
+
     /// The interval's share of the momentum thickness `∫ (u/U_e)(1 − u/U_e) dy` at edge speed
     /// `edge`: `[law, trapezoid]`.
     pub fn momentum_thickness(&self, edge: f64) -> [f64; 2] {

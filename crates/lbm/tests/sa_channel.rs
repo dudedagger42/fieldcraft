@@ -53,6 +53,9 @@ const LEE_MOSER_1000_CF: f64 = 2.0 * 0.0500256 * 0.0500256;
 const LEE_MOSER_180_RE_TAU: f64 = 182.088;
 const LEE_MOSER_180_BULK: f64 = 1.0 / 0.0637309;
 const LEE_MOSER_180_CF: f64 = 2.0 * 0.0637309 * 0.0637309;
+/// The centreline U⁺ of Lee & Moser's Re_τ 182 profile, as the gate's window rounds it (17.75 to
+/// 18.65 is 18.2 ± 2.5 %; the tabulated mean at y = δ reads about 18.27).
+const LEE_MOSER_180_CENTRE: f64 = 18.2;
 
 /// A channel run's parameters.
 #[derive(Debug, Clone)]
@@ -88,6 +91,9 @@ struct ChannelResult {
     /// board WL3 P1); `bulk_trapezoid` is the same with the trapezoid from u = 0 at the wall.
     bulk: f64,
     bulk_trapezoid: f64,
+    /// The centreline velocity over u_τ (the mean of the two middle rows when there is no row on
+    /// the centreline).
+    centre: f64,
     /// C_f from the carried, applied and requested wall stress, on the measured U_b (the law's);
     /// `carried_trapezoid` the carried C_f on the trapezoid's U_b.
     carried: f64,
@@ -164,6 +170,8 @@ impl Channel {
         // The bulk velocity: the mean over the rows between the walls (the on-node walls' rows,
         // on the walls themselves, at half weight), `[with the wall intervals from the wall law,
         // with the trapezoid]`: the two differ on on-node walls only (WL3 P1).
+        let sa_law = matches!(self.turbulence, Some(Turbulence::SpalartAllmaras { wall_model: Some(WallModel::SpalartAllmarasBounce), .. }));
+        let interval = |u1: f64| if sa_law { WallInterval::new_sa_law(u1, 1.0, nu) } else { WallInterval::new(u1, 1.0, nu) };
         let bulk = |flow: &Flow| -> [f64; 2] {
             let row = |j: usize| {
                 (0..grid.cells[0] * grid.cells[2])
@@ -175,11 +183,20 @@ impl Channel {
             let height = if self.on_node { (rows - 1) as f64 } else { rows as f64 };
             // Each wall's interval, one cell (lattice units) from its node to its first fluid node.
             let law: f64 = if self.on_node {
-                [row(1), row(rows - 2)].iter().filter_map(|&u1| WallInterval::new(u1, 1.0, nu)).map(|w| w.law[0] - w.trapezoid[0]).sum()
+                [row(1), row(rows - 2)].iter().filter_map(|&u1| interval(u1)).map(|w| w.law[0] - w.trapezoid[0]).sum()
             } else {
                 0.0
             };
             [(sum + law) / height, sum / height]
+        };
+        let centre = |flow: &Flow| -> f64 {
+            let row = |j: usize| {
+                (0..grid.cells[0] * grid.cells[2])
+                    .map(|k| flow.moments(grid.index([k % grid.cells[0], j + first, k / grid.cells[0]])).map_or(0.0, |(_, u)| u[0]))
+                    .sum::<f64>()
+                    / (grid.cells[0] * grid.cells[2]) as f64
+            };
+            if rows % 2 == 1 { row(rows / 2) } else { 0.5 * (row(rows / 2 - 1) + row(rows / 2)) }
         };
         let acoustic = 2.0 * rows as f64 * 3f64.sqrt();
         let bulk_lattice = self.lattice_bulk;
@@ -189,13 +206,14 @@ impl Channel {
         let mut blocks = Blocks::new(window, min_steps / self.sample).unwrap();
         // Per sample interval: [carried, applied, requested, body, U_b (law), U_b (trapezoid)]
         // summed, then averaged.
-        let mut history: Vec<[f64; 6]> = Vec::new();
-        let mut sums = [0.0; 6];
+        let mut history: Vec<[f64; 7]> = Vec::new();
+        let mut sums = [0.0; 7];
         let mut any_requested = false;
         let mut budget_ok = true;
         let mut p = wall_balance::population_momentum(&flow);
         let mut steps = 0;
-        let mean = |rows: &[[f64; 6]]| -> [f64; 6] { [0, 1, 2, 3, 4, 5].map(|c| rows.iter().map(|r| r[c]).sum::<f64>() / rows.len().max(1) as f64) };
+        let mean =
+            |rows: &[[f64; 7]]| -> [f64; 7] { [0, 1, 2, 3, 4, 5, 6].map(|c| rows.iter().map(|r| r[c]).sum::<f64>() / rows.len().max(1) as f64) };
         let cf = |stress: f64, ub: f64, rho: f64| 2.0 * stress / (rho * ub * ub);
         let rho = flow.mass() / (0..grid.len()).filter(|&c| flow.is_fluid(c)).count() as f64;
         let mut settled = false;
@@ -226,7 +244,7 @@ impl Channel {
                 wall_balance::closed_step(p, next, a.map(|a| a * m), wall, requested.map(|r| r / area), area, m, 1e-12, f64::EPSILON).unwrap();
             budget_ok &= report.budget_ok;
             p = next;
-            for (s, v) in sums.iter_mut().zip([report.carried[0], report.applied[0], requested[0] / area, a[0] * m, 0.0, 0.0]) {
+            for (s, v) in sums.iter_mut().zip([report.carried[0], report.applied[0], requested[0] / area, a[0] * m, 0.0, 0.0, 0.0]) {
                 *s += v;
             }
             if steps % self.sample != 0 {
@@ -234,8 +252,8 @@ impl Channel {
             }
             let n = self.sample as f64;
             let [law, trapezoid] = bulk(&flow);
-            let row = [sums[0] / n, sums[1] / n, sums[2] / n, sums[3] / n, law, trapezoid];
-            sums = [0.0; 6];
+            let row = [sums[0] / n, sums[1] / n, sums[2] / n, sums[3] / n, law, trapezoid, centre(&flow)];
+            sums = [0.0; 7];
             assert!(row.iter().all(|v| v.is_finite()), "the channel is not finite after {steps} steps: {row:?}");
             // Past MAX_BLOCKS the stream refuses more samples; the statistics keep what they hold.
             blocks.push(cf(row[0], row[4], rho)).ok();
@@ -253,6 +271,7 @@ impl Channel {
         ChannelResult {
             bulk: last[4] / u_tau,
             bulk_trapezoid: last[5] / u_tau,
+            centre: last[6] / u_tau,
             carried: cf(last[0], last[4], rho),
             carried_trapezoid: cf(last[0], last[5], rho),
             applied: cf(last[1], last[4], rho),
@@ -392,7 +411,9 @@ fn sa(wall: WallModel) -> Turbulence {
 /// Under a second in release.
 #[test]
 fn the_sa_wall_function_s_request_is_read() {
-    for (wall, on_node, cells) in [(WallModel::SpaldingBounce, true, 20), (WallModel::Musker, false, 10)] {
+    for (wall, on_node, cells) in
+        [(WallModel::SpaldingBounce, true, 20), (WallModel::SpalartAllmarasBounce, true, 20), (WallModel::Musker, false, 10)]
+    {
         let ch = Channel {
             re_tau: 1000.0,
             cells,
@@ -647,6 +668,101 @@ fn sa_rans_channel_on_the_hybrid_collision_meets_lee_and_moser() {
         report(&name, &r, LEE_MOSER_1000_BULK, LEE_MOSER_1000_CF);
         score.push(Gate::new("C7 channel, HRR", &format!("{name}: C_f carried"), r.carried, LEE_MOSER_1000_CF, 0.05));
         score.push(Gate::new("C7 channel, HRR", &format!("{name}: requested / carried"), r.requested.unwrap_or(f64::NAN) / r.carried, 1.0, 0.01));
+        if !r.settled {
+            failures.push(format!("{name}: not settled in {} steps", r.steps));
+        }
+        if !r.min_nu_tilde.is_some_and(|v| v >= 0.0) {
+            failures.push(format!("{name}: ν̃ below 0 ({:?})", r.min_nu_tilde));
+        }
+    }
+    println!("{}", score.table());
+    assert!(failures.is_empty(), "{failures:?}");
+    assert!(score.passes());
+}
+
+/// The Spalart–Allmaras wall law (`spalart_allmaras_bounce`) on a periodic SA channel at
+/// Re_τ 182, 12 and 24 cells per half-height (the first fluid node at y⁺ 15 and 7.6), on MRT and
+/// on the hybrid collision at σ 0.99. Spalding's law is biased low in the buffer layer, so the
+/// same runs under `spalding_bounce` read the centreline velocity 3 to 5 % off (the finding is in
+/// docs/verification.md); the gates are the centreline U⁺ within 2.5 % of Lee & Moser (the
+/// window 17.75 to 18.65), carried C_f within 3.5 %, the request within 1 % of the carried
+/// stress, settled, ν̃ ≥ 0.
+///
+/// Measured when written (3 threads, 5 s for the four):
+///
+/// | collision | cells per δ (y⁺₁) | centre U⁺ (ref 18.2) | C_f carried (ref 8.123e-3) |
+/// |---|---|---|---|
+/// | MRT | 12 (15.2) | 18.472 (+1.50 %) | 7.959e-3 (−2.02 %) |
+/// | MRT | 24 (7.6) | 18.401 (+1.10 %) | 8.005e-3 (−1.45 %) |
+/// | HRR σ 0.99 | 12 (15.2) | 18.246 (+0.25 %) | 8.159e-3 (+0.44 %) |
+/// | HRR σ 0.99 | 24 (7.6) | 18.102 (−0.54 %) | 8.314e-3 (+2.35 %) |
+#[test]
+#[ignore = "heavy: cargo xtask test --heavy (CI heavy job)"]
+fn sa_law_channel_at_re_tau_180_meets_lee_and_moser_at_12_and_24_cells() {
+    let mut score = Score::default();
+    let mut failures = Vec::new();
+    for (collision, sigma) in [(Collision::Mrt, None), (Collision::Hrr, Some(0.99))] {
+        for cells in [12, 24] {
+            let r = Channel {
+                re_tau: LEE_MOSER_180_RE_TAU,
+                cells,
+                bulk_guess: LEE_MOSER_180_BULK,
+                lattice_bulk: 0.1,
+                collision,
+                sigma,
+                turbulence: Some(sa(WallModel::SpalartAllmarasBounce)),
+                on_node: true,
+                slabs: false,
+                max_steps: 2_000_000,
+                sample: 100,
+                settling: GATED,
+            }
+            .run();
+            let name = format!("SA law, {collision:?}, {cells} cells per δ (first node y⁺ {:.1})", LEE_MOSER_180_RE_TAU / cells as f64);
+            report(&name, &r, LEE_MOSER_180_BULK, LEE_MOSER_180_CF);
+            println!("{name}: centre U⁺ {:.3} ({:+.2} % of {LEE_MOSER_180_CENTRE})", r.centre, 100.0 * (r.centre / LEE_MOSER_180_CENTRE - 1.0));
+            score.push(Gate::new("SA law channel 180", &format!("{name}: centre U⁺"), r.centre, LEE_MOSER_180_CENTRE, 0.025));
+            score.push(Gate::new("SA law channel 180", &format!("{name}: C_f carried"), r.carried, LEE_MOSER_180_CF, 0.035));
+            score.push(Gate::new(
+                "SA law channel 180",
+                &format!("{name}: requested / carried"),
+                r.requested.unwrap_or(f64::NAN) / r.carried,
+                1.0,
+                0.01,
+            ));
+            if !r.settled {
+                failures.push(format!("{name}: not settled in {} steps", r.steps));
+            }
+            if !r.min_nu_tilde.is_some_and(|v| v >= 0.0) {
+                failures.push(format!("{name}: ν̃ below 0 ({:?})", r.min_nu_tilde));
+            }
+        }
+    }
+    println!("{}", score.table());
+    assert!(failures.is_empty(), "{failures:?}");
+    assert!(score.passes());
+}
+
+/// C7 re-baselined with the Spalart–Allmaras wall law: the channel at Re_τ 1000 on MRT, 20 and 32
+/// cells per δ (the first node at y⁺ 50 and 31), the same gates as the Spalding-law C7 above.
+///
+/// Measured when written (3 threads, 10 s for both): 20 cells per δ, 136 800 steps, U_b⁺ 19.838
+/// (−0.76 %), C_f 5.082e-3 (+1.54 %), requested / carried 1.00001; 32 cells per δ, 195 000 steps,
+/// U_b⁺ 19.929 (−0.30 %), C_f 5.036e-3 (+0.61 %), requested / carried 1.00000. Against the
+/// Spalding law's +0.11 % and +1.23 % the new law is the nearer on the fine grid and 1.4 % further
+/// on the coarse one, both inside the gate; the law's gain is at the buffer-layer first nodes
+/// (Re_τ 182), not here.
+#[test]
+#[ignore = "heavy: cargo xtask test --heavy (CI heavy job)"]
+fn sa_law_channel_at_re_tau_1000_meets_lee_and_moser() {
+    let mut score = Score::default();
+    let mut failures = Vec::new();
+    for cells in [20, 32] {
+        let r = c7(WallModel::SpalartAllmarasBounce, true, cells, 2_000_000);
+        let name = format!("SA law on MRT, {cells} cells per δ (first node y⁺ {:.0})", 1000.0 / cells as f64);
+        report(&name, &r, LEE_MOSER_1000_BULK, LEE_MOSER_1000_CF);
+        score.push(Gate::new("C7 channel, SA law", &format!("{name}: C_f carried"), r.carried, LEE_MOSER_1000_CF, 0.05));
+        score.push(Gate::new("C7 channel, SA law", &format!("{name}: requested / carried"), r.requested.unwrap_or(f64::NAN) / r.carried, 1.0, 0.01));
         if !r.settled {
             failures.push(format!("{name}: not settled in {} steps", r.steps));
         }

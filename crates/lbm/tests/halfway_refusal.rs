@@ -49,3 +49,21 @@ fn legacy_halfway_files_are_readable_but_every_solve_route_refuses_before_alloca
         }
     }
 }
+
+/// The Spalart–Allmaras wall law belongs to the Spalart–Allmaras model: with a subgrid model the
+/// setup refuses it and names the model to use.
+#[test]
+fn the_sa_wall_law_needs_the_sa_model() {
+    for t in [
+        Turbulence::Smagorinsky { constant: 0.1, prandtl: 0.9, van_driest: None, wall_model: Some(WallModel::SpalartAllmarasBounce) },
+        Turbulence::Vreman { constant: 0.18, prandtl: 0.9, wall_model: Some(WallModel::SpalartAllmarasBounce) },
+    ] {
+        let mut p = collide(1.0, 1.0, None, Collision::Mrt);
+        if let Procedure::Fluid { turbulence, .. } = &mut p {
+            *turbulence = Some(t);
+        }
+        let m = model(1.0, 0.01, domain([0.0; 3], [4.0; 3], 1.0), p);
+        let e = Setup::new(&m, None, &[], &Limits::default()).unwrap_err().to_string();
+        assert!(e.contains("spalart_allmaras_bounce") && e.contains("spalart_allmaras"), "{e}");
+    }
+}
