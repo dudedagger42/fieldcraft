@@ -243,7 +243,10 @@ impl Plate {
                 })
                 .collect()
         };
-        while steps < self.max_steps {
+        // `FIELDCRAFT_PLATE_SCORE_ONLY=1`: take no step, only read the restart file and score its
+        // samples (a copy of a running study's file: the study itself is not disturbed).
+        let max_steps = if std::env::var("FIELDCRAFT_PLATE_SCORE_ONLY").is_ok_and(|v| v == "1") { steps } else { self.max_steps };
+        while steps < max_steps {
             flow.step().unwrap();
             steps += 1;
             let forces = flow.forces();
@@ -321,8 +324,16 @@ impl Plate {
         if let Some(start) = history.len().checked_sub(2 * window)
             && let (Some(then), Some(now)) = (column_means(&history[start..start + window]), column_means(&history[start + window..]))
         {
-            let drift = now.iter().zip(&then).map(|(a, b)| ((a - b) / a).abs()).fold(0.0f64, f64::max);
+            let drifts: Vec<f64> = now.iter().zip(&then).map(|(a, b)| ((a - b) / a).abs()).collect();
+            let drift = drifts.iter().copied().fold(0.0f64, f64::max);
             println!("not settled: the largest relative change of the {window}-sample mean C_f is {drift:.2e}");
+            let over: Vec<String> = gated
+                .iter()
+                .zip(&drifts)
+                .filter(|(_, d)| **d > self.settling.drift)
+                .map(|(&s, d)| format!("x {:.3}: {d:.2e}", 0.5 * (strips[s].0 + strips[s].1)))
+                .collect();
+            println!("{} of {} gated strips change by more than {:.0e}: {}", over.len(), drifts.len(), self.settling.drift, over.join(", "));
         }
         (mean(&samples), false, steps)
     }
