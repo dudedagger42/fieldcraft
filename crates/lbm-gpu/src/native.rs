@@ -151,6 +151,75 @@ fn buffer_limit() -> Option<u64> {
     })
 }
 
+/// What the kernels index with: array entries are addressed by 32-bit integers (`q * n + cell`).
+const INDEX_RANGE: u64 = 1 << 32;
+
+/// A buffer that grows with the cell count: its name, what the messages call it, its bytes per
+/// cell and its indexed entries per cell (the kernels' array indices are 32-bit).
+struct CellBuffer {
+    name: &'static str,
+    what: &'static str,
+    bytes: u64,
+    entries: u64,
+}
+
+/// The buffers that grow with the cell count, for the options this flow runs with.
+fn cell_buffers(aa: bool, thermal: bool, gradients: bool, sa: bool) -> Vec<CellBuffer> {
+    let q = Q as u64;
+    let buffer = |name, what, bytes, entries| CellBuffer { name, what, bytes, entries };
+    let mut v = vec![buffer("lbm f", "populations", 4 * q, q), buffer("lbm moments", "moments", 16, 1)];
+    if !aa {
+        v.push(buffer("lbm g", "second populations", 4 * q, q));
+    }
+    if gradients {
+        v.push(buffer("lbm gradient velocities", "gradient velocities", 12, 3));
+    }
+    if sa {
+        v.push(buffer("lbm sa nu_tilde", "Spalart–Allmaras ν̃", 4, 1));
+        v.push(buffer("lbm sa rates", "Spalart–Allmaras rates", 8, 1));
+        v.push(buffer("lbm sa cells", "Spalart–Allmaras cell data", 16, 1));
+    }
+    if thermal {
+        let qt = QT as u64;
+        v.push(buffer("lbm t", "scalar populations", 4 * qt, qt));
+        v.push(buffer("lbm t2", "second scalar populations", 4 * qt, qt));
+    }
+    v
+}
+
+/// Refuse a cell count the kernels cannot address, before anything is allocated: a buffer over
+/// `cap` bytes, or one with more entries than a 32-bit index reaches (the populations, 19 per
+/// cell, wrap above 226 050 910 cells). Names the buffer, the cell count and the limit.
+fn check_cell_buffers(cells: usize, cap: Option<u64>, buffers: &[CellBuffer]) -> Result<()> {
+    use fieldcraft_lbm::memory::megabytes;
+    let n = cells as u64;
+    for b in buffers {
+        let entries = n.saturating_mul(b.entries);
+        if entries > INDEX_RANGE {
+            return Err(Error::Limit(format!(
+                "{cells} cells need {entries} entries of {} (`{}`); the kernels index with 32 bits ({INDEX_RANGE} at most), which holds {} cells: coarsen the spacing",
+                b.what,
+                b.name,
+                INDEX_RANGE / b.entries
+            )));
+        }
+        let bytes = n.saturating_mul(b.bytes);
+        if let Some(cap) = cap
+            && bytes > cap
+        {
+            return Err(Error::Limit(format!(
+                "{cells} cells need {} of {} (`{}`) per buffer; this GPU allows {} per buffer, which holds {} cells: coarsen the spacing",
+                megabytes(bytes),
+                b.what,
+                b.name,
+                megabytes(cap),
+                cap / b.bytes
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// How the momentum populations stream (see `lbm.wgsl`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Streaming {
@@ -895,6 +964,8 @@ impl GpuFlow {
         });
         // Validate zone values before opening a device or doing device work.
         let n = flow.grid().len();
+        // The 32-bit indices need no device to be known: refuse before the host arrays are made.
+        check_cell_buffers(n, None, &cell_buffers(true, false, false, false))?;
         let mut fluid_u32 = filled(n, 0u32, "cell flags")?;
         for (cell, flag) in fluid_u32.iter_mut().enumerate() {
             *flag = u32::from(flow.is_fluid(cell));
@@ -926,6 +997,14 @@ impl GpuFlow {
         if !adapter.features().contains(features) {
             return Err(gpu_error("profiling needs timestamp queries, which this adapter does not offer"));
         }
+        // Before a device is opened or a buffer made: every per-cell buffer within the adapter's
+        // limit and the kernels' 32-bit indices (the device is requested with these same limits).
+        let gradients = flow.hybrid_sigma().is_some_and(|s| s != fieldcraft_model::HrrSigma::Value(1.0)) || flow.vreman() > 0.0 || sa_faces.is_some();
+        check_cell_buffers(
+            n,
+            Some(buffer_cap(&adapter.limits())),
+            &cell_buffers(options.streaming != Streaming::TwoBuffers, flow.thermal().is_some(), gradients, sa_faces.is_some()),
+        )?;
         let storage_buffers = reflection()?.storage_buffers;
         check_storage_buffers(info.backend, adapter.limits().max_storage_buffers_per_shader_stage, storage_buffers)?;
         let (shared, created) = shared_device(&adapter, features, storage_buffers)?;
@@ -947,14 +1026,6 @@ impl GpuFlow {
         let elem = 4u64;
         let pop_bytes = elem * (Q * n) as u64;
         let cap = buffer_cap(&device.limits());
-        if pop_bytes > cap {
-            use fieldcraft_lbm::memory::megabytes;
-            return Err(Error::Limit(format!(
-                "{n} cells need {} of populations per buffer; this GPU allows {} per buffer: coarsen the spacing",
-                megabytes(pop_bytes),
-                megabytes(cap)
-            )));
-        }
 
         let flag_bytes = (fluid_u32.len() as u64).checked_mul(4).ok_or_else(|| Error::Limit("too much GPU zone data".into()))?;
         if flag_bytes > cap {
@@ -2230,6 +2301,38 @@ impl Backend for GpuFlow {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A fake cap and cell counts: nothing is allocated, the refusals name the buffer, the count and
+    /// the limit, and a count within the limits passes.
+    #[test]
+    fn per_cell_buffers_are_refused_past_the_cap_and_the_32_bit_index_before_allocation() {
+        let all = cell_buffers(false, true, true, true);
+        let names: Vec<_> = all.iter().map(|b| b.name).collect();
+        assert_eq!(
+            names,
+            ["lbm f", "lbm moments", "lbm g", "lbm gradient velocities", "lbm sa nu_tilde", "lbm sa rates", "lbm sa cells", "lbm t", "lbm t2"]
+        );
+        // Within the limits, with and without a cap.
+        assert!(check_cell_buffers(1000, Some(76_000), &cell_buffers(true, false, false, false)).is_ok());
+        assert!(check_cell_buffers(226_050_910, None, &cell_buffers(true, false, false, false)).is_ok());
+        // One cell more than the cap holds, for the populations (the largest per cell).
+        let e = check_cell_buffers(1001, Some(76_000), &cell_buffers(true, false, false, false)).unwrap_err().to_string();
+        assert!(e.contains("1001 cells") && e.contains("`lbm f`") && e.contains("which holds 1000 cells"), "{e}");
+        // The 32-bit index: 19 entries per cell wrap above 226 050 910 cells (2^32 / 19).
+        let e = check_cell_buffers(226_050_911, None, &cell_buffers(true, false, false, false)).unwrap_err().to_string();
+        assert!(e.contains("226050911 cells") && e.contains("`lbm f`") && e.contains("holds 226050910 cells"), "{e}");
+        // Each other buffer is refused by itself, at exactly its size.
+        for (b, per_cell) in [("lbm moments", 16u64), ("lbm gradient velocities", 12), ("lbm sa rates", 8), ("lbm sa cells", 16), ("lbm t", 28)] {
+            let one: Vec<_> = cell_buffers(true, true, true, true).into_iter().filter(|x| x.name == b).collect();
+            assert_eq!(one.len(), 1, "{b}");
+            assert!(check_cell_buffers(100, Some(100 * per_cell), &one).is_ok(), "{b}");
+            let e = check_cell_buffers(100, Some(100 * per_cell - 1), &one).unwrap_err().to_string();
+            assert!(e.contains(b) && e.contains("100 cells"), "{e}");
+        }
+        // Counts that overflow the arithmetic are refused, not wrapped.
+        assert!(check_cell_buffers(usize::MAX, Some(u64::MAX), &all).is_err());
+        assert!(check_cell_buffers(usize::MAX, None, &all).is_err());
+    }
 
     #[test]
     fn pressure_staging_refuses_oversized_buffers_before_allocation() {
