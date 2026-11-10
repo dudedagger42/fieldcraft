@@ -127,6 +127,7 @@ fn a_seed_in_the_slotted_channel_at_low_tau() {
             b.set_equilibrium(|c| state(c, SEED));
             println!("== u_lat {ulat} tau-1/2 {tau_half:e} (tau- {:.3e}), seed {SEED:e} in cell {seed}, {steps} steps", setup.tau_minus - 0.5);
             let (mut last, mut peak_ratio, mut done, mut verdict) = (0.0f64, 0.0f64, 0u64, "ran all steps");
+            let mut history: Vec<f64> = Vec::new();
             while done < steps {
                 if let Err(e) = Backend::advance(&mut a, 100).and_then(|()| Backend::advance(&mut b, 100)) {
                     println!("  steps {}..{}: advance failed: {e}", done + 1, done + 100);
@@ -165,7 +166,28 @@ fn a_seed_in_the_slotted_channel_at_low_tau() {
                     a.grid().centre(umax_at.1).map(|v| (v * 100.0).round() / 100.0)
                 );
                 last = dr;
+                history.push(dr);
             }
+            // The score: the last half of the run (at most 2000 steps) gives the mean growth per 100 steps.
+            let window = history.len().div_ceil(2).clamp(1, 20);
+            let start = history.len().saturating_sub(window + 1);
+            let growth = match (history.get(start), history.last()) {
+                (Some(a), Some(b)) if *a > 0.0 && history.len() > start + 1 => (b / a).powf(1.0 / (history.len() - 1 - start) as f64),
+                _ => f64::NAN,
+            };
+            let class = if verdict != "ran all steps" {
+                "FAIL"
+            } else if last < 1e-9 && growth <= 1.0 {
+                "HOLD"
+            } else if growth <= 1.05 {
+                "SATURATED"
+            } else {
+                "GROWING"
+            };
+            println!(
+                "  SCORE u_lat {ulat} tau-1/2 {tau_half:e}: {class} (stopped at step {done} of {steps}; last max |d_rho| {last:.3e}; mean growth per 100 steps over the last {} steps {growth:.3})",
+                100 * history.len().saturating_sub(start + 1)
+            );
             println!("  -> {verdict} at step {done}; peak growth per 100 steps after step 300: {peak_ratio:.2}x; last max |d_rho| {last:.3e}");
         }
     }
