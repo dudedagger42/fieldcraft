@@ -8,6 +8,10 @@
 //! leaves 0.5..1.5. Whether the difference saturates (the speeds stay bounded and the difference stops growing)
 //! or the run fails shows in the last rows.
 //!
+//! Variants, all off by default: `STUDY_SIGMA` (the hybrid collision's σ, or `dynamic` with `STUDY_MODEL=vreman` or
+//! `smag`), `STUDY_MODEL` (`sa`, `sa_ddes`, `vreman`, `smag`), `STUDY_COLLISION` (`hrr`, `regularized`, `mrt`, `trt`),
+//! `STUDY_SLOT` (the slot's width in m, 0.1), `STUDY_INFLOW` (Spalart–Allmaras's ν̃/ν at the inflow) and `STUDY_LAYER=1` (the default absorbing layer).
+//!
 //! `STUDY_TAUS` (τ⁺ − ½, comma-separated), `STUDY_ULATS` (the inlet's peak lattice speed), `STUDY_STEPS`.
 #[path = "common/mod.rs"]
 mod common;
@@ -15,12 +19,16 @@ mod common;
 use common::*;
 use fieldcraft_lbm::backend::Backend;
 use fieldcraft_lbm::{Flow, Limits, Setup};
-use fieldcraft_model::{Collision, FaceCondition, HrrSigma, Outflow, Procedure, Profile, Turbulence};
+use fieldcraft_model::{AbsorbingLayer, Collision, Ddes, FaceCondition, HrrSigma, Outflow, Procedure, Profile, Turbulence};
 
 const SEED: f64 = 1e-7;
 
 fn list(k: &str, d: &str) -> Vec<f64> {
     std::env::var(k).unwrap_or_else(|_| d.into()).split(',').filter_map(|s| s.trim().parse().ok()).collect()
+}
+
+fn word(k: &str, d: &str) -> String {
+    std::env::var(k).unwrap_or_else(|_| d.into())
 }
 
 fn setup_of(ulat: f64, tau_half: f64, steps: u64) -> Option<(Setup, Vec<fieldcraft_lbm::Obstacle>)> {
@@ -33,11 +41,28 @@ fn setup_of(ulat: f64, tau_half: f64, steps: u64) -> Option<(Setup, Vec<fieldcra
     d.faces.z_max = FaceCondition::Slip {};
     d.acceleration = [0.0, 0.0, -0.01];
     d.obstacles = vec!["PlateLow".into(), "PlateHigh".into()];
+    let slot = word("STUDY_SLOT", "0.1").parse::<f64>().unwrap_or(0.1);
     let bodies = vec![
-        obstacle("PlateLow", cuboid([0.6, 0.0, 0.0], [0.8, 1.0, 0.45]), &CUBOID_FACES),
-        obstacle("PlateHigh", cuboid([0.6, 0.0, 0.55], [0.8, 1.0, 1.0]), &CUBOID_FACES),
+        obstacle("PlateLow", cuboid([0.6, 0.0, 0.0], [0.8, 1.0, 0.5 - slot / 2.0]), &CUBOID_FACES),
+        obstacle("PlateHigh", cuboid([0.6, 0.0, 0.5 + slot / 2.0], [0.8, 1.0, 1.0]), &CUBOID_FACES),
     ];
-    let sa = Turbulence::SpalartAllmaras { prandtl: 0.9, wall_model: None, inflow_ratio: 3.0, ddes: None };
+    let inflow_ratio = word("STUDY_INFLOW", "3").parse().unwrap_or(3.0);
+    let sa = match word("STUDY_MODEL", "sa").as_str() {
+        "sa_ddes" => Turbulence::SpalartAllmaras { prandtl: 0.9, wall_model: None, inflow_ratio, ddes: Some(Ddes { c_des: 0.65 }) },
+        "vreman" => Turbulence::Vreman { constant: 0.18, prandtl: 0.9, wall_model: None },
+        "smag" => Turbulence::Smagorinsky { constant: 0.17, prandtl: 0.9, van_driest: None, wall_model: None },
+        _ => Turbulence::SpalartAllmaras { prandtl: 0.9, wall_model: None, inflow_ratio, ddes: None },
+    };
+    let sigma = match word("STUDY_SIGMA", "0.99").as_str() {
+        "dynamic" => HrrSigma::Dynamic,
+        v => HrrSigma::Value(v.parse().unwrap_or(0.99)),
+    };
+    let collision = match word("STUDY_COLLISION", "hrr").as_str() {
+        "regularized" => Collision::Regularized,
+        "mrt" => Collision::Mrt,
+        "trt" => Collision::Trt,
+        _ => Collision::Hrr,
+    };
     let p = Procedure::Fluid {
         domain: "Flow".into(),
         end_time: None,
@@ -45,13 +70,22 @@ fn setup_of(ulat: f64, tau_half: f64, steps: u64) -> Option<(Setup, Vec<fieldcra
         time_step: Some(dt),
         frames: 2,
         magic: None,
-        sigma: Some(HrrSigma::Value(0.99)),
-        collision: Some(Collision::Hrr),
+        sigma: Some(sigma),
+        collision: Some(collision),
         turbulence: Some(sa),
         steady: None,
     };
+    if word("STUDY_LAYER", "0") == "1" {
+        d.absorbing = Some(AbsorbingLayer { thickness: None, strength: None, filter_time: None });
+    }
     let m = model(1.0, nu, d, p);
-    Setup::new(&m, None, &bodies, &Limits::default()).ok().map(|s| (s, bodies))
+    match Setup::new(&m, None, &bodies, &Limits::default()) {
+        Ok(s) => Some((s, bodies)),
+        Err(e) => {
+            println!("setup refused: {e}");
+            None
+        }
+    }
 }
 
 /// (largest lattice speed, whether the fluid cells are finite with a density in 0.5..1.5).
@@ -90,7 +124,8 @@ fn a_seed_in_the_slotted_channel_at_low_tau() {
             println!("== u_lat {ulat} tau-1/2 {tau_half:e} (tau- {:.3e}), seed {SEED:e} in cell {seed}, {steps} steps", setup.tau_minus - 0.5);
             let (mut last, mut peak_ratio, mut done, mut verdict) = (0.0f64, 0.0f64, 0u64, "ran all steps");
             while done < steps {
-                if Backend::advance(&mut a, 100).is_err() || Backend::advance(&mut b, 100).is_err() {
+                if let Err(e) = Backend::advance(&mut a, 100).and_then(|()| Backend::advance(&mut b, 100)) {
+                    println!("  steps {}..{}: advance failed: {e}", done + 1, done + 100);
                     verdict = "advance failed";
                     break;
                 }
@@ -102,16 +137,29 @@ fn a_seed_in_the_slotted_channel_at_low_tau() {
                     break;
                 }
                 let (Ok(fa), Ok(fb)) = (Backend::fields(&mut a), Backend::fields(&mut b)) else { break };
-                let (mut dr, mut du) = (0.0f64, 0.0f64);
+                let (mut dr, mut du, mut at, mut umax_at) = (0.0f64, 0.0f64, 0usize, (0.0f64, 0usize));
                 for &c in &fluid {
-                    dr = dr.max((fa.density[c] - fb.density[c]).abs());
+                    let e = (fa.density[c] - fb.density[c]).abs();
+                    if e > dr {
+                        at = c;
+                    }
+                    let u = fa.velocity[c].iter().map(|v| v * v).sum::<f64>().sqrt() / scale;
+                    if u > umax_at.0 {
+                        umax_at = (u, c);
+                    }
+                    dr = dr.max(e);
                     du = du.max((0..3).map(|k| ((fa.velocity[c][k] - fb.velocity[c][k]) / scale).powi(2)).sum::<f64>().sqrt());
                 }
                 let ratio = if last > 0.0 { dr / last } else { f64::NAN };
                 if done > 300 && ratio.is_finite() {
                     peak_ratio = peak_ratio.max(ratio);
                 }
-                println!("  step {done}: umax {ua:.4} / {ub:.4}; max |d_rho| {dr:.3e}; max |d_u| {du:.3e}; growth over 100 steps {ratio:.2}x");
+                println!(
+                    "  step {done}: umax {ua:.4} / {ub:.4}; max |d_rho| {dr:.3e}; max |d_u| {du:.3e}; growth over 100 steps {ratio:.2}x; nu_t/nu max {:.2}; max d_rho at {:?}, max |u| at {:?}",
+                    a.eddy_viscosity_ratio(),
+                    a.grid().centre(at).map(|v| (v * 100.0).round() / 100.0),
+                    a.grid().centre(umax_at.1).map(|v| (v * 100.0).round() / 100.0)
+                );
                 last = dr;
             }
             println!("  -> {verdict} at step {done}; peak growth per 100 steps after step 300: {peak_ratio:.2}x; last max |d_rho| {last:.3e}");
