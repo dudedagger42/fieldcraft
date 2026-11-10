@@ -410,6 +410,26 @@ Re_τ 182.088 (u_τ = 0.0637309 at U_b = 1; C_f = 8.123 × 10⁻³; M. Lee, R. D
   request equals the carried stress to 10⁻⁵, so the wall carries what it asks for, and the error is
   the closure at low Re_τ: Spalding's law at the first node, fed by SA's profile. It is pinned in
   its measured band rather than gated, so any change to it comes to review.
+- **The error is Spalding's buffer layer, not the wall.** With the first node at y⁺ 7 to 15, Spalding's
+  law (κ 0.41, B 5.5) is low in the buffer layer, and the ν̃ the wall function derives from it there
+  is too high. The Spalart–Allmaras model has its own constant-stress layer (ν̃ = κ u_τ y exactly,
+  u⁺ the integral of 1 / (1 + κ y⁺ f_v1(κ y⁺)); `crates/lbm/src/sa_law.rs`), selected with
+  `wall_model: "spalart_allmaras_bounce"`. Gated in
+  `sa_law_channel_at_re_tau_180_meets_lee_and_moser_at_12_and_24_cells`, centreline U⁺ against
+  18.2 (the window 17.75 to 18.65) and carried C_f, 12 and 24 cells per half-height:
+
+| collision | cells (y⁺₁) | centre U⁺ | C_f carried |
+|---|---|---|---|
+| MRT | 12 (15.2) | 18.472 (+1.50 %) | −2.02 % |
+| MRT | 24 (7.6) | 18.401 (+1.10 %) | −1.45 % |
+| HRR σ 0.99 | 12 (15.2) | 18.246 (+0.25 %) | +0.44 % |
+| HRR σ 0.99 | 24 (7.6) | 18.102 (−0.54 %) | +2.35 % |
+
+  C7 at Re_τ 1000 re-baselined with the law (`sa_law_channel_at_re_tau_1000_meets_lee_and_moser`,
+  MRT): C_f +1.54 % at 20 cells per δ and +0.61 % at 32, inside the 5 % gate (the Spalding law gave
+  +0.11 % and +1.23 %). The law itself is tested against an independent quadrature, against the
+  model's steady equation to round-off, and against the model's own one-dimensional solver
+  relaxed from a different start.
 
 **Pipe at Re_b 5300** (`sa_pipe.rs`; the stair-stepped circle is halfway bounce-back on the cells
 outside it; the hybrid collision at σ 0.99).
