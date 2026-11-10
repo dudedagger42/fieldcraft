@@ -9,7 +9,7 @@
 //! or the run fails shows in the last rows.
 //!
 //! Variants, all off by default: `STUDY_SIGMA` (the hybrid collision's σ, or `dynamic` with `STUDY_MODEL=vreman` or
-//! `smag`), `STUDY_MODEL` (`sa`, `sa_ddes`, `vreman`, `smag`), `STUDY_COLLISION` (`hrr`, `regularized`, `mrt`, `trt`),
+//! `smag`), `STUDY_MODEL` (`sa`, `sa_ddes`, `vreman`, `smag`, `off`: a Smagorinsky constant of 1e-4, no viscosity to speak of), `STUDY_COLLISION` (`hrr`, `regularized`, `mrt`, `trt`),
 //! `STUDY_YFACES=slip` (slip instead of walls at y min and max), `STUDY_SLOT` (the slot's width in m, 0.1), `STUDY_INFLOW` (Spalart–Allmaras's ν̃/ν at the inflow) and `STUDY_LAYER=1` (the default absorbing layer).
 //!
 //! `STUDY_TAUS` (τ⁺ − ½, comma-separated), `STUDY_ULATS` (the inlet's peak lattice speed), `STUDY_STEPS`.
@@ -54,6 +54,8 @@ fn setup_of(ulat: f64, tau_half: f64, steps: u64) -> Option<(Setup, Vec<fieldcra
     let sa = match word("STUDY_MODEL", "sa").as_str() {
         "sa_ddes" => Turbulence::SpalartAllmaras { prandtl: 0.9, wall_model: None, inflow_ratio, ddes: Some(Ddes { c_des: 0.65 }) },
         "vreman" => Turbulence::Vreman { constant: 0.18, prandtl: 0.9, wall_model: None },
+        // A model the setup accepts at τ − ½ below 5e-3 (it refuses a plain flow there) that adds no viscosity worth the name: ν_t/ν about 1e-7.
+        "off" => Turbulence::Smagorinsky { constant: 1e-4, prandtl: 0.9, van_driest: None, wall_model: None },
         "smag" => Turbulence::Smagorinsky { constant: 0.17, prandtl: 0.9, van_driest: None, wall_model: None },
         _ => Turbulence::SpalartAllmaras { prandtl: 0.9, wall_model: None, inflow_ratio, ddes: None },
     };
