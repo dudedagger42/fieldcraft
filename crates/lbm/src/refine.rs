@@ -45,6 +45,14 @@
 //! same amount, so mass stays exact); what wall reflection leaves in the outer ghost layer
 //! after the first fine step is collected before the fine box's periodic seam can carry it off.
 //!
+//! The same holds for solid cells of obstacles that cross the interface plane (the walls of a
+//! channel made of obstacles): a population whose source cell along the interface is solid is
+//! treated as one whose source is beyond a wall face, the slopes along the interface are one-sided
+//! next to a solid cell, and the coarse values the ghost cells interpolate from take the linear
+//! extrapolation of the two fluid cells beside each solid cell. The two levels must agree on
+//! the solid cells of the interface layers (an obstacle meets the interface on coarse cell
+//! boundaries) and these run along the strip's axis; anything else is refused with the reason.
+//!
 //! # The Spalart–Allmaras model
 //! ν̃ is transported on both levels. The fine ghost cells take the coarse ν̃ interpolated like the
 //! moments, in the fine level's lattice units (twice the coarse value: a lattice viscosity doubles
@@ -346,29 +354,39 @@ impl Refined {
         }
     }
 
-    /// The columns next to the interface must be fluid on both levels (no obstacle, no wall node).
+    /// Solid cells may cross the interface plane (the walls of a channel made of obstacles), but the
+    /// two levels must agree on them and they must run along the strip's axis: a coarse cell is solid
+    /// exactly when the eight fine cells in it are, and the solid cells of the interface layer are
+    /// solid in the layers on both sides of it too.
     fn check_interface_cells(&self) -> Result<()> {
         let Strip { first, last, .. } = self.strip;
         let [_, ny, nz] = self.nc;
-        for x in [first - 2, first - 1, last, last + 1] {
-            for z in 0..nz {
-                for y in 0..ny {
-                    if !self.coarse.is_fluid(self.cidx([x, y, z])) {
-                        return Err(Error::Invalid(format!(
-                            "coarse cell ({x}, {y}, {z}) next to the interface is not a fluid cell: the interface must lie in open fluid, at least 2 coarse cells from a solid"
-                        )));
-                    }
-                }
-            }
-        }
-        let nxf = self.nf[0];
-        for x in (0..4).chain(nxf - 4..nxf) {
-            for z in 0..self.nf[2] {
-                for y in 0..self.nf[1] {
-                    if !self.fine.is_fluid(self.fidx([x, y, z])) {
-                        return Err(Error::Invalid(format!(
-                            "fine cell ({x}, {y}, {z}) next to the interface is not a fluid cell: the interface must lie in open fluid"
-                        )));
+        for z in 0..nz {
+            for y in 0..ny {
+                for columns in [[first - 2, first - 1, first], [last - 1, last, last + 1]] {
+                    let solid = !self.coarse.is_fluid(self.cidx([columns[1], y, z]));
+                    for x in columns {
+                        let here = !self.coarse.is_fluid(self.cidx([x, y, z]));
+                        if here != solid {
+                            return Err(Error::Invalid(format!(
+                                "coarse cells ({}, {y}, {z}) and ({x}, {y}, {z}) next to the interface differ in being solid: an obstacle may cross the interface plane only along the strip's axis",
+                                columns[1]
+                            )));
+                        }
+                        // The fine cells that lie in this coarse cell (the covered column `first − 2` and `last + 1` have none).
+                        if x == first - 2 || x == last + 1 {
+                            continue;
+                        }
+                        let x0 = RATIO * (x - (first - 1));
+                        let fine_solid = (0..RATIO * RATIO * RATIO)
+                            .filter(|k| !self.fine.is_fluid(self.fidx([x0 + k % 2, RATIO * y + (k / 2) % 2, RATIO * z + k / 4])))
+                            .count();
+                        if fine_solid != 0 && fine_solid != RATIO * RATIO * RATIO || (fine_solid != 0) != here {
+                            return Err(Error::Invalid(format!(
+                                "the obstacle does not meet the interface on coarse cell boundaries at coarse cell ({x}, {y}, {z}): {fine_solid} of its 8 fine cells are solid, the coarse cell is {}",
+                                if here { "solid" } else { "fluid" }
+                            )));
+                        }
                     }
                 }
             }
@@ -465,11 +483,28 @@ impl Refined {
         self.fidx([x0 + d[0], RATIO * y + d[1], RATIO * z + d[2]])
     }
 
-    /// Whether the neighbour of coarse cell `(y, z)` along `(cy, cz)` exists: inside the box, or
-    /// across a periodic face. A population toward a wall face bounces back within its cell.
+    /// Whether the neighbour of coarse cell `(y, z)` of the interface layer along `(cy, cz)` is a
+    /// fluid cell: inside the box (or across a periodic face) and not solid. A population toward a
+    /// wall face or a solid cell bounces back within its cell.
     fn neighbour_exists(&self, y: usize, z: usize, cy: i32, cz: i32) -> bool {
-        let ok = |i: usize, c: i32, n: usize, periodic: bool| periodic || (i as i64 + i64::from(c) >= 0 && ((i as i64 + i64::from(c)) as usize) < n);
-        ok(y, cy, self.nc[1], self.periodic[0]) && ok(z, cz, self.nc[2], self.periodic[1])
+        self.tangential_fluid(true, self.strip.first - 1, y as i64 + i64::from(cy), z as i64 + i64::from(cz))
+    }
+
+    /// Whether the cell at tangential position `(y, z)` (possibly outside the box) of layer `x` of the
+    /// coarse (`coarse`) or the fine level is a fluid cell: outside a wall face it is not, across a periodic face it wraps.
+    fn tangential_fluid(&self, coarse: bool, x: usize, y: i64, z: i64) -> bool {
+        let n = if coarse { self.nc } else { self.nf };
+        let wrap = |i: i64, n: usize, periodic: bool| -> Option<usize> {
+            if (0..n as i64).contains(&i) {
+                Some(i as usize)
+            } else if periodic {
+                Some(i.rem_euclid(n as i64) as usize)
+            } else {
+                None
+            }
+        };
+        let (Some(y), Some(z)) = (wrap(y, n[1], self.periodic[0]), wrap(z, n[2], self.periodic[1])) else { return false };
+        if coarse { self.coarse.is_fluid(self.cidx([x, y, z])) } else { self.fine.is_fluid(self.fidx([x, y, z])) }
     }
 
     fn interface_column(&self, side: usize) -> usize {
@@ -532,7 +567,9 @@ impl Refined {
                         v.push(moments_of(&self.coarse.cell_populations(self.cidx([x, y, z]))));
                     }
                 }
-                v
+                let mut packed: Vec<[f64; 4]> = v.iter().map(|&(rho, u)| [rho, u[0], u[1], u[2]]).collect();
+                self.extrapolate_solid(x, &mut packed);
+                packed.iter().map(|p| (p[0], [p[1], p[2], p[3]])).collect()
             })
             .collect();
         if self.sa {
@@ -550,12 +587,48 @@ impl Refined {
                 let mut v = Vec::with_capacity(ny * nz);
                 for z in 0..nz {
                     for y in 0..ny {
-                        v.push(self.coarse.sa_value(self.cidx([x, y, z])).unwrap_or(0.0));
+                        v.push([self.coarse.sa_value(self.cidx([x, y, z])).unwrap_or(0.0), 0.0, 0.0, 0.0]);
                     }
                 }
-                v
+                self.extrapolate_solid(x, &mut v);
+                v.iter().map(|p| p[0]).collect()
             })
             .collect()
+    }
+
+    /// The values of a coarse layer `x` (by `z * ny + y`) in its solid cells replaced by the linear
+    /// extrapolation of the two fluid cells next to them along y, or along z, or the nearest one:
+    /// the ghost cells interpolate between cell centres, and next to a solid they read the line
+    /// through the fluid cells, as they do next to a wall face of the box.
+    fn extrapolate_solid(&self, x: usize, values: &mut [[f64; 4]]) {
+        let [_, ny, nz] = self.nc;
+        let fluid: Vec<bool> = (0..ny * nz).map(|i| self.coarse.is_fluid(self.cidx([x, i % ny, i / ny]))).collect();
+        let at =
+            |y: i64, z: i64| -> Option<usize> { ((0..ny as i64).contains(&y) && (0..nz as i64).contains(&z)).then(|| z as usize * ny + y as usize) };
+        let source = values.to_vec();
+        for i in 0..ny * nz {
+            if fluid[i] {
+                continue;
+            }
+            let (y, z) = ((i % ny) as i64, (i / ny) as i64);
+            let mut done = None;
+            for (dy, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+                let (a, b) = (at(y + dy, z + dz).filter(|&k| fluid[k]), at(y + 2 * dy, z + 2 * dz).filter(|&k| fluid[k]));
+                if let Some(a) = a {
+                    let mut v = source[a];
+                    if let Some(b) = b {
+                        for c in 0..4 {
+                            v[c] = 2.0 * source[a][c] - source[b][c];
+                        }
+                    }
+                    done = Some(v);
+                    break;
+                }
+            }
+            if let (Some(v), Some(slot)) = (done, values.get_mut(i)) {
+                *slot = v;
+            }
+        }
     }
 
     /// The coarse moments at fine ghost cell `(xf, yf, zf)` of `side`, interpolated linearly in
@@ -639,6 +712,9 @@ impl Refined {
                         let xf = if side == 0 { dx } else { self.nf[0] - RATIO + dx };
                         let (rho, u) = self.interpolate(side, dx, yf, zf);
                         let cell = self.fidx([xf, yf, zf]);
+                        if !self.fine.is_fluid(cell) {
+                            continue;
+                        }
                         self.fine.set_cell_populations(cell, &equilibrium(rho, u));
                         if self.sa {
                             let nu = self.interpolate_nu_tilde(side, dx, yf, zf, later);
@@ -668,6 +744,9 @@ impl Refined {
             };
             for z in 0..nz {
                 for y in 0..ny {
+                    if !self.coarse.is_fluid(at(y, z)) {
+                        continue;
+                    }
                     let a = self.coarse.cell_populations(at(y, z));
                     // Slopes along y and z: central, one-sided next to a wall (the periodic or missing neighbour
                     // does not count), zero where neither neighbour is a fluid cell.
@@ -709,12 +788,9 @@ impl Refined {
                             let inner = if side == 0 { RATIO - 1 } else { 0 };
                             let fine_cell = self.ghost(side, y, z, [inner, dy, dz]);
                             let (yf, zf) = ((RATIO * y + dy) as i64, (RATIO * z + dz) as i64);
+                            let xi = if side == 0 { RATIO - 1 } else { self.nf[0] - RATIO };
                             for &q in &sent {
-                                let behind =
-                                    |i: i64, c: i32, n: usize, periodic: bool| !periodic && (i - i64::from(c) < 0 || i - i64::from(c) >= n as i64);
-                                if behind(yf, cdir(self.perm, q, 1), self.nf[1], self.periodic[0])
-                                    || behind(zf, cdir(self.perm, q, 2), self.nf[2], self.periodic[1])
-                                {
+                                if !self.tangential_fluid(false, xi, yf - i64::from(cdir(self.perm, q, 1)), zf - i64::from(cdir(self.perm, q, 2))) {
                                     self.replenish.push((fine_cell, q, g[q], (side * nz + z) * ny + y));
                                 }
                             }
@@ -740,6 +816,9 @@ impl Refined {
                     for dz in 0..RATIO {
                         for dy in 0..RATIO {
                             let cell = self.ghost(side, y, z, [if side == 0 { 0 } else { RATIO - 1 }, dy, dz]);
+                            if !self.fine.is_fluid(cell) {
+                                continue;
+                            }
                             let mut f = self.fine.cell_populations(cell);
                             let Some(slot) = self.pending.get_mut((side * nz + z) * ny + y) else { continue };
                             for q in (0..Q).filter(|&q| !into_strip(self.perm, side, q) && cdir(self.perm, q, 0) != 0) {
@@ -795,6 +874,9 @@ impl Refined {
             for z in 0..nz {
                 for y in 0..ny {
                     let cell = self.cidx([xa, y, z]);
+                    if !self.coarse.is_fluid(cell) {
+                        continue;
+                    }
                     let mut a = self.coarse.cell_populations(cell);
                     let mut sum = [0.0; Q];
                     for dz in 0..RATIO {

@@ -128,11 +128,11 @@ fn what_is_not_supported_is_refused_with_the_reason() {
     refused(build(closed_box(), procedure(Collision::Hrr, None), Strip { first: 1, last: 12, linear: true }, &[]), "inside");
     refused(build(closed_box(), procedure(Collision::Hrr, None), Strip { first: 12, last: 18, linear: true }, &[]), "narrower");
     refused(build(closed_box(), procedure(Collision::Hrr, None), Strip { first: 12, last: 31, linear: true }, &[]), "inside");
-    // A solid next to the interface: a block in the coarse column just outside the strip.
+    // A solid that ends at the interface plane: a block in the coarse columns just outside the strip.
     let mut d = closed_box();
     d.obstacles = vec!["Block".into()];
     let block = obstacle("Block", cuboid([0.55, 0.05, 0.05], [0.64, 0.15, 0.15]), &CUBOID_FACES);
-    refused(build(d, procedure(Collision::Hrr, None), STRIP, &[block]), "fluid");
+    refused(build(d, procedure(Collision::Hrr, None), STRIP, &[block]), "solid");
 }
 
 // ---- waves through the strip -----------------------------------------------------------------
@@ -924,4 +924,83 @@ fn a_strip_across_y_or_z_is_the_x_strip_turned() {
         }
         assert!(worst <= 1e-12, "axis {axis}: the turned strip differs from the x strip by {worst:e}");
     }
+}
+
+/// Walls made of obstacle slabs that cross the interface plane give the same refined flow as the
+/// box's own wall faces: the channel `[64, 8, 4]` with its walls on the y faces against the same
+/// channel `[64, 12, 4]` with two solid layers on each side, driven alike, composite velocity and
+/// density to round-off, mass exact.
+#[test]
+fn walls_made_of_obstacles_act_like_the_box_walls_at_the_interface() {
+    let dx = 0.05;
+    let driven = |ny: usize| {
+        let mut d = all_periodic([64, ny, 4]);
+        d.faces.y_min = FaceCondition::Wall {};
+        d.faces.y_max = FaceCondition::Wall {};
+        d.acceleration = [0.002, 0.0, 0.0];
+        d
+    };
+    let walls = driven(8);
+    let mut slabs = driven(12);
+    slabs.obstacles = vec!["Lo".into(), "Hi".into()];
+    let obstacles = [
+        obstacle("Lo", cuboid([-1.0, -1.0, -1.0], [5.0, 2.0 * dx, 2.0]), &CUBOID_FACES),
+        obstacle("Hi", cuboid([-1.0, 10.0 * dx, -1.0], [5.0, 2.0, 2.0]), &CUBOID_FACES),
+    ];
+    let strip = Strip { first: 24, last: 40, linear: true };
+    let mut a =
+        Refined::new(&box_model(walls, procedure(Collision::Hrr, None)), None, &[], &Limits::default(), strip).unwrap_or_else(|e| panic!("{e}"));
+    let mut b = Refined::new(&box_model(slabs, procedure(Collision::Hrr, None)), None, &obstacles, &Limits::default(), strip)
+        .unwrap_or_else(|e| panic!("{e}"));
+    let (m0, m1) = (a.mass(), b.mass());
+    assert!((m0 - m1).abs() < 1e-9 * m0, "the same fluid: {m0} against {m1}");
+    for _ in 0..400 {
+        a.step().unwrap();
+        b.step().unwrap();
+    }
+    assert!(((b.mass() - m1) / m1).abs() <= 1e-10, "mass drift with obstacle walls");
+    let (ca, cb, ga, gb) = (a.composite_moments(), b.composite_moments(), *a.coarse().grid(), *b.coarse().grid());
+    let mut worst = 0.0f64;
+    let mut peak = 0.0f64;
+    for z in 0..4 {
+        for y in 0..8 {
+            for x in 0..64 {
+                let (p, q) = (ca[ga.index([x, y, z])], cb[gb.index([x, y + 2, z])]);
+                worst = worst.max((p.0 - q.0).abs());
+                for c in 0..3 {
+                    worst = worst.max((p.1[c] - q.1[c]).abs());
+                }
+                peak = peak.max(p.1[0]);
+            }
+        }
+    }
+    assert!(peak > 1e-3, "the channel did not accelerate: {peak:e}");
+    assert!(worst <= 1e-10 * peak.max(1.0), "obstacle walls differ from box walls by {worst:e} (peak {peak:e})");
+}
+
+/// An obstacle that does not meet the interface on coarse cell boundaries, or that ends at the
+/// interface plane, is refused with the reason.
+#[test]
+fn obstacles_that_do_not_fit_the_interface_are_refused() {
+    let dx = 0.05;
+    let strip = Strip { first: 24, last: 40, linear: true };
+    let channel = |top: f64, x_end: f64| {
+        let mut d = all_periodic([64, 12, 4]);
+        d.faces.y_min = FaceCondition::Wall {};
+        d.faces.y_max = FaceCondition::Wall {};
+        d.obstacles = vec!["Lo".into()];
+        (d, [obstacle("Lo", cuboid([-1.0, -1.0, -1.0], [x_end, top, 2.0]), &CUBOID_FACES)])
+    };
+    for (top, x_end, reason) in [(2.3 * dx, 5.0, "coarse cell boundaries"), (2.0 * dx, 24.0 * dx, "differ in being solid")] {
+        let (d, obstacles) = channel(top, x_end);
+        let r = Refined::new(&box_model(d, procedure(Collision::Hrr, None)), None, &obstacles, &Limits::default(), strip);
+        match r {
+            Err(e) => assert!(e.to_string().contains(reason), "{e}"),
+            Ok(_) => panic!("accepted an obstacle that ends at the interface or is off the cell boundaries ({reason})"),
+        }
+    }
+    let (d, obstacles) = channel(2.0 * dx, 5.0);
+    let r =
+        Refined::new(&box_model(d, procedure(Collision::Hrr, None)), None, &obstacles, &Limits::default(), strip).unwrap_or_else(|e| panic!("{e}"));
+    assert!(!r.coarse().is_fluid(r.coarse().grid().index([23, 1, 1])) && r.coarse().is_fluid(r.coarse().grid().index([23, 3, 1])));
 }
