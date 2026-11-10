@@ -78,6 +78,8 @@ pub struct Refined {
     periodic: [bool; 2],
     /// ρ and u of the coarse cells in the columns around the interface, by column offset (see `moment_columns`).
     moments: Vec<Vec<(f64, [f64; 3])>>,
+    /// Outbound populations that wall reflection left in the outer ghost layer after the first fine step, per side and coarse (y, z) cell, in coarse units.
+    pending: Vec<[f64; Q]>,
 }
 
 /// ρ and u of a set of populations.
@@ -201,13 +203,17 @@ impl Refined {
             matches!(domain.faces.y_min, FaceCondition::Periodic {}) && matches!(domain.faces.y_max, FaceCondition::Periodic {}),
             matches!(domain.faces.z_min, FaceCondition::Periodic {}) && matches!(domain.faces.z_max, FaceCondition::Periodic {}),
         ];
-        let mut refined = Refined { coarse, fine, strip, nc, nf, periodic, moments: Vec::new() };
+        let mut refined = Refined { coarse, fine, strip, nc, nf, periodic, moments: Vec::new(), pending: vec![[0.0; Q]; 2 * nc[1] * nc[2]] };
         refined.check_interface_cells()?;
         // The ghost cells hold nothing between steps.
-        for (cell, _) in refined.save_ghosts() {
-            refined.fine.set_cell_populations(cell, &[0.0; Q]);
-        }
+        refined.clear_ghosts();
         Ok(refined)
+    }
+
+    fn clear_ghosts(&mut self) {
+        for (cell, _) in self.save_ghosts() {
+            self.fine.set_cell_populations(cell, &[0.0; Q]);
+        }
     }
 
     /// The columns next to the interface must be fluid on both levels (no obstacle, no wall node).
@@ -408,17 +414,43 @@ impl Refined {
                     };
                     let sy = if linear { slope(y.checked_sub(1).map(|y| at(y, z)), (y + 1 < ny).then(|| at(y + 1, z))) } else { [0.0; Q] };
                     let sz = if linear { slope(z.checked_sub(1).map(|z| at(y, z)), (z + 1 < nz).then(|| at(y, z + 1))) } else { [0.0; Q] };
+                    let sent: Vec<usize> = (0..Q).filter(|&q| Strip::into_strip(side, q)).collect();
                     for dz in 0..RATIO {
                         for dy in 0..RATIO {
                             let (oy, oz) = (if dy == 0 { -0.25 } else { 0.25 }, if dz == 0 { -0.25 } else { 0.25 });
                             let mut g = [0.0; Q];
-                            for q in (0..Q).filter(|&q| Strip::into_strip(side, q) && self.neighbour_exists(y, z, C[q][1], C[q][2])) {
+                            for &q in &sent {
                                 g[q] = a[q] + oy * sy[q] + oz * sz[q];
                             }
                             for dx in 0..RATIO {
                                 let cell = self.ghost(side, y, z, [dx, dy, dz]);
                                 self.fine.set_cell_populations(cell, &g);
                             }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// After the first fine step: what wall reflection has left in the outer ghost layer, pointing
+    /// out of the strip, would be pulled across the fine box's periodic seam by the next step. It is
+    /// taken out now, into `pending`, and joins the sum at the end of the coarse step.
+    fn harvest_outer_ghosts(&mut self) {
+        let [_, ny, nz] = self.nc;
+        for side in 0..2 {
+            for z in 0..nz {
+                for y in 0..ny {
+                    for dz in 0..RATIO {
+                        for dy in 0..RATIO {
+                            let cell = self.ghost(side, y, z, [if side == 0 { 0 } else { RATIO - 1 }, dy, dz]);
+                            let mut f = self.fine.cell_populations(cell);
+                            let Some(slot) = self.pending.get_mut((side * nz + z) * ny + y) else { continue };
+                            for q in (0..Q).filter(|&q| !Strip::into_strip(side, q) && C[q][0] != 0) {
+                                slot[q] += f[q] / (RATIO * RATIO * RATIO) as f64;
+                                f[q] = 0.0;
+                            }
+                            self.fine.set_cell_populations(cell, &f);
                         }
                     }
                 }
@@ -477,16 +509,15 @@ impl Refined {
                             if !self.neighbour_exists(y, z, -C[q][1], -C[q][2]) {
                                 a[q] += sum[q];
                             }
-                        } else if self.neighbour_exists(y, z, -C[q][1], -C[q][2]) {
-                            a[q] = sum[q];
                         } else {
-                            a[q] += sum[q];
+                            a[q] = sum[q] + self.pending.get((side * nz + z) * ny + y).map_or(0.0, |p| p[q]);
                         }
                     }
                     self.coarse.set_cell_populations(cell, &a);
                 }
             }
         }
+        self.pending.iter_mut().for_each(|p| *p = [0.0; Q]);
     }
 
     /// One coarse step (two fine steps).
@@ -500,6 +531,7 @@ impl Refined {
         self.coarse.step_stream()?;
         self.fine.step_stream()?;
         // Second fine step: the ghost cells keep what they hold through the collision.
+        self.harvest_outer_ghosts();
         let saved = self.save_ghosts();
         self.fill_ghost_equilibrium();
         self.fine.step_collide()?;
@@ -509,6 +541,42 @@ impl Refined {
         self.fine.step_stream()?;
         self.restrict();
         Ok(())
+    }
+
+    /// Start both levels from a given state: `state(x)` is the density and velocity (lattice
+    /// units) at `x`, a position in coarse cells (the cell `i` has its centre at `i + 0.5`).
+    pub fn initialise(&mut self, state: &dyn Fn([f64; 3]) -> (f64, [f64; 3])) {
+        let at = |flow: &mut Flow, scale: f64| {
+            for cell in 0..flow.grid().len() {
+                let c = flow.grid().coords(cell);
+                let x = [0, 1, 2].map(|a| (c[a] as f64 + 0.5) * scale);
+                let (rho, u) = state(x);
+                flow.set_cell_populations(cell, &equilibrium(rho, u));
+            }
+        };
+        at(&mut self.coarse, 1.0);
+        // The fine grid starts at the interface column `first − 1`, in half cells.
+        let offset = (self.strip.first - 1) as f64;
+        for cell in 0..self.fine.grid().len() {
+            let c = self.fine.grid().coords(cell);
+            let x = [offset + (c[0] as f64 + 0.5) / RATIO as f64, (c[1] as f64 + 0.5) / RATIO as f64, (c[2] as f64 + 0.5) / RATIO as f64];
+            let (rho, u) = state(x);
+            self.fine.set_cell_populations(cell, &equilibrium(rho, u));
+        }
+        self.clear_ghosts();
+    }
+
+    /// One coarse step of the coarse flow alone, as if there were no strip: the baseline a
+    /// refined run is compared with.
+    pub fn step_unrefined(&mut self) -> Result<()> {
+        self.coarse.step()
+    }
+
+    /// The moments of every coarse cell, covered ones included (the coarse flow alone).
+    pub fn coarse_moments(&self) -> Vec<(f64, [f64; 3])> {
+        (0..self.coarse.grid().len())
+            .map(|c| if self.coarse.is_fluid(c) { moments_of(&self.coarse.cell_populations(c)) } else { (0.0, [0.0; 3]) })
+            .collect()
     }
 
     /// The mass in fine-cell units: the coarse cells outside the strip (8 each) and the fine cells.
