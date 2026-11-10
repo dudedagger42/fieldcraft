@@ -959,7 +959,7 @@ pub const FLUID_DOMAIN: &[Field] = &[
     ABSORBING,
     RADIAL_INFLOW,
     positive("moving_wall_ramp", "Moving-wall ramp", D::Time)
-        .help("How long every moving wall takes to reach its velocity from rest, with a smooth (cosine) start: a wall or inlet face switched on at full speed sends a pressure pulse through the box. Left out or 0, the walls move at full speed from the first step.")
+        .help("How long every moving wall takes to reach its velocity from rest, with a smooth (cosine) start: a wall switched on at full speed sends a pressure pulse through the box. It ramps moving walls only, not the cells of a velocity inlet, which run at their velocity from the first step. Left out or 0, the walls move at full speed from the first step.")
         .hint("none"),
 ];
 

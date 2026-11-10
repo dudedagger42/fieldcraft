@@ -84,6 +84,7 @@ moving wall** of the domain, box faces and obstacle faces alike, from rest:
 - **The ramp:** each wall moves at r(t) u_w, with r(t) = ½ (1 − cos(π t / T)) until T, then exactly
   at u_w.
 - **Without one:** left out or 0, the walls move at full speed from the first step.
+- **Inlets are not ramped:** the cells of a velocity inlet run at their velocity from the first step, ramp or not; only wall links follow the ramp.
 - **Why it helps:** a wall switched on at full speed sends a pressure pulse through the box.
   Through narrow passages at small τ − ½, that pulse can run away before any outflow forms. So can
   an obstacle face whose velocity has a normal part, which injects or removes mass.
