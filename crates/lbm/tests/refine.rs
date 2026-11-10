@@ -633,6 +633,11 @@ fn the_interface_report_names_the_les_share() {
 /// converted to the model's SI ones through dx = 0.05 m and dt = 0.025 s (speeds ×2, viscosity ×0.1,
 /// acceleration ×80).
 fn turbulent_channel() -> Model {
+    turbulent_channel_at(false)
+}
+
+/// The same channel on a grid of half the spacing and time step (`fine`).
+fn turbulent_channel_at(fine: bool) -> Model {
     let (u_tau, h, re_tau): (f64, f64, f64) = (0.003, 12.0, 180.0);
     let nu_lat = u_tau * h / re_tau;
     let g_lat = u_tau * u_tau / h;
@@ -641,7 +646,10 @@ fn turbulent_channel() -> Model {
     d.faces.y_max = FaceCondition::Wall {};
     d.acceleration = [g_lat * 80.0, 0.0, 0.0];
     let sa = Turbulence::SpalartAllmaras { prandtl: 0.9, wall_model: None, inflow_ratio: 3.0, ddes: None };
-    model(1.0, nu_lat * 0.1, d, procedure(Collision::Hrr, Some(sa)))
+    if fine {
+        d.spacing = 0.025;
+    }
+    model(1.0, nu_lat * 0.1, d, procedure_dt(Collision::Hrr, Some(sa), if fine { 0.0125 } else { 0.025 }))
 }
 
 /// The strip across the turbulent channel, refined against unrefined, both with the model: mean
@@ -710,4 +718,164 @@ fn a_turbulent_channel_through_the_strip_matches_the_unrefined_one() {
     }
     let (du, dn) = history.last().copied().unwrap_or((1.0, 1.0));
     assert!(du <= 0.015 && dn <= 0.10, "velocity {du:e} of the peak, nu_t {dn:e}");
+}
+
+// ---- the turbulent channel job: refined, unrefined and uniform fine, run to steady --------------
+
+const JOB_COLUMNS: [usize; 8] = [10, 20, 23, 24, 30, 40, 41, 50];
+
+/// One case of the job, `JOB_CASE` = `refined`, `unrefined` or `fine`, for `JOB_STEPS` coarse steps
+/// (default 100 000; the fine case takes twice as many of its own), writing `JOB_OUT/<case>.history.csv`
+/// (every 1000 coarse steps: the peak velocity of column 10 and the largest ν̃, coarse lattice units)
+/// and `JOB_OUT/<case>.profiles.txt` (`column y u nu_tilde` per coarse cell at the end).
+#[test]
+#[ignore = "job: the turbulent channel to steady state, see the job script"]
+fn turbulent_channel_job() {
+    use std::io::Write;
+    let case = std::env::var("JOB_CASE").unwrap_or_else(|_| "refined".into());
+    let steps: usize = std::env::var("JOB_STEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(100_000);
+    let out = std::path::PathBuf::from(std::env::var("JOB_OUT").unwrap_or_else(|_| ".".into()));
+    let fine = case == "fine";
+    let m = turbulent_channel_at(fine);
+    let strip = if fine { Strip { first: 48, last: 80, linear: true } } else { Strip { first: 24, last: 40, linear: true } };
+    let mut r = Refined::new(&m, None, &[], &Limits::default(), strip).unwrap_or_else(|e| panic!("{e}"));
+    let nu = (1.0 / r.coarse().omegas().0 - 0.5) / 3.0 / if fine { 2.0 } else { 1.0 };
+    let (u_tau, kappa): (f64, f64) = (0.003, 0.41);
+    let scale = if fine { 0.5 } else { 1.0 };
+    r.initialise(&|x| {
+        let d = (x[1] * scale).min(24.0 - x[1] * scale).max(0.5);
+        let yplus = (d * u_tau / nu).max(1.0);
+        (1.0, [u_tau * (yplus.ln() / kappa + 5.0).min(25.0), 0.0, 0.0])
+    });
+    r.initialise_nu_tilde(&|x| (if fine { 2.0 } else { 1.0 }) * (kappa * u_tau * (x[1] * scale).min(24.0 - x[1] * scale).max(0.5)).max(3.0 * nu))
+        .unwrap_or_else(|e| panic!("{e}"));
+    let g = *r.coarse().grid();
+    // Per coarse cell of the 64 x 24 x 4 channel: u_x and ν̃ in coarse lattice units.
+    let fields = |r: &Refined| -> (Vec<f64>, Vec<f64>) {
+        let (n, k) = if case == "refined" { (r.composite_moments(), r.composite_nu_tilde()) } else { (r.coarse_moments(), r.coarse_nu_tilde()) };
+        if !fine {
+            return (n.iter().map(|m| m.1[0]).collect(), k);
+        }
+        let mut u = vec![0.0; 64 * 24 * 4];
+        let mut nt = vec![0.0; 64 * 24 * 4];
+        for z in 0..4 {
+            for y in 0..24 {
+                for x in 0..64 {
+                    for c in 0..8 {
+                        let i = g.index([2 * x + c % 2, 2 * y + (c / 2) % 2, 2 * z + c / 4]);
+                        u[(z * 24 + y) * 64 + x] += n[i].1[0] / 8.0;
+                        nt[(z * 24 + y) * 64 + x] += k[i] / 16.0;
+                    }
+                }
+            }
+        }
+        (u, nt)
+    };
+    let at = |x: usize, y: usize| (24 + y) * 64 + x;
+    let mut history = std::fs::File::create(out.join(format!("{case}.history.csv"))).unwrap_or_else(|e| panic!("{e}"));
+    writeln!(history, "step,peak_u_column_10,max_nu_tilde").ok();
+    for step in 0..steps {
+        if case == "refined" {
+            r.step().unwrap();
+        } else {
+            // The fine case takes two of its own (half-size) steps for each coarse one.
+            for _ in 0..if fine { 2 } else { 1 } {
+                r.step_unrefined().unwrap();
+            }
+        }
+        if (step + 1) % 1000 == 0 {
+            let (u, nt) = fields(&r);
+            let peak = (0..24).map(|y| u[at(10, y)]).fold(0.0f64, f64::max);
+            let max_nt = nt.iter().cloned().fold(0.0f64, f64::max);
+            writeln!(history, "{},{peak:.6e},{max_nt:.6e}", step + 1).ok();
+            history.flush().ok();
+        }
+    }
+    let (u, nt) = fields(&r);
+    let mut profiles = std::fs::File::create(out.join(format!("{case}.profiles.txt"))).unwrap_or_else(|e| panic!("{e}"));
+    for x in JOB_COLUMNS {
+        for y in 0..24 {
+            writeln!(profiles, "{x} {y} {:.8e} {:.8e}", u[at(x, y)], nt[at(x, y)]).ok();
+        }
+    }
+    writeln!(profiles, "nu {nu:.8e}").ok();
+}
+
+type Profiles = std::collections::HashMap<(usize, usize), (f64, f64)>;
+
+fn read_profiles(out: &std::path::Path, case: &str) -> (Profiles, f64) {
+    let text = std::fs::read_to_string(out.join(format!("{case}.profiles.txt"))).unwrap_or_else(|e| panic!("{case}: {e}"));
+    let (mut map, mut nu) = (Profiles::new(), 0.0);
+    for line in text.lines() {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        match f.as_slice() {
+            ["nu", v] => nu = v.parse().unwrap_or(0.0),
+            [x, y, u, k] => {
+                map.insert((x.parse().unwrap_or(0), y.parse().unwrap_or(0)), (u.parse().unwrap_or(0.0), k.parse().unwrap_or(0.0)));
+            }
+            _ => {}
+        }
+    }
+    (map, nu)
+}
+
+/// Reads the three cases of the job from `JOB_OUT` and writes `JOB_OUT/results.txt`: the profile
+/// errors of the refined run against the uniform fine one, at the far-field and the interface
+/// columns, ν_t at the interface columns, and the steady-state evidence of each case.
+#[test]
+#[ignore = "job: the turbulent channel report, see the job script"]
+fn turbulent_channel_job_report() {
+    let out = std::path::PathBuf::from(std::env::var("JOB_OUT").unwrap_or_else(|_| ".".into()));
+    let ((refined, nu), (unrefined, _), (fine, _)) = (read_profiles(&out, "refined"), read_profiles(&out, "unrefined"), read_profiles(&out, "fine"));
+    let peak = (0..24).map(|y| fine[&(10, y)].0).fold(0.0f64, f64::max);
+    let mut lines = vec![format!("peak velocity of the fine run, column 10: {peak:.4e} (lattice units)")];
+    let err = |a: &Profiles, x: usize| (0..24).map(|y| (a[&(x, y)].0 - fine[&(x, y)].0).abs()).fold(0.0f64, f64::max) / peak;
+    let (mut far, mut face) = (0.0f64, 0.0f64);
+    for x in JOB_COLUMNS {
+        let (er, eu) = (err(&refined, x), err(&unrefined, x));
+        lines.push(format!("column {x:2}: velocity error against the fine run, refined {er:.3e}, unrefined {eu:.3e} of the peak"));
+        if [10, 20, 50].contains(&x) {
+            far = far.max(er);
+        } else {
+            face = face.max(er);
+        }
+    }
+    let mut worst_nt = 0.0f64;
+    for x in [23, 40] {
+        let nt_max = (0..24).map(|y| fieldcraft_lbm::sa::nu_t(fine[&(x, y)].1, nu)).fold(0.0f64, f64::max);
+        let mut e = 0.0f64;
+        for y in 0..24 {
+            let tf = fieldcraft_lbm::sa::nu_t(fine[&(x, y)].1, nu);
+            if tf > 0.1 * nt_max {
+                e = e.max((fieldcraft_lbm::sa::nu_t(refined[&(x, y)].1, nu) - tf).abs() / tf);
+            }
+        }
+        lines.push(format!("column {x:2}: nu_t error against the fine run {e:.3e}"));
+        worst_nt = worst_nt.max(e);
+    }
+    lines
+        .push(format!("far field {far:.3e}, interface and strip {face:.3e}, excess {:.3e} (bar 1.5e-2); nu_t {worst_nt:.3e} (bar 1e-1)", face - far));
+    for case in ["refined", "unrefined", "fine"] {
+        let text = std::fs::read_to_string(out.join(format!("{case}.history.csv"))).unwrap_or_default();
+        let rows: Vec<(f64, f64)> = text
+            .lines()
+            .skip(1)
+            .filter_map(|l| {
+                let f: Vec<&str> = l.split(',').collect();
+                Some((f.get(1)?.parse().ok()?, f.get(2)?.parse().ok()?))
+            })
+            .collect();
+        let last: Vec<&(f64, f64)> = rows.iter().rev().take(20).collect();
+        let spread = |pick: fn(&(f64, f64)) -> f64| {
+            let (lo, hi) = last.iter().fold((f64::MAX, f64::MIN), |(lo, hi), r| (lo.min(pick(r)), hi.max(pick(r))));
+            (hi - lo) / hi.abs().max(1e-300)
+        };
+        lines.push(format!(
+            "{case}: over the last 20k steps the peak velocity moved by {:.2e} and the largest nu_tilde by {:.2e} (relative range)",
+            spread(|r| r.0),
+            spread(|r| r.1)
+        ));
+    }
+    std::fs::write(out.join("results.txt"), lines.join("\n") + "\n").unwrap_or_else(|e| panic!("{e}"));
+    eprintln!("{}", lines.join("\n"));
 }
