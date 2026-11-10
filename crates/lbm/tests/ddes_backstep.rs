@@ -961,9 +961,15 @@ fn sa_step(sa: Turbulence) -> Step {
     Step { cells_per_h, ..Step::driver_seegmiller(sa, 0.0) }
 }
 
-/// The SA run's model.
+/// The SA run's model: on Han's on-node wall with Spalding's law, or with the model's own with
+/// `FIELDCRAFT_WALL_LAW=spalart_allmaras`.
 fn sa_rans() -> Turbulence {
-    Turbulence::SpalartAllmaras { prandtl: 0.9, wall_model: Some(WallModel::SpaldingBounce), inflow_ratio: 3.0, ddes: None }
+    let wall = if std::env::var("FIELDCRAFT_WALL_LAW").is_ok_and(|v| v == "spalart_allmaras") {
+        WallModel::SpalartAllmarasBounce
+    } else {
+        WallModel::SpaldingBounce
+    };
+    Turbulence::SpalartAllmaras { prandtl: 0.9, wall_model: Some(wall), inflow_ratio: 3.0, ddes: None }
 }
 
 /// The floor's u = 0 crossing ([`WallCrossing`]) in an SA run's restart file

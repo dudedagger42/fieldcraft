@@ -833,8 +833,14 @@ fn study_spalart_allmaras_on_han_s_wall_meets_karman_schoenherr() {
         grid.absorbing = grid.absorbing.map(|a| AbsorbingLayer { filter_time: Some(0.25 * period * grid.lattice_velocity * dx), ..a });
     }
     println!("2DZP study: absorbing layer {:?}", grid.absorbing);
-    let sa =
-        Turbulence::SpalartAllmaras { prandtl: 0.9, wall_model: Some(fieldcraft_model::WallModel::SpaldingBounce), inflow_ratio: 3.0, ddes: None };
+    // `FIELDCRAFT_WALL_LAW=spalart_allmaras` runs the model's own wall law instead of Spalding's.
+    let wall = if std::env::var("FIELDCRAFT_WALL_LAW").is_ok_and(|v| v == "spalart_allmaras") {
+        fieldcraft_model::WallModel::SpalartAllmarasBounce
+    } else {
+        fieldcraft_model::WallModel::SpaldingBounce
+    };
+    println!("2DZP study: wall model {wall:?}");
+    let sa = Turbulence::SpalartAllmaras { prandtl: 0.9, wall_model: Some(wall), inflow_ratio: 3.0, ddes: None };
     let checkpoint = std::env::var_os("FIELDCRAFT_PLATE_CHECKPOINT").map(std::path::PathBuf::from);
     let r = tmr_2dzp(sa, grid, checkpoint);
     assert!(r.settled, "not settled in {} steps", r.steps);

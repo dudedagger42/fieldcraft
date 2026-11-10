@@ -774,3 +774,71 @@ fn sa_law_channel_at_re_tau_1000_meets_lee_and_moser() {
     assert!(failures.is_empty(), "{failures:?}");
     assert!(score.passes());
 }
+
+/// Lee & Moser's Re_τ 543.496 channel (header: ν = 1e-4, u_τ = 5.43496e-2, Re_b = 2 δ U_b / ν =
+/// 20 000, so U_b = 1 in units of u_τ / 0.0543496 and C_f = 2 (u_τ / U_b)²); the centreline U⁺ of
+/// their mean profile is 21.00. Not used to choose the wall law or its constants.
+const LEE_MOSER_550_RE_TAU: f64 = 543.496;
+const LEE_MOSER_550_BULK: f64 = 1.0 / 0.0543496;
+const LEE_MOSER_550_CF: f64 = 2.0 * 0.0543496 * 0.0543496;
+const LEE_MOSER_550_CENTRE: f64 = 21.0;
+
+/// The held-out check of the Spalart–Allmaras wall law: Re_τ 543, a Reynolds number the law was
+/// not built or tuned on (Re_τ 182 and 1000 were), MRT and the hybrid collision at σ 0.99, 16 and
+/// 24 cells per δ (the first node at y⁺ 34 and 23). Gates: centreline U⁺ within 2.5 % of Lee &
+/// Moser, carried C_f within 5 %, the request within 1 % of the carried stress.
+///
+/// Run once, as written (3 threads, 7 s), no change made after it:
+///
+/// | collision | cells per δ (y⁺₁) | centre U⁺ (ref 21.0) | C_f carried (ref 5.908e-3) |
+/// |---|---|---|---|
+/// | MRT | 16 (34) | 20.657 (−1.63 %) | 5.959e-3 (+0.86 %) |
+/// | MRT | 24 (23) | 20.801 (−0.95 %) | 5.862e-3 (−0.77 %) |
+/// | HRR σ 0.99 | 16 (34) | 20.603 (−1.89 %) | 5.992e-3 (+1.43 %) |
+/// | HRR σ 0.99 | 24 (23) | 20.735 (−1.26 %) | 5.911e-3 (+0.06 %) |
+#[test]
+#[ignore = "heavy: cargo xtask test --heavy (CI heavy job)"]
+fn sa_law_channel_at_re_tau_550_meets_lee_and_moser() {
+    let mut score = Score::default();
+    let mut failures = Vec::new();
+    for (collision, sigma) in [(Collision::Mrt, None), (Collision::Hrr, Some(0.99))] {
+        for cells in [16, 24] {
+            let r = Channel {
+                re_tau: LEE_MOSER_550_RE_TAU,
+                cells,
+                bulk_guess: LEE_MOSER_550_BULK,
+                lattice_bulk: 0.1,
+                collision,
+                sigma,
+                turbulence: Some(sa(WallModel::SpalartAllmarasBounce)),
+                on_node: true,
+                slabs: false,
+                max_steps: 2_000_000,
+                sample: 100,
+                settling: GATED,
+            }
+            .run();
+            let name = format!("SA law, {collision:?}, {cells} cells per δ (first node y⁺ {:.0})", LEE_MOSER_550_RE_TAU / cells as f64);
+            report(&name, &r, LEE_MOSER_550_BULK, LEE_MOSER_550_CF);
+            println!("{name}: centre U⁺ {:.3} ({:+.2} % of {LEE_MOSER_550_CENTRE})", r.centre, 100.0 * (r.centre / LEE_MOSER_550_CENTRE - 1.0));
+            score.push(Gate::new("SA law channel 550", &format!("{name}: centre U⁺"), r.centre, LEE_MOSER_550_CENTRE, 0.025));
+            score.push(Gate::new("SA law channel 550", &format!("{name}: C_f carried"), r.carried, LEE_MOSER_550_CF, 0.05));
+            score.push(Gate::new(
+                "SA law channel 550",
+                &format!("{name}: requested / carried"),
+                r.requested.unwrap_or(f64::NAN) / r.carried,
+                1.0,
+                0.01,
+            ));
+            if !r.settled {
+                failures.push(format!("{name}: not settled in {} steps", r.steps));
+            }
+            if !r.min_nu_tilde.is_some_and(|v| v >= 0.0) {
+                failures.push(format!("{name}: ν̃ below 0 ({:?})", r.min_nu_tilde));
+            }
+        }
+    }
+    println!("{}", score.table());
+    assert!(failures.is_empty(), "{failures:?}");
+    assert!(score.passes());
+}
