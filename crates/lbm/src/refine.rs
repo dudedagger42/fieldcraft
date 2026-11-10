@@ -17,8 +17,9 @@
 //!    hand the post-collision populations that point into the strip to the ghost cells of the fine
 //!    flow that cover them (8 cells per coarse cell). Rohde puts the same value in all 8; here the
 //!    populations are reconstructed linearly along the interface, `f ∓ slope / 4` in the two fine
-//!    cells of a coarse cell along y and z (the slope a central difference of the neighbouring
-//!    coarse cells, zero where a neighbour is missing): the offsets cancel, so mass is exact, and the
+//!    cells of a coarse cell along y and z, the conservative piecewise-linear reconstruction of
+//!    B. van Leer, J. Comput. Phys. 32:101–136, 1979 (the slope a central difference of the
+//!    neighbouring coarse cells, one-sided next to a wall, zero where there is no neighbour): the offsets cancel, so mass is exact, and the
 //!    equal split's smearing along the interface (an error that falls as the square of the
 //!    wavelength, 4 % of a convected shear wave's amplitude at 16 cells) is gone.
 //! 2. Both levels stream; the ghost cells' populations travel into the strip, and what the strip
@@ -35,10 +36,25 @@
 //! No interpolation or rescaling of populations is applied (Rohde's variant; the study found the
 //! rescaling of the non-equilibrium part shifts a convected wave's phase and gains nothing).
 //!
+//! # Walls that meet the interface
+//! A wall along y or z reaches the interface plane. A fine ghost cell at the wall cannot reflect a
+//! population it never held, so the inner ghost cells next to a wall are handed, in the second
+//! fine step, the population their reflection would have supplied (the coarse cell gives up the
+//! same amount, so mass stays exact); what wall reflection leaves in the outer ghost layer
+//! after the first fine step is collected before the fine box's periodic seam can carry it off.
+//!
+//! # The Spalart–Allmaras model
+//! ν̃ is transported on both levels. The fine ghost cells take the coarse ν̃ interpolated like the
+//! moments, in the fine level's lattice units (twice the coarse value: a lattice viscosity doubles
+//! when the spacing halves at the same lattice speed), at the start of the coarse step for the
+//! first fine step and half-way to its end for the second; the covered coarse cells take the mean
+//! of the fine ν̃ in them. Each level has its own wall distance (its own grid). A wall function is
+//! refused.
+//!
 //! # Not supported yet
 //! One strip with interfaces normal to x, spanning the box in y and z; the hybrid recursive
-//! regularised or regularised collision without an eddy-viscosity model (a Smagorinsky constant
-//! below 1e-3 is allowed: it is how a low τ is admitted); no heat, free surface, porous zone, fan,
+//! regularised or regularised collision with no eddy-viscosity model but Spalart–Allmaras (also
+//! with DDES; a Smagorinsky constant below 1e-3 is allowed: it is how a low τ is admitted); no heat, free surface, porous zone, fan,
 //! absorbing layer, moving wall or obstacle surface condition; no wall-function bounce. Each is
 //! refused with the reason.
 
@@ -85,6 +101,23 @@ pub struct Refined {
     replenish: Vec<(usize, usize, f64, usize)>,
     /// What was put back, per side and coarse (y, z) cell, in coarse units: the coarse cell gives it up.
     replenished: Vec<[f64; Q]>,
+    /// Whether the Spalart–Allmaras model runs on both levels.
+    sa: bool,
+    /// Scratch of [`Refined::step`]: the ghost cells' populations, kept for its capacity.
+    saved: Vec<(usize, [f64; Q])>,
+    /// ν̃ of the coarse cells in the same columns as `moments`.
+    nu_tilde: Vec<Vec<f64>>,
+    /// The same after the coarse step's transport (the end of the coarse step).
+    nu_tilde_next: Vec<Vec<f64>>,
+}
+
+/// What the interface columns hold, see [`Refined::interface_report`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct InterfaceReport {
+    pub nu_t_over_nu_max: f64,
+    pub nu_t_over_nu_mean: f64,
+    /// The share of interface cells in DDES's LES mode (none without DDES).
+    pub les_share: Option<f64>,
 }
 
 /// ρ and u of a set of populations.
@@ -132,6 +165,7 @@ impl Refined {
         match turbulence {
             None => {}
             Some(Turbulence::Smagorinsky { constant, van_driest: None, wall_model: None, .. }) if *constant <= NEGLIGIBLE_SMAGORINSKY => {}
+            Some(Turbulence::SpalartAllmaras { wall_model: None, .. }) => {}
             Some(_) => {
                 return refuse("an eddy-viscosity or turbulence model (the fine level's relaxation time is scaled from the molecular viscosity)");
             }
@@ -168,6 +202,10 @@ impl Refined {
             let flow = Flow::new(&setup, obstacles)?;
             (setup, flow)
         };
+        let sa = coarse.spalart_allmaras().is_some();
+        if sa && coarse.sa_wall_function().0.is_some() {
+            return refuse("a wall function with the Spalart–Allmaras model");
+        }
         if coarse.on_node_bounce() {
             return refuse("the on-node wall-function bounce");
         }
@@ -219,6 +257,10 @@ impl Refined {
             pending: vec![[0.0; Q]; 2 * nc[1] * nc[2]],
             replenish: Vec::new(),
             replenished: vec![[0.0; Q]; 2 * nc[1] * nc[2]],
+            sa,
+            saved: Vec::new(),
+            nu_tilde: Vec::new(),
+            nu_tilde_next: Vec::new(),
         };
         refined.check_interface_cells()?;
         // The ghost cells hold nothing between steps.
@@ -272,6 +314,69 @@ impl Refined {
         self.fine.cell_populations(self.fine.grid().index([x, y, z]))
     }
 
+    /// ν̃ of a coarse and a fine cell in physical (coarse lattice) units, for studies.
+    pub fn nu_tilde_coarse(&self, x: usize, y: usize, z: usize) -> Option<f64> {
+        self.coarse.sa_value(self.coarse.grid().index([x, y, z]))
+    }
+
+    pub fn nu_tilde_fine(&self, x: usize, y: usize, z: usize) -> Option<f64> {
+        self.fine.sa_value(self.fine.grid().index([x, y, z])).map(|v| v / RATIO as f64)
+    }
+
+    /// Both levels transport ν̃ without production or destruction, for verification.
+    pub fn set_sa_transport_only(&mut self) {
+        self.coarse.set_sa_model(false);
+        self.fine.set_sa_model(false);
+    }
+
+    /// Start ν̃ on both levels from `value(x)` (coarse lattice units, `x` in coarse cells as in
+    /// [`Refined::initialise`]).
+    pub fn initialise_nu_tilde(&mut self, value: &dyn Fn([f64; 3]) -> f64) -> Result<()> {
+        let mut c = Vec::new();
+        for cell in 0..self.coarse.grid().len() {
+            if self.coarse.is_fluid(cell) {
+                let p = self.coarse.grid().coords(cell);
+                c.push((cell, value([0, 1, 2].map(|a| p[a] as f64 + 0.5))));
+            }
+        }
+        self.coarse.sa_impose(&c)?;
+        let offset = (self.strip.first - 1) as f64;
+        let mut f = Vec::new();
+        for cell in 0..self.fine.grid().len() {
+            if self.fine.is_fluid(cell) {
+                let p = self.fine.grid().coords(cell);
+                let x = [offset + (p[0] as f64 + 0.5) / RATIO as f64, (p[1] as f64 + 0.5) / RATIO as f64, (p[2] as f64 + 0.5) / RATIO as f64];
+                f.push((cell, RATIO as f64 * value(x)));
+            }
+        }
+        self.fine.sa_impose(&f)
+    }
+
+    /// ν̃ per coarse cell (coarse lattice units): the coarse level outside the strip, the mean of the fine cells in it.
+    pub fn composite_nu_tilde(&self) -> Vec<f64> {
+        let Strip { first, last, .. } = self.strip;
+        let g = self.coarse.grid();
+        (0..g.len())
+            .map(|cell| {
+                let [x, y, z] = g.coords(cell);
+                if !(first..last).contains(&x) {
+                    return self.coarse.sa_value(cell).unwrap_or(0.0);
+                }
+                let mut sum = 0.0;
+                for k in 0..8 {
+                    let fc = self.fine.grid().index([RATIO * (x - (first - 1)) + k % 2, RATIO * y + (k / 2) % 2, RATIO * z + k / 4]);
+                    sum += self.fine.sa_value(fc).unwrap_or(0.0);
+                }
+                sum / 8.0 / RATIO as f64
+            })
+            .collect()
+    }
+
+    /// ν̃ per coarse cell of the coarse level alone.
+    pub fn coarse_nu_tilde(&self) -> Vec<f64> {
+        (0..self.coarse.grid().len()).map(|c| self.coarse.sa_value(c).unwrap_or(0.0)).collect()
+    }
+
     pub fn coarse(&self) -> &Flow {
         &self.coarse
     }
@@ -303,7 +408,7 @@ impl Refined {
     }
 
     /// The covered coarse cells take the equilibrium of the average moments of the fine cells in them.
-    fn fill_covered(&mut self) {
+    fn fill_covered(&mut self) -> Result<()> {
         let Strip { first, last, .. } = self.strip;
         let [_, ny, nz] = self.nc;
         for z in 0..nz {
@@ -313,7 +418,7 @@ impl Refined {
                     if !self.coarse.is_fluid(cell) {
                         continue;
                     }
-                    let (mut rho, mut j, mut n) = (0.0, [0.0; 3], 0.0);
+                    let (mut rho, mut j, mut n, mut nu_tilde) = (0.0, [0.0; 3], 0.0, 0.0);
                     for dz in 0..RATIO {
                         for dy in 0..RATIO {
                             for dx in 0..RATIO {
@@ -327,8 +432,12 @@ impl Refined {
                                     j[a] += r * u[a];
                                 }
                                 n += 1.0;
+                                nu_tilde += self.fine.sa_value(fc).unwrap_or(0.0);
                             }
                         }
+                    }
+                    if self.sa && n > 0.0 {
+                        self.coarse.sa_impose(&[(cell, nu_tilde / n / RATIO as f64)])?;
                     }
                     if n > 0.0 && rho > 0.0 {
                         let mean = rho / n;
@@ -337,6 +446,7 @@ impl Refined {
                 }
             }
         }
+        Ok(())
     }
 
     /// ρ and u of the coarse cells in the columns that the ghost interpolation reads.
@@ -356,11 +466,32 @@ impl Refined {
                 v
             })
             .collect();
+        if self.sa {
+            self.nu_tilde = self.snapshot_nu_tilde();
+        }
+    }
+
+    /// ν̃ of the coarse cells in the columns the ghost interpolation reads.
+    fn snapshot_nu_tilde(&self) -> Vec<Vec<f64>> {
+        let Strip { first, last, .. } = self.strip;
+        let [_, ny, nz] = self.nc;
+        [first - 2, first - 1, first, last - 1, last, last + 1]
+            .iter()
+            .map(|&x| {
+                let mut v = Vec::with_capacity(ny * nz);
+                for z in 0..nz {
+                    for y in 0..ny {
+                        v.push(self.coarse.sa_value(self.coarse.grid().index([x, y, z])).unwrap_or(0.0));
+                    }
+                }
+                v
+            })
+            .collect()
     }
 
     /// The coarse moments at fine ghost cell `(xf, yf, zf)` of `side`, interpolated linearly in
     /// x, y and z between the coarse cell centres (clamped at the box faces).
-    fn interpolate(&self, side: usize, dx: usize, yf: usize, zf: usize) -> (f64, [f64; 3]) {
+    fn stencil(&self, side: usize, dx: usize, yf: usize, zf: usize) -> [(usize, usize, f64); 8] {
         let [_, ny, nz] = self.nc;
         // Position in coarse cell units relative to the interface column's centre, along x.
         let along = (dx as f64 + 0.5) / RATIO as f64 - 0.5;
@@ -389,25 +520,48 @@ impl Refined {
         };
         let (y0, y1, ty) = axis(fy, ny, self.periodic[0]);
         let (z0, z1, tz) = axis(fz, nz, self.periodic[1]);
-        let mut rho = 0.0;
-        let mut j = [0.0; 3];
+        let mut out = [(0, 0, 0.0); 8];
+        let mut k = 0;
         for (c, wx) in [(col0, 1.0 - tx), (col1, tx)] {
             for (z, wz) in [(z0, 1.0 - tz), (z1, tz)] {
                 for (y, wy) in [(y0, 1.0 - ty), (y1, ty)] {
-                    let w = wx * wy * wz;
-                    let (r, u) = self.moments.get(c).and_then(|m| m.get(z * ny + y)).copied().unwrap_or((1.0, [0.0; 3]));
-                    rho += w * r;
-                    for a in 0..3 {
-                        j[a] += w * u[a];
-                    }
+                    out[k] = (c, z * ny + y, wx * wy * wz);
+                    k += 1;
                 }
+            }
+        }
+        out
+    }
+
+    /// The coarse moments at fine ghost cell `(dx, yf, zf)` of `side`.
+    fn interpolate(&self, side: usize, dx: usize, yf: usize, zf: usize) -> (f64, [f64; 3]) {
+        let mut rho = 0.0;
+        let mut j = [0.0; 3];
+        for (c, i, w) in self.stencil(side, dx, yf, zf) {
+            let (r, u) = self.moments.get(c).and_then(|m| m.get(i)).copied().unwrap_or((1.0, [0.0; 3]));
+            rho += w * r;
+            for a in 0..3 {
+                j[a] += w * u[a];
             }
         }
         (rho, j)
     }
 
+    /// ν̃ of the coarse level interpolated to fine ghost cell `(dx, yf, zf)` of `side`, in the fine
+    /// level's lattice units (a lattice viscosity doubles when the spacing halves at the same lattice speed).
+    fn interpolate_nu_tilde(&self, side: usize, dx: usize, yf: usize, zf: usize, later: f64) -> f64 {
+        let at = |v: &[Vec<f64>], c: usize, i: usize| v.get(c).and_then(|m| m.get(i)).copied().unwrap_or(0.0);
+        let sum: f64 = self
+            .stencil(side, dx, yf, zf)
+            .into_iter()
+            .map(|(c, i, w)| w * ((1.0 - later) * at(&self.nu_tilde, c, i) + later * at(&self.nu_tilde_next, c, i)))
+            .sum();
+        RATIO as f64 * sum
+    }
+
     /// Every ghost cell takes the equilibrium of the interpolated coarse moments.
-    fn fill_ghost_equilibrium(&mut self) {
+    /// `later` is the share of the coarse step's end in the ν̃ the ghost cells take (0: its start).
+    fn fill_ghost_equilibrium(&mut self, later: f64) -> Result<()> {
         let [_, ny, nz] = self.nc;
         for side in 0..2 {
             for zf in 0..RATIO * nz {
@@ -417,10 +571,15 @@ impl Refined {
                         let (rho, u) = self.interpolate(side, dx, yf, zf);
                         let cell = self.fine.grid().index([xf, yf, zf]);
                         self.fine.set_cell_populations(cell, &equilibrium(rho, u));
+                        if self.sa {
+                            let nu = self.interpolate_nu_tilde(side, dx, yf, zf, later);
+                            self.fine.sa_impose(&[(cell, nu)])?;
+                        }
                     }
                 }
             }
         }
+        Ok(())
     }
 
     /// The coarse interface columns' post-collision populations that point into the strip go to the ghost cells.
@@ -531,8 +690,9 @@ impl Refined {
     }
 
     /// What the ghost cells hold, to put back after a collision that must not touch them.
-    fn save_ghosts(&self) -> Vec<(usize, [f64; Q])> {
-        let mut saved = Vec::new();
+    fn save_ghosts(&mut self) -> Vec<(usize, [f64; Q])> {
+        let mut saved = std::mem::take(&mut self.saved);
+        saved.clear();
         for side in 0..2 {
             for zf in 0..self.nf[2] {
                 for yf in 0..self.nf[1] {
@@ -593,10 +753,13 @@ impl Refined {
 
     /// One coarse step (two fine steps).
     pub fn step(&mut self) -> Result<()> {
-        self.fill_covered();
+        self.fill_covered()?;
         self.snapshot_moments();
-        self.fill_ghost_equilibrium();
+        self.fill_ghost_equilibrium(0.0)?;
         self.coarse.step_collide()?;
+        if self.sa {
+            self.nu_tilde_next = self.snapshot_nu_tilde();
+        }
         self.fine.step_collide()?;
         self.transfer_in();
         self.coarse.step_stream()?;
@@ -605,11 +768,12 @@ impl Refined {
         self.harvest_outer_ghosts();
         self.replenish_inner_ghosts();
         let saved = self.save_ghosts();
-        self.fill_ghost_equilibrium();
+        self.fill_ghost_equilibrium(0.5)?;
         self.fine.step_collide()?;
         for (cell, f) in &saved {
             self.fine.set_cell_populations(*cell, f);
         }
+        self.saved = saved;
         self.fine.step_stream()?;
         self.restrict();
         Ok(())
@@ -649,6 +813,43 @@ impl Refined {
         (0..self.coarse.grid().len())
             .map(|c| if self.coarse.is_fluid(c) { moments_of(&self.coarse.cell_populations(c)) } else { (0.0, [0.0; 3]) })
             .collect()
+    }
+
+    /// With the Spalart–Allmaras model, what the two interface columns of the coarse level hold:
+    /// the largest and mean ν_t/ν there and, with DDES, the share of those cells in LES mode (the
+    /// destruction length below the wall distance). An interface in a LES region has little eddy
+    /// viscosity to damp what the interface produces.
+    pub fn interface_report(&self) -> Option<InterfaceReport> {
+        let sa = self.coarse.spalart_allmaras()?;
+        let nu = (1.0 / self.coarse.omegas().0 - 0.5) / 3.0;
+        let (distance, length) = (self.coarse.sa_wall_distance()?, self.coarse.ddes_length());
+        let [_, ny, nz] = self.nc;
+        let (mut max, mut sum, mut n, mut les) = (0.0f64, 0.0, 0usize, 0usize);
+        for side in 0..2 {
+            for z in 0..nz {
+                for y in 0..ny {
+                    let cell = self.coarse.grid().index([self.interface_column(side), y, z]);
+                    if !self.coarse.is_fluid(cell) {
+                        continue;
+                    }
+                    let ratio = sa.nu_t(cell, nu) / nu;
+                    max = max.max(ratio);
+                    sum += ratio;
+                    n += 1;
+                    if let (Some(l), Some(d)) = (length.and_then(|l| l.get(cell)), distance.get(cell))
+                        && *l > 0.0
+                        && *l < 0.999 * d
+                    {
+                        les += 1;
+                    }
+                }
+            }
+        }
+        (n > 0).then(|| InterfaceReport {
+            nu_t_over_nu_max: max,
+            nu_t_over_nu_mean: sum / n as f64,
+            les_share: length.map(|_| les as f64 / n as f64),
+        })
     }
 
     /// The mass in fine-cell units: the coarse cells outside the strip (8 each) and the fine cells.

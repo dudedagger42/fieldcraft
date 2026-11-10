@@ -114,8 +114,8 @@ fn what_is_not_supported_is_refused_with_the_reason() {
     };
     // Another collision, an eddy-viscosity model.
     refused(build(closed_box(), procedure(Collision::Trt, None), STRIP, &[]), "collision");
-    let sa = Turbulence::SpalartAllmaras { prandtl: 0.9, wall_model: None, inflow_ratio: 3.0, ddes: None };
-    refused(build(closed_box(), procedure(Collision::Hrr, Some(sa)), STRIP, &[]), "eddy-viscosity");
+    let sa_wall = Turbulence::SpalartAllmaras { prandtl: 0.9, wall_model: Some(fieldcraft_model::WallModel::Musker), inflow_ratio: 3.0, ddes: None };
+    refused(build(closed_box(), procedure(Collision::Hrr, Some(sa_wall)), STRIP, &[]), "eddy-viscosity");
     let vreman = Turbulence::Vreman { constant: 0.18, prandtl: 0.9, wall_model: None };
     refused(build(closed_box(), procedure(Collision::Hrr, Some(vreman)), STRIP, &[]), "eddy-viscosity");
     // An absorbing layer.
@@ -460,4 +460,168 @@ fn the_wall_cells_of_the_interface_keep_their_density() {
             }
         }
     }
+}
+
+// ---- the Spalart–Allmaras model across the interface ------------------------------------------
+
+fn sa_model(d: FluidDomain, ddes: Option<f64>) -> Model {
+    let dx: f64 = 0.05;
+    let dt: f64 = 0.05 * dx / 0.1;
+    let nu = 0.1 / 3.0 * dx * dx / dt;
+    let sa =
+        Turbulence::SpalartAllmaras { prandtl: 0.9, wall_model: None, inflow_ratio: 3.0, ddes: ddes.map(|c_des| fieldcraft_model::Ddes { c_des }) };
+    model(1.0, nu, d, procedure(Collision::Hrr, Some(sa)))
+}
+
+/// A uniform ν̃ stays uniform across the interface (transport alone, a uniform stream): the coarse
+/// cells keep their value and the fine cells the same physical value, the fine level's lattice
+/// units twice as large.
+#[test]
+fn a_uniform_nu_tilde_stays_uniform_across_the_interface() {
+    let n = [48, 4, 4];
+    let mut r = Refined::new(&sa_model(all_periodic(n), None), None, &[], &Limits::default(), Strip { first: 16, last: 32, linear: true })
+        .unwrap_or_else(|e| panic!("{e}"));
+    r.set_sa_transport_only();
+    r.initialise(&|_x| (1.0, [0.03, 0.01, 0.0]));
+    let v0 = r.nu_tilde_coarse(2, 1, 1).unwrap_or(0.0);
+    assert!(v0 > 0.0);
+    for _ in 0..200 {
+        r.step().unwrap();
+    }
+    let mut worst = 0.0f64;
+    for x in 0..n[0] {
+        worst = worst.max((r.nu_tilde_coarse(x, 1, 1).unwrap_or(0.0) / v0 - 1.0).abs());
+    }
+    for xf in 0..2 * (32 - 16 + 2) {
+        for yf in 0..2 * n[1] {
+            worst = worst.max((r.nu_tilde_fine(xf, yf, 1).unwrap_or(0.0) / v0 - 1.0).abs());
+        }
+    }
+    assert!(worst <= 1e-12, "ν̃ moved by {worst:e}");
+}
+
+/// The channel through the strip, refined against unrefined, as the largest profile difference
+/// over the interface and strip columns, as a share of the peak.
+fn channel_difference(m: &Model, report: bool) -> f64 {
+    let n = [64, 8, 4];
+    let strip = Strip { first: 24, last: 40, linear: true };
+    let build = || Refined::new(m, None, &[], &Limits::default(), strip).unwrap_or_else(|e| panic!("{e}"));
+    let (mut with, mut without) = (build(), build());
+    for _ in 0..3000 {
+        with.step().unwrap();
+        without.step_unrefined().unwrap();
+    }
+    let g = with.coarse().grid();
+    let (a, b) = (with.composite_moments(), without.coarse_moments());
+    let peak = b[g.index([10, 4, 1])].1[0];
+    assert!(peak > 1e-3);
+    let mut worst = 0.0f64;
+    for x in [10, 20, 23, 24, 30, 40, 41, 50] {
+        let e = (0..n[1]).map(|y| (a[g.index([x, y, 1])].1[0] - b[g.index([x, y, 1])].1[0]).abs()).fold(0.0f64, f64::max) / peak;
+        if report {
+            eprintln!("  column {x:2}: refined against unrefined {e:.2e} of the peak {peak:.3e}");
+        }
+        worst = worst.max(e);
+    }
+    if let Some(r) = with.interface_report().filter(|_| report) {
+        eprintln!("  interface: nu_t/nu max {:.2e} mean {:.2e}, LES share {:?}", r.nu_t_over_nu_max, r.nu_t_over_nu_mean, r.les_share);
+    }
+    worst
+}
+
+/// The channel through the strip with the model on: the refined flow differs from the unrefined one
+/// no more than it does without the model (where the fine level resolves the wall better), plus
+/// 0.5 % of the peak.
+#[test]
+fn a_driven_channel_with_sa_matches_the_unrefined_one() {
+    let mut d = all_periodic([64, 8, 4]);
+    d.faces.y_min = FaceCondition::Wall {};
+    d.faces.y_max = FaceCondition::Wall {};
+    d.acceleration = [0.002, 0.0, 0.0];
+    let smag = Some(Turbulence::Smagorinsky { constant: 1e-4, prandtl: 0.9, van_driest: None, wall_model: None });
+    let dx: f64 = 0.05;
+    let dt: f64 = 0.05 * dx / 0.1;
+    let plain = model(1.0, 0.1 / 3.0 * dx * dx / dt, d.clone(), procedure(Collision::Hrr, smag));
+    let (without_model, with_model) = (channel_difference(&plain, true), channel_difference(&sa_model(d, None), true));
+    eprintln!("difference without the model {without_model:.2e}, with it {with_model:.2e}");
+    assert!(with_model <= without_model + 0.005, "SA: {with_model:e} against {without_model:e} without the model");
+}
+
+/// A smooth ν̃ wave carried through the strip by a uniform stream (transport only): the amplitude
+/// and phase after crossing, against the coarse level alone and against a uniform fine run
+/// (printed), for a wavelength of 32 coarse cells.
+#[test]
+fn a_nu_tilde_wave_crosses_the_interface() {
+    let n = [64, 4, 4];
+    let l = 32.0;
+    let mut with = Refined::new(&sa_model(all_periodic(n), None), None, &[], &Limits::default(), Strip { first: 24, last: 40, linear: true })
+        .unwrap_or_else(|e| panic!("{e}"));
+    let mut without = Refined::new(&sa_model(all_periodic(n), None), None, &[], &Limits::default(), Strip { first: 24, last: 40, linear: true })
+        .unwrap_or_else(|e| panic!("{e}"));
+    let nu0 = with.nu_tilde_coarse(2, 1, 1).unwrap_or(1.0);
+    for r in [&mut with, &mut without] {
+        r.set_sa_transport_only();
+        r.initialise(&|_x| (1.0, [0.04, 0.0, 0.0]));
+        r.initialise_nu_tilde(&|x| nu0 * (1.0 + 0.5 * (2.0 * std::f64::consts::PI * x[0] / l).sin())).unwrap_or_else(|e| panic!("{e}"));
+    }
+    for _ in 0..400 {
+        with.step().unwrap();
+        without.step_unrefined().unwrap();
+    }
+    let g = with.coarse().grid();
+    let mode = |v: &[f64]| {
+        let (mut a, mut b) = (0.0, 0.0);
+        for (cell, x) in v.iter().enumerate() {
+            let k = 2.0 * std::f64::consts::PI * (g.coords(cell)[0] as f64 + 0.5) / l;
+            a += x * k.sin();
+            b += x * k.cos();
+        }
+        let m = v.len() as f64;
+        (2.0 * a.hypot(b) / m, b.atan2(a))
+    };
+    let ((aw, pw), (au, pu)) = (mode(&with.composite_nu_tilde()), mode(&without.coarse_nu_tilde()));
+    // The truth: the same wave on a grid of half the spacing and time step everywhere.
+    let mut fd = all_periodic([2 * n[0], 2 * n[1], 2 * n[2]]);
+    fd.max = [n[0] as f64 * 0.05, n[1] as f64 * 0.05, n[2] as f64 * 0.05];
+    fd.spacing = 0.025;
+    let sa = Turbulence::SpalartAllmaras { prandtl: 0.9, wall_model: None, inflow_ratio: 3.0, ddes: None };
+    let fm = model(1.0, 0.1 / 3.0 * 0.05 * 0.05 / (0.05 * 0.05 / 0.1), fd, procedure_dt(Collision::Hrr, Some(sa), 0.05 * 0.05 / 0.1 / 2.0));
+    let mut fine = Refined::new(&fm, None, &[], &Limits::default(), Strip { first: 48, last: 80, linear: true }).unwrap_or_else(|e| panic!("{e}"));
+    fine.set_sa_transport_only();
+    fine.initialise(&|_x| (1.0, [0.04, 0.0, 0.0]));
+    fine.initialise_nu_tilde(&|x| 2.0 * nu0 * (1.0 + 0.5 * (2.0 * std::f64::consts::PI * x[0] / (2.0 * l)).sin())).unwrap_or_else(|e| panic!("{e}"));
+    for _ in 0..800 {
+        fine.step_unrefined().unwrap();
+    }
+    let (mut a, mut b) = (0.0, 0.0);
+    let gf = fine.coarse().grid();
+    let v = fine.coarse_nu_tilde();
+    for (cell, x) in v.iter().enumerate() {
+        let k = 2.0 * std::f64::consts::PI * (gf.coords(cell)[0] as f64 + 0.5) / (2.0 * l);
+        a += x * k.sin();
+        b += x * k.cos();
+    }
+    let (at, pt) = (2.0 * a.hypot(b) / v.len() as f64 / 2.0, b.atan2(a));
+    eprintln!("truth (uniform fine): amplitude {:+.2e} of the unrefined one's, phase {:+.2e} rad", at / au - 1.0, pt - pu);
+    eprintln!("nu_tilde wave: amplitude {:+.2e} of the unrefined one's, phase {:+.2e} rad", aw / au - 1.0, pw - pu);
+    // Not yet the shear-wave bar: the interface costs the wave a few per cent of its amplitude (the
+    // uniform fine run keeps 15 % more than the unrefined one; this run 3 % less).
+    assert!((aw / au - 1.0).abs() <= 0.05 && (pw - pu).abs() <= 0.01);
+}
+
+/// With DDES the interface report says whether the interface columns are in LES mode.
+#[test]
+fn the_interface_report_names_the_les_share() {
+    let mut d = all_periodic([64, 8, 4]);
+    d.faces.y_min = FaceCondition::Wall {};
+    d.faces.y_max = FaceCondition::Wall {};
+    d.acceleration = [0.002, 0.0, 0.0];
+    let mut r = Refined::new(&sa_model(d, Some(0.65)), None, &[], &Limits::default(), Strip { first: 24, last: 40, linear: true })
+        .unwrap_or_else(|e| panic!("{e}"));
+    for _ in 0..300 {
+        r.step().unwrap();
+    }
+    let report = r.interface_report().unwrap_or_else(|| panic!("no report"));
+    eprintln!("interface with DDES: nu_t/nu max {:.2e}, LES share {:?}", report.nu_t_over_nu_max, report.les_share);
+    assert!(report.les_share.is_some_and(|s| (0.0..=1.0).contains(&s)));
 }

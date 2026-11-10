@@ -1868,6 +1868,19 @@ impl Flow {
         }
     }
 
+    /// With the Spalart–Allmaras model: ν̃ of `cell` (lattice units).
+    pub(crate) fn sa_value(&self, cell: usize) -> Option<f64> {
+        self.sa.as_ref().and_then(|s| s.field.nu_tilde().get(cell).copied())
+    }
+
+    /// With the Spalart–Allmaras model: fix ν̃ at the given fluid cells, `(cell, ν̃)`.
+    pub(crate) fn sa_impose(&mut self, values: &[(usize, f64)]) -> Result<()> {
+        match &mut self.sa {
+            Some(sa) => sa.field.impose(values),
+            None => Err(Error::Invalid("the flow has no Spalart–Allmaras model".into())),
+        }
+    }
+
     /// With the Spalart–Allmaras model, each cell's wall distance it reads (lattice units).
     pub fn sa_wall_distance(&self) -> Option<&[f64]> {
         self.sa.as_ref().map(|s| s.distance.as_slice())
