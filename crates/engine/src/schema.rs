@@ -359,6 +359,8 @@ pub enum Dim {
     DofDisplacement,
     /// A fan curve's `[flow, pressure rise]` rows.
     FanCurve,
+    /// A radial inflow table's `[radius, factor]` rows: a length, then a plain number.
+    RadialInflow,
     /// A geometry check finding's `value` or `limit`: an area for a `small_face`, else a length.
     Finding,
     /// Any other quantity.
@@ -377,6 +379,7 @@ impl Dim {
             | Dim::Reaction
             | Dim::DofDisplacement
             | Dim::FanCurve
+            | Dim::RadialInflow
             | Dim::Finding => {
                 return None;
             }
@@ -440,6 +443,7 @@ impl Dim {
                 Some(if parent.and_then(|p| p.get("direction")).and_then(Value::as_u64).is_some_and(|d| d >= 4) { Q::Angle } else { Q::Length })
             }
             Dim::FanCurve => Some(if index == 0 { Q::VolumeFlow } else { Q::Pressure }),
+            Dim::RadialInflow => (index == 0).then_some(Q::Length),
             Dim::Finding => Some(if parent.and_then(|p| p.get("kind")).and_then(Value::as_str) == Some("small_face") { Q::Area } else { Q::Length }),
             d => d.quantity(),
         }
@@ -455,6 +459,7 @@ impl Dim {
             Dim::Reaction => "force",
             Dim::DofDisplacement => "displacement",
             Dim::FanCurve => "volume flow and pressure",
+            Dim::RadialInflow => "radius",
             Dim::Finding => "length",
             d => d.quantity().map(Quantity::name)?,
         })

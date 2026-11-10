@@ -611,6 +611,7 @@ mod tests {
             fans: vec![],
             free_surface: None,
             absorbing: None,
+            radial_inflow: None,
             moving_wall_ramp: None,
         };
         m.add_fluid_domain("Flow", domain).unwrap();

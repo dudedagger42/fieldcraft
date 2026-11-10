@@ -44,7 +44,7 @@ wall is measured by momentum exchange.
 | `wall` | — | box, obstacle | No-slip wall at rest. Every box face and every obstacle face is one unless given. |
 | `moving_wall` | `velocity: [u, v, w]` | box, obstacle | No-slip wall sliding with this velocity. On a box face the normal component must be 0. On an obstacle face it is the tangential motion of a rotating or sliding surface; the body does not move. |
 | `slip` | — | box | Frictionless wall: no flow through it, no shear. |
-| `velocity` | `velocity: [u, v, w]`, `profile: "uniform" \| "parabolic"` (default uniform) | box | Velocity inlet, or outlet if the velocity points out of the box. `parabolic` multiplies the velocity by 4 s (1 − s) across each direction of the face that ends at walls (not periodic), s from 0 to 1 across the box: fully developed flow between plates (one such direction), or in a rectangular duct approximated by the product (two). The given velocity is the peak. |
+| `velocity` | `velocity: [u, v, w]`, `profile: "uniform" \| "parabolic" \| "radial"` (default uniform) | box | Velocity inlet, or outlet if the velocity points out of the box. `parabolic` multiplies the velocity by 4 s (1 − s) across each direction of the face that ends at walls (not periodic), s from 0 to 1 across the box: fully developed flow between plates (one such direction), or in a rectangular duct approximated by the product (two). The given velocity is the peak. `radial` reads the domain's `radial_inflow` table (below), and the given velocity is the bulk velocity. |
 | `pressure` | `pressure: p` (gauge), `outflow: "uniform" \| "convective"` (default uniform) | box | Pressure outlet (or inlet). `uniform`: the face at the pressure, the flow crossing it normally. `convective`: each cell at the pressure, the flow leaving as it arrives; for outlets a wake or vortices reach. |
 | `periodic` | — | box | What leaves through this face enters through the opposite one, which must be periodic too. |
 
@@ -93,6 +93,16 @@ moving wall** of the domain, box faces and obstacle faces alike, from rest:
   take the wall's own velocity, which is not ramped.
 - **On the GPU:** the same factors, one per step, as on the CPU; while the walls ramp, the GPU
   submits two steps at a time.
+
+## A jet from a pipe: the radial profile
+
+A box face carries one condition, so a jet from a pipe is a velocity face with a solid flange over it: obstacle cells are not fluid, and the inlet feeds only the fluid cells under the bore. The velocity face with `"profile": "radial"` reads the domain's `radial_inflow`:
+
+```json
+"radial_inflow": {"axis_point": [0, 0.026, 0.026], "power_law": {"radius": 0.013, "exponent": 6.6}}
+```
+
+`axis_point` is a point on the pipe's axis (only its two coordinates across the face count). `power_law` builds the 1/n law of a turbulent pipe, (1 − r/R)^(1/n), on 256 points (`points`); n is about 6.6 at a Reynolds number of 2.3 × 10⁴ and about 7 at 10⁵. Instead of `power_law`, `table` gives `[radius, factor]` rows: the factor is linear between rows and 0 beyond the last radius. Either way the factors are divided by their mean over the cells they reach, so the velocity you give is the bulk velocity and the Reynolds number is the one you intended whatever the cell count across. The profile is a mean profile: it carries no fluctuations, which a Reynolds-averaged model (Spalart–Allmaras) does not need, and the pipe wall layer of a detached-eddy run stays in its Reynolds-averaged mode. Leave a pipe length of several diameters between the inlet and the exit so the wall layer adjusts to the wall model.
 
 ## Theory
 

@@ -117,6 +117,126 @@ pub enum Profile {
     /// plates (one such direction) or in a rectangular duct approximated by the product (two).
     /// The given velocity is the peak.
     Parabolic,
+    /// The velocity times the domain's [`RadialInflow`] table at the distance of each cell from
+    /// its axis, scaled so the mean over the cells it reaches is 1: the given velocity is the
+    /// bulk velocity. A fully developed pipe flow needs it.
+    Radial,
+}
+
+/// The most points a [`RadialInflow`] table holds.
+pub const MAX_RADIAL_POINTS: usize = 4096;
+
+/// A radial profile for the velocity faces with [`Profile::Radial`]: a factor on the face's
+/// velocity as a function of the distance from an axis normal to the face. Between the table's
+/// points the factor is linear, and beyond the last radius it is 0 (a cell there is not fed).
+/// Each cell's factor is divided by their mean over the cells with a factor above 0, so the given
+/// velocity is the bulk velocity whatever the table's normalisation or the cell count across.
+///
+/// In JSON either the table, `{"axis_point": [x, y, z], "table": [[radius, factor], …]}`, or a
+/// power law that builds it, `{"axis_point": [x, y, z], "power_law": {"radius": R, "exponent": n}}`
+/// (`"points"`, default 256): `(1 − r/R)^(1/n)`, the 1/n power law of a turbulent pipe flow
+/// (n about 7 at a Reynolds number of 10⁵, about 6.6 at 2.3 × 10⁴).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, try_from = "RadialInflowInput")]
+pub struct RadialInflow {
+    /// A point on the axis (only its coordinates across the face count).
+    pub axis_point: [f64; 3],
+    /// `[radius, factor]` pairs: radii increasing from 0 or more, factors 0 or more.
+    pub table: Vec<[f64; 2]>,
+}
+
+/// What a [`RadialInflow`] is read from.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RadialInflowInput {
+    axis_point: [f64; 3],
+    #[serde(default)]
+    table: Option<Vec<[f64; 2]>>,
+    #[serde(default)]
+    power_law: Option<PowerLaw>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PowerLaw {
+    radius: f64,
+    exponent: f64,
+    #[serde(default)]
+    points: Option<usize>,
+}
+
+impl TryFrom<RadialInflowInput> for RadialInflow {
+    type Error = String;
+
+    fn try_from(input: RadialInflowInput) -> std::result::Result<Self, String> {
+        let table = match (input.table, input.power_law) {
+            (Some(table), None) => table,
+            (None, Some(p)) => {
+                RadialInflow::power_law(input.axis_point, p.radius, p.exponent, p.points.unwrap_or(256)).map_err(|e| e.to_string())?.table
+            }
+            _ => return Err("give either `table` or `power_law`, not both and not neither".into()),
+        };
+        Ok(RadialInflow { axis_point: input.axis_point, table })
+    }
+}
+
+impl RadialInflow {
+    /// The 1/`exponent` power law `(1 − r/R)^(1/n)` of a turbulent pipe of radius `radius`, on
+    /// `points` radii from 0 to `radius`, normalised to a mean of 1 over the disc (its peak is
+    /// (n + 1)(2n + 1) / 2n² times the bulk velocity).
+    pub fn power_law(axis_point: [f64; 3], radius: f64, exponent: f64, points: usize) -> Result<Self> {
+        positive("radial inflow radius", radius)?;
+        if !(exponent.is_finite() && (1.0..=100.0).contains(&exponent)) {
+            return Err(Error::Invalid(format!("the power law exponent {exponent} must be between 1 and 100")));
+        }
+        if !(2..=MAX_RADIAL_POINTS).contains(&points) {
+            return Err(Error::Invalid(format!("the power law table needs 2 to {MAX_RADIAL_POINTS} points, not {points}")));
+        }
+        let peak = (exponent + 1.0) * (2.0 * exponent + 1.0) / (2.0 * exponent * exponent);
+        let table = (0..points)
+            .map(|k| {
+                let s = k as f64 / (points - 1) as f64;
+                [radius * s, peak * (1.0 - s).powf(1.0 / exponent)]
+            })
+            .collect();
+        Ok(RadialInflow { axis_point, table })
+    }
+
+    /// Check the numbers.
+    pub fn validate(&self) -> Result<()> {
+        vector("radial inflow axis point", self.axis_point)?;
+        if !(2..=MAX_RADIAL_POINTS).contains(&self.table.len()) {
+            return Err(Error::Invalid(format!("the radial inflow table needs 2 to {MAX_RADIAL_POINTS} points, not {}", self.table.len())));
+        }
+        let mut last = None;
+        for (k, [r, f]) in self.table.iter().enumerate() {
+            finite("radial inflow radius", *r)?;
+            finite("radial inflow factor", *f)?;
+            if *r < 0.0 || *f < 0.0 || last.is_some_and(|l| *r <= l) {
+                return Err(Error::Invalid(format!(
+                    "radial inflow point {k} ([{r}, {f}]): radii must increase from 0 or more, and factors must be 0 or more"
+                )));
+            }
+            last = Some(*r);
+        }
+        if !self.table.iter().any(|p| p[1] > 0.0) {
+            return Err(Error::Invalid("the radial inflow table has no factor above 0".into()));
+        }
+        Ok(())
+    }
+
+    /// The factor at distance `r` from the axis: linear between the table's points, 0 beyond the
+    /// last radius, and the first factor inside the first radius.
+    pub fn factor(&self, r: f64) -> f64 {
+        let at = self.table.partition_point(|p| p[0] <= r);
+        match (at.checked_sub(1).and_then(|i| self.table.get(i)), self.table.get(at)) {
+            (Some(a), Some(b)) if b[0] > a[0] => a[1] + (b[1] - a[1]) * (r - a[0]) / (b[0] - a[0]),
+            (Some(a), Some(_)) => a[1],
+            (None, Some(b)) => b[1],
+            (Some(a), None) if r <= a[0] => a[1],
+            _ => 0.0,
+        }
+    }
 }
 
 /// The condition on a face of the domain box.
@@ -783,6 +903,9 @@ pub struct FluidDomain {
     /// none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub absorbing: Option<AbsorbingLayer>,
+    /// The table the velocity faces with `"profile": "radial"` read ([`RadialInflow`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub radial_inflow: Option<RadialInflow>,
     /// How long every moving wall takes to reach its velocity from rest (a time): box faces and
     /// obstacle faces alike move at `r(t) u_w` with `r = ½ (1 − cos(π t / T))` until `T`, then at
     /// `u_w`. `None` or 0 for the full velocity from the first step.
@@ -894,6 +1017,17 @@ impl FluidDomain {
         if let Some(layer) = &self.absorbing {
             let open = BoxFace::ALL.iter().any(|f| matches!(self.faces.get(*f), FaceCondition::Velocity { .. } | FaceCondition::Pressure { .. }));
             layer.validate(open).map_err(|e| context("absorbing layer", "settings", e))?;
+        }
+        let radial_faces = BoxFace::ALL.iter().any(|f| matches!(self.faces.get(*f), FaceCondition::Velocity { profile: Profile::Radial, .. }));
+        match (&self.radial_inflow, radial_faces) {
+            (Some(r), true) => r.validate().map_err(|e| context("radial inflow", "settings", e))?,
+            (None, true) => {
+                return Err(Error::Invalid("a velocity face has the profile `radial` but the domain has no `radial_inflow` table".into()));
+            }
+            (Some(_), false) => {
+                return Err(Error::Invalid("the domain has a `radial_inflow` table but no velocity face with the profile `radial`".into()));
+            }
+            (None, false) => {}
         }
         if let Some(t) = self.moving_wall_ramp {
             nonnegative("moving wall ramp", t)?;
@@ -1067,8 +1201,80 @@ mod tests {
             fans: vec![],
             free_surface: None,
             absorbing: None,
+            radial_inflow: None,
             moving_wall_ramp: None,
         }
+    }
+
+    /// The power law's mean over the disc is 1 (the factors scale the bulk velocity), its peak is
+    /// (n + 1)(2n + 1) / 2n² and it is 0 at the wall; the table reads back as JSON, and the
+    /// shorthand builds the same table.
+    #[test]
+    fn a_radial_inflow_power_law_has_a_unit_mean_and_round_trips() {
+        let n = 6.6;
+        let r = RadialInflow::power_law([0.0, 1.0, 2.0], 0.013, n, 2048).unwrap();
+        let mean: f64 =
+            r.table.windows(2).map(|w| 0.5 * (w[0][0] * w[0][1] + w[1][0] * w[1][1]) * (w[1][0] - w[0][0])).sum::<f64>() * 2.0 / (0.013 * 0.013);
+        assert!((mean - 1.0).abs() < 2e-3, "{mean}");
+        let peak = (n + 1.0) * (2.0 * n + 1.0) / (2.0 * n * n);
+        assert!((r.factor(0.0) - peak).abs() < 1e-12 && r.factor(0.013) == 0.0 && r.factor(0.02) == 0.0);
+        r.validate().unwrap();
+        let json = serde_json::to_string(&r).unwrap();
+        assert_eq!(serde_json::from_str::<RadialInflow>(&json).unwrap(), r);
+        let short: RadialInflow =
+            serde_json::from_str(r#"{"axis_point": [0, 1, 2], "power_law": {"radius": 0.013, "exponent": 6.6, "points": 2048}}"#).unwrap();
+        assert_eq!(short, r);
+        assert!(serde_json::from_str::<RadialInflow>(r#"{"axis_point": [0, 0, 0]}"#).is_err());
+        assert!(
+            serde_json::from_str::<RadialInflow>(
+                r#"{"axis_point": [0, 0, 0], "table": [[0, 1], [1, 0]], "power_law": {"radius": 1, "exponent": 7}}"#
+            )
+            .is_err()
+        );
+    }
+
+    /// A table is linear between its rows, holds its first factor inside the first radius and is 0
+    /// beyond the last; bad tables are refused with the point named.
+    #[test]
+    fn a_radial_inflow_table_interpolates_and_is_checked() {
+        let r = RadialInflow { axis_point: [0.0; 3], table: vec![[0.1, 2.0], [0.3, 1.0], [0.5, 0.0]] };
+        r.validate().unwrap();
+        for (at, want) in [(0.0, 2.0), (0.1, 2.0), (0.2, 1.5), (0.4, 0.5), (0.5, 0.0), (0.6, 0.0)] {
+            assert!((r.factor(at) - want).abs() < 1e-12, "{at}: {}", r.factor(at));
+        }
+        let bad = |table: Vec<[f64; 2]>| RadialInflow { axis_point: [0.0; 3], table }.validate().unwrap_err().to_string();
+        assert!(bad(vec![[0.0, 1.0]]).contains("2 to"));
+        assert!(bad(vec![[0.0, 1.0], [0.0, 1.0]]).contains("point 1"));
+        assert!(bad(vec![[0.0, 1.0], [1.0, -1.0]]).contains("point 1"));
+        assert!(bad(vec![[0.0, 0.0], [1.0, 0.0]]).contains("no factor above 0"));
+        assert!(bad(vec![[0.0, f64::NAN], [1.0, 1.0]]).contains("finite"));
+        assert!(bad(vec![[0.0, f64::INFINITY], [1.0, 1.0]]).contains("finite") && bad(vec![[0.0, 1.0], [f64::NAN, 1.0]]).contains("finite"));
+        assert!(bad((0..=MAX_RADIAL_POINTS).map(|k| [k as f64, 1.0]).collect()).contains("2 to"));
+        // An unchecked table with a repeated radius does not divide by zero.
+        let unchecked = RadialInflow { axis_point: [0.0; 3], table: vec![[0.0, 1.0], [0.5, 2.0], [0.5, 3.0], [1.0, 0.0]] };
+        assert!((0..=20).all(|k| unchecked.factor(k as f64 * 0.05).is_finite()));
+        assert!(bad(vec![[-1.0, 1.0], [1.0, 1.0]]).contains("point 0"));
+        assert!(RadialInflow::power_law([0.0; 3], 1.0, 0.5, 16).is_err() && RadialInflow::power_law([0.0; 3], -1.0, 7.0, 16).is_err());
+        assert!(
+            RadialInflow::power_law([0.0; 3], 1.0, 7.0, 1).is_err() && RadialInflow::power_law([0.0; 3], 1.0, 7.0, MAX_RADIAL_POINTS + 1).is_err()
+        );
+    }
+
+    /// The radial profile and the table go together.
+    #[test]
+    fn the_radial_profile_needs_its_table_and_the_table_its_profile() {
+        let mut m = Model::default();
+        m.add_material("Water", water()).unwrap();
+        let mut d = channel();
+        d.faces.x_min = FaceCondition::Velocity { velocity: [1.0, 0.0, 0.0], profile: Profile::Radial };
+        let e = m.add_fluid_domain("Flow", d.clone()).unwrap_err().to_string();
+        assert!(e.contains("radial_inflow"), "{e}");
+        d.radial_inflow = Some(RadialInflow::power_law([0.0, 1.0, 0.5], 0.4, 7.0, 64).unwrap());
+        m.add_fluid_domain("Flow", d).unwrap();
+        let mut unused = channel();
+        unused.radial_inflow = Some(RadialInflow::power_law([0.0, 1.0, 0.5], 0.4, 7.0, 64).unwrap());
+        let e = m.replace_fluid_domain("Flow", unused).unwrap_err().to_string();
+        assert!(e.contains("radial_inflow") && e.contains("radial"), "{e}");
     }
 
     /// A Cross-WLF melt's viscosity depends on the temperature: its domain needs heat, and the

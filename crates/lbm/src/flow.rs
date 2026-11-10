@@ -1033,6 +1033,8 @@ impl Flow {
             let a = face.axis();
             let layer = if face.is_max() { grid.cells[a] - 1 } else { 0 };
             let (t1, t2) = ((a + 1) % 3, (a + 2) % 3);
+            // A radial profile: each cell's index in `open` and its table factor, scaled below.
+            let mut radial: Vec<(usize, f64)> = Vec::new();
             for j in 0..grid.cells[t2] {
                 for i in 0..grid.cells[t1] {
                     let mut ijk = [0usize; 3];
@@ -1053,6 +1055,17 @@ impl Flow {
                                     scale *= 4.0 * s * (1.0 - s);
                                 }
                             }
+                            if profile == Profile::Radial {
+                                let [x, y, z] = grid.centre(cell);
+                                let c = [x, y, z];
+                                let axis = domain.radial_inflow.as_ref();
+                                let across =
+                                    |t: usize| c.get(t).copied().unwrap_or(0.0) - axis.and_then(|r| r.axis_point.get(t).copied()).unwrap_or(0.0);
+                                scale = axis.map_or(0.0, |r| r.factor(across(t1).hypot(across(t2))));
+                                if scale > 0.0 {
+                                    radial.push((open.len(), scale));
+                                }
+                            }
                             Target::Velocity(setup.to_lattice(velocity).map(|v| v * scale))
                         }
                         FaceCondition::Pressure { pressure, outflow: Outflow::Uniform } => Target::Density(setup.lattice_density(pressure)),
@@ -1063,6 +1076,25 @@ impl Flow {
                         *t = true;
                     }
                     open.push(OpenCell { cell: cell as u32, axis: a, inward: if face.is_max() { -1.0 } else { 1.0 }, target });
+                }
+            }
+            // The mean factor over the cells the table reaches is 1: the given velocity is the bulk.
+            let sum: f64 = radial.iter().map(|(_, f)| f).sum();
+            if sum > 0.0 {
+                let norm = radial.len() as f64 / sum;
+                let mut fastest = 0.0f64;
+                for (i, _) in &radial {
+                    if let Some(OpenCell { target: Target::Velocity(v), .. }) = open.get_mut(*i) {
+                        v.iter_mut().for_each(|c| *c *= norm);
+                        fastest = fastest.max(v.iter().map(|c| c * c).sum::<f64>().sqrt());
+                    }
+                }
+                if !(fastest <= crate::setup::MAX_LATTICE_SPEED) {
+                    return Err(Error::Invalid(format!(
+                        "the radial inflow profile of box face {} runs its fastest cell at lattice speed {fastest:.2} (the limit is {}): its factors are too uneven for the bulk velocity; smooth the table",
+                        face.name(),
+                        crate::setup::MAX_LATTICE_SPEED
+                    )));
                 }
             }
         }

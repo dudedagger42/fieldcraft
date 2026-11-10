@@ -283,6 +283,7 @@ impl Quantities for FluidDomain {
             fans,
             free_surface,
             absorbing,
+            radial_inflow,
             moving_wall_ramp,
         } = self;
         each(min, Q::Length, f);
@@ -366,6 +367,12 @@ impl Quantities for FluidDomain {
             }
             if let Some(t) = filter_time {
                 f(Q::Time, t);
+            }
+        }
+        if let Some(RadialInflow { axis_point, table }) = radial_inflow {
+            each(axis_point, Q::Length, f);
+            for [radius, _factor] in table {
+                f(Q::Length, radius);
             }
         }
         if let Some(t) = moving_wall_ramp {

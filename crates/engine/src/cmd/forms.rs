@@ -698,8 +698,8 @@ const FACE_CONDITION: &[Variant] = &[
         "Velocity inlet",
         &[
             xyz("velocity", "Velocity", D::Velocity).help("Inflow velocity.").req(),
-            choice("profile", "Profile", &[("uniform", "Uniform"), ("parabolic", "Parabolic")])
-                .help("Uniform across the inlet, or parabolic (fully developed flow).")
+            choice("profile", "Profile", &[("uniform", "Uniform"), ("parabolic", "Parabolic"), ("radial", "Radial")])
+                .help("Uniform across the inlet, parabolic (fully developed laminar flow), or radial: the domain's radial inflow table, with the velocity as the bulk velocity (a turbulent pipe).")
                 .def("\"uniform\""),
         ],
     ),
@@ -899,6 +899,18 @@ const ABSORBING: Field = group(
 )
 .help("Drains the pressure waves the inlets and outlets reflect, so a flow settles sooner; a steady flow is unchanged. CPU only.");
 
+const RADIAL_INFLOW: Field = group(
+    "radial_inflow",
+    "Radial inflow",
+    &[
+        xyz("axis_point", "Axis point", D::Length).help("A point on the pipe's axis; only its coordinates across the inlet face count.").req(),
+        table("table", "Profile", D::RadialInflow, &["radius", "factor"], fieldcraft_model::fluids::MAX_RADIAL_POINTS)
+            .help("Factor on the velocity against the distance from the axis, linear between rows and 0 beyond the last radius; scaled so the velocity is the bulk velocity. In a script, `power_law` (radius, exponent) builds a turbulent pipe's 1/n law instead.")
+            .req(),
+    ],
+)
+.help("The profile that velocity faces with the radial profile read: a turbulent pipe flow entering the box.");
+
 pub const FLUID_DOMAIN: &[Field] = &[
     NAME,
     reference("material", "Fluid", C::Material).help("The fluid material: needs a density and a viscosity.").req(),
@@ -942,6 +954,7 @@ pub const FLUID_DOMAIN: &[Field] = &[
     rows("fans", "Fans", FAN).help("Fans: zones that raise the pressure by their pressure–flow curve; the solve finds the operating point."),
     FREE_SURFACE,
     ABSORBING,
+    RADIAL_INFLOW,
     positive("moving_wall_ramp", "Moving-wall ramp", D::Time)
         .help("How long every moving wall takes to reach its velocity from rest, with a smooth (cosine) start: a wall or inlet face switched on at full speed sends a pressure pulse through the box. Left out or 0, the walls move at full speed from the first step.")
         .hint("none"),
