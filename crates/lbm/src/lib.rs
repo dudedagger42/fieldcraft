@@ -79,6 +79,7 @@ pub mod memory;
 pub mod mrt;
 pub mod outlet;
 pub mod ports;
+pub mod refine;
 pub mod regularized;
 pub mod rheology;
 pub mod sa;

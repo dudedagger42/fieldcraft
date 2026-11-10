@@ -1766,6 +1766,24 @@ impl Flow {
         self.steps_done
     }
 
+    /// The populations of `cell` (zeros outside the grid).
+    pub(crate) fn cell_populations(&self, cell: usize) -> [f64; Q] {
+        let mut out = [0.0; Q];
+        for (q, x) in out.iter_mut().enumerate() {
+            *x = self.f.get(q * self.stride + cell).copied().unwrap_or(0.0);
+        }
+        out
+    }
+
+    /// Set the populations of `cell` (nothing outside the grid).
+    pub(crate) fn set_cell_populations(&mut self, cell: usize, values: &[f64; Q]) {
+        for (q, v) in values.iter().enumerate() {
+            if let Some(x) = self.f.get_mut(q * self.stride + cell) {
+                *x = *v;
+            }
+        }
+    }
+
     /// The moving walls' ramp in time steps (0 without one; `lattice::wall_ramp`).
     pub fn ramp_steps(&self) -> u64 {
         self.ramp_steps
@@ -1990,6 +2008,13 @@ impl Flow {
     /// One time step. Fails with [`Error::Unstable`] when a density stops being a positive
     /// number or a lattice speed exceeds [`MAX_LATTICE_SPEED`].
     pub fn step(&mut self) -> Result<()> {
+        self.step_collide()?;
+        self.step_stream()
+    }
+
+    /// The first half of [`Flow::step`]: everything up to and including the collision. A refined
+    /// flow ([`crate::refine`]) sets the populations of its interface cells between the two halves.
+    pub(crate) fn step_collide(&mut self) -> Result<()> {
         self.wall_ramp = crate::lattice::wall_ramp(self.steps_done.saturating_add(1), self.ramp_steps);
         self.targets()?;
         self.refresh_buoyancy();
@@ -2010,6 +2035,11 @@ impl Flow {
                 max_u2.sqrt()
             )));
         }
+        Ok(())
+    }
+
+    /// The second half of [`Flow::step`]: the streaming, the boundary conditions and the swap.
+    pub(crate) fn step_stream(&mut self) -> Result<()> {
         self.stream();
         self.apply_stress();
         self.surface_stream();
