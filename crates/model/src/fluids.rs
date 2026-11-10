@@ -123,6 +123,26 @@ pub enum Profile {
     Radial,
 }
 
+/// What a [`RadialInflow`]'s factors are scaled to.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RadialScale {
+    /// The mean over the fluid cells it reaches is 1 (the default): the given velocity is the bulk
+    /// velocity of the cells that are fed, however many of them a staircase bore leaves.
+    #[default]
+    Fed,
+    /// The flow is the given velocity times the area the table covers on the face, counted over
+    /// every cell of the face (solid ones too): a staircase bore that leaves 90 % of its area as
+    /// fluid cells still carries the intended mass flow, through faster cells.
+    Area,
+}
+
+impl RadialScale {
+    fn is_fed(&self) -> bool {
+        *self == RadialScale::Fed
+    }
+}
+
 /// The most points a [`RadialInflow`] table holds.
 pub const MAX_RADIAL_POINTS: usize = 4096;
 
@@ -143,6 +163,9 @@ pub struct RadialInflow {
     pub axis_point: [f64; 3],
     /// `[radius, factor]` pairs: radii increasing from 0 or more, factors 0 or more.
     pub table: Vec<[f64; 2]>,
+    /// What the factors are scaled to (`"scale": "fed"` or `"area"`; default `fed`).
+    #[serde(default, skip_serializing_if = "RadialScale::is_fed")]
+    pub scale: RadialScale,
 }
 
 /// What a [`RadialInflow`] is read from.
@@ -154,6 +177,8 @@ struct RadialInflowInput {
     table: Option<Vec<[f64; 2]>>,
     #[serde(default)]
     power_law: Option<PowerLaw>,
+    #[serde(default)]
+    scale: RadialScale,
 }
 
 #[derive(Deserialize)]
@@ -176,7 +201,7 @@ impl TryFrom<RadialInflowInput> for RadialInflow {
             }
             _ => return Err("give either `table` or `power_law`, not both and not neither".into()),
         };
-        Ok(RadialInflow { axis_point: input.axis_point, table })
+        Ok(RadialInflow { axis_point: input.axis_point, table, scale: input.scale })
     }
 }
 
@@ -199,7 +224,7 @@ impl RadialInflow {
                 [radius * s, peak * (1.0 - s).powf(1.0 / exponent)]
             })
             .collect();
-        Ok(RadialInflow { axis_point, table })
+        Ok(RadialInflow { axis_point, table, scale: RadialScale::Fed })
     }
 
     /// Check the numbers.
@@ -1237,12 +1262,12 @@ mod tests {
     /// beyond the last; bad tables are refused with the point named.
     #[test]
     fn a_radial_inflow_table_interpolates_and_is_checked() {
-        let r = RadialInflow { axis_point: [0.0; 3], table: vec![[0.1, 2.0], [0.3, 1.0], [0.5, 0.0]] };
+        let r = RadialInflow { axis_point: [0.0; 3], table: vec![[0.1, 2.0], [0.3, 1.0], [0.5, 0.0]], scale: RadialScale::Fed };
         r.validate().unwrap();
         for (at, want) in [(0.0, 2.0), (0.1, 2.0), (0.2, 1.5), (0.4, 0.5), (0.5, 0.0), (0.6, 0.0)] {
             assert!((r.factor(at) - want).abs() < 1e-12, "{at}: {}", r.factor(at));
         }
-        let bad = |table: Vec<[f64; 2]>| RadialInflow { axis_point: [0.0; 3], table }.validate().unwrap_err().to_string();
+        let bad = |table: Vec<[f64; 2]>| RadialInflow { axis_point: [0.0; 3], table, scale: RadialScale::Fed }.validate().unwrap_err().to_string();
         assert!(bad(vec![[0.0, 1.0]]).contains("2 to"));
         assert!(bad(vec![[0.0, 1.0], [0.0, 1.0]]).contains("point 1"));
         assert!(bad(vec![[0.0, 1.0], [1.0, -1.0]]).contains("point 1"));
@@ -1251,7 +1276,7 @@ mod tests {
         assert!(bad(vec![[0.0, f64::INFINITY], [1.0, 1.0]]).contains("finite") && bad(vec![[0.0, 1.0], [f64::NAN, 1.0]]).contains("finite"));
         assert!(bad((0..=MAX_RADIAL_POINTS).map(|k| [k as f64, 1.0]).collect()).contains("2 to"));
         // An unchecked table with a repeated radius does not divide by zero.
-        let unchecked = RadialInflow { axis_point: [0.0; 3], table: vec![[0.0, 1.0], [0.5, 2.0], [0.5, 3.0], [1.0, 0.0]] };
+        let unchecked = RadialInflow { axis_point: [0.0; 3], table: vec![[0.0, 1.0], [0.5, 2.0], [0.5, 3.0], [1.0, 0.0]], scale: RadialScale::Fed };
         assert!((0..=20).all(|k| unchecked.factor(k as f64 * 0.05).is_finite()));
         assert!(bad(vec![[-1.0, 1.0], [1.0, 1.0]]).contains("point 0"));
         assert!(RadialInflow::power_law([0.0; 3], 1.0, 0.5, 16).is_err() && RadialInflow::power_law([0.0; 3], -1.0, 7.0, 16).is_err());

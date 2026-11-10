@@ -9,7 +9,7 @@ mod common;
 
 use common::*;
 use fieldcraft_lbm::Target;
-use fieldcraft_model::{FaceCondition, Outflow, Profile, RadialInflow};
+use fieldcraft_model::{FaceCondition, Outflow, Profile, RadialInflow, RadialScale};
 
 const SPACING: f64 = 0.05;
 const BORE: f64 = 0.4;
@@ -74,6 +74,37 @@ fn a_radial_inlet_feeds_only_the_bore_at_the_bulk_velocity() {
     assert!(near_wall < 0.8, "the cell next to the wall runs at {near_wall} of the bulk");
 }
 
+/// With `scale: area` the inlet carries the bulk velocity times the bore's area, however many cells
+/// a staircase bore leaves as fluid: the pipe wall (a thin tube) takes the ring of cells next to it,
+/// so the fed cells' mean is higher than the bulk velocity and the flux is not short.
+#[test]
+fn an_area_scaled_radial_inlet_carries_the_flow_of_the_whole_bore() {
+    let flux = |scale| {
+        let (mut m, pipe) = jet();
+        let mut d = m.fluid_domain("Flow").unwrap().clone();
+        d.radial_inflow.as_mut().unwrap().scale = scale;
+        m.replace_fluid_domain("Flow", d).unwrap();
+        let (setup, flow) = prepare(&m, &[pipe]);
+        let lattice = setup.to_lattice([0.1, 0.0, 0.0])[0];
+        let sum: f64 = flow
+            .open_cells()
+            .iter()
+            .filter(|oc| oc.axis == 0 && oc.inward > 0.0)
+            .filter_map(|oc| match oc.target {
+                Target::Velocity(v) => Some(v[0]),
+                _ => None,
+            })
+            .sum();
+        // In cells of the bore's area: the flux over the bulk velocity.
+        sum / lattice / (std::f64::consts::PI * BORE * BORE / (SPACING * SPACING))
+    };
+    let fed = flux(RadialScale::Fed);
+    let area = flux(RadialScale::Area);
+    // The count of cell centres in a disc of 8 cells' radius is within a few per cent of its area.
+    assert!((area - 1.0).abs() < 0.05, "the area-scaled flux is {area} of U·πR²");
+    assert!((area - 1.0).abs() <= (fed - 1.0).abs() + 1e-12, "area {area}, fed {fed}");
+}
+
 /// The jet runs: 100 steps with the flange over the face stay finite, and the bore's centre
 /// cell moves with the inlet (a smoke test; the developed profile is for the jet studies).
 #[test]
@@ -103,6 +134,7 @@ fn an_uneven_radial_table_is_refused_before_the_run() {
     d.radial_inflow = Some(RadialInflow {
         axis_point: [0.0, AXIS[0], AXIS[1]],
         table: vec![[0.0, 1e-9], [0.0353, 1e-9], [0.03536, 1e9], [0.0354, 1e-9], [0.4, 1e-9]],
+        scale: RadialScale::Fed,
     });
     m.replace_fluid_domain("Flow", d).unwrap();
     let setup = fieldcraft_lbm::Setup::new(&m, None, std::slice::from_ref(&pipe), &fieldcraft_lbm::Limits::default()).unwrap();

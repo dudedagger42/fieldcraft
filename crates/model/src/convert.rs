@@ -369,7 +369,7 @@ impl Quantities for FluidDomain {
                 f(Q::Time, t);
             }
         }
-        if let Some(RadialInflow { axis_point, table }) = radial_inflow {
+        if let Some(RadialInflow { axis_point, table, .. }) = radial_inflow {
             each(axis_point, Q::Length, f);
             for [radius, _factor] in table {
                 f(Q::Length, radius);

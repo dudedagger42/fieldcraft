@@ -1035,6 +1035,9 @@ impl Flow {
             let (t1, t2) = ((a + 1) % 3, (a + 2) % 3);
             // A radial profile: each cell's index in `open` and its table factor, scaled below.
             let mut radial: Vec<(usize, f64)> = Vec::new();
+            // The cells of the face the table reaches, fluid or not (the area it covers).
+            let mut disc_cells = 0usize;
+            let radial_face = matches!(*domain.faces.get(face), FaceCondition::Velocity { profile: Profile::Radial, .. });
             for j in 0..grid.cells[t2] {
                 for i in 0..grid.cells[t1] {
                     let mut ijk = [0usize; 3];
@@ -1042,6 +1045,14 @@ impl Flow {
                     ijk[t1] = i;
                     ijk[t2] = j;
                     let cell = grid.index(ijk);
+                    if radial_face {
+                        let c = grid.centre(cell);
+                        let table = domain.radial_inflow.as_ref();
+                        let across = |t: usize| c.get(t).copied().unwrap_or(0.0) - table.and_then(|r| r.axis_point.get(t).copied()).unwrap_or(0.0);
+                        if table.is_some_and(|r| r.factor(across(t1).hypot(across(t2))) > 0.0) {
+                            disc_cells += 1;
+                        }
+                    }
                     if !fluid[cell] || taken.get(cell).copied().unwrap_or(true) {
                         continue;
                     }
@@ -1081,7 +1092,11 @@ impl Flow {
             // The mean factor over the cells the table reaches is 1: the given velocity is the bulk.
             let sum: f64 = radial.iter().map(|(_, f)| f).sum();
             if sum > 0.0 {
-                let norm = radial.len() as f64 / sum;
+                let counted = match domain.radial_inflow.as_ref().map(|r| r.scale) {
+                    Some(fieldcraft_model::RadialScale::Area) => disc_cells,
+                    _ => radial.len(),
+                };
+                let norm = counted as f64 / sum;
                 let mut fastest = 0.0f64;
                 for (i, _) in &radial {
                     if let Some(OpenCell { target: Target::Velocity(v), .. }) = open.get_mut(*i) {

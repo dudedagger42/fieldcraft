@@ -907,6 +907,9 @@ const RADIAL_INFLOW: Field = group(
         table("table", "Profile", D::RadialInflow, &["radius", "factor"], fieldcraft_model::fluids::MAX_RADIAL_POINTS)
             .help("Factor on the velocity against the distance from the axis, linear between rows and 0 beyond the last radius; scaled so the velocity is the bulk velocity. In a script, `power_law` (radius, exponent) builds a turbulent pipe's 1/n law instead.")
             .req(),
+        choice("scale", "Scaled to", &[("fed", "Fed cells' mean"), ("area", "Area")])
+            .help("Fed: the velocity is the mean over the fluid cells the table reaches. Area: the flow is the velocity times the area the table covers, counting solid cells too, so a staircase bore that leaves less fluid than its area still carries the intended flow.")
+            .def("\"fed\""),
     ],
 )
 .help("The profile that velocity faces with the radial profile read: a turbulent pipe flow entering the box.");
