@@ -297,7 +297,11 @@ fn a_driven_channel_through_the_strip_against_a_uniform_fine_run() {
     let nu = 0.1 / 3.0 * dx * dx / dt;
     let smag = Some(Turbulence::Smagorinsky { constant: 1e-4, prandtl: 0.9, van_driest: None, wall_model: None });
     let m = model(1.0, nu, d, procedure(Collision::Hrr, smag));
-    let strip = Strip { first: 24, last: 40, linear: true };
+    let (f0, l0): (usize, usize) = std::env::var("STUDY_STRIP")
+        .ok()
+        .and_then(|v| v.split_once(',').map(|(a, b)| (a.parse().unwrap_or(24), b.parse().unwrap_or(40))))
+        .unwrap_or((24, 40));
+    let strip = Strip { first: f0, last: l0, linear: std::env::var("STUDY_LINEAR").map_or(true, |v| v != "0") };
     let build = || Refined::new(&m, None, &[], &Limits::default(), strip).unwrap_or_else(|e| panic!("{e}"));
     let (mut with, mut without) = (build(), build());
     for step in 0..3000 {
@@ -348,6 +352,15 @@ fn a_driven_channel_through_the_strip_against_a_uniform_fine_run() {
         let err = |p: &[f64]| p.iter().zip(&t).map(|(p, q)| (p - q).abs()).fold(0.0f64, f64::max) / peak;
         let (er, eu) = (err(&profile(&a, x)), err(&profile(&b, x)));
         eprintln!("column {x:2}: profile error against the uniform fine run: refined {er:.2e}, unrefined {eu:.2e} of the peak {peak:.3e}");
+        let diff = |p: &[f64]| p.iter().zip(&t).map(|(p, q)| format!("{:+.1e}", (p - q) / peak)).collect::<Vec<_>>().join(" ");
+        eprintln!(
+            "           refined - truth {}
+           unrefined - truth {}",
+            diff(&profile(&a, x)),
+            diff(&profile(&b, x))
+        );
+        let flux = |p: &[f64]| p.iter().sum::<f64>() / t.iter().sum::<f64>() - 1.0;
+        eprintln!("           flux against the uniform fine run: refined {:+.2e}, unrefined {:+.2e}", flux(&profile(&a, x)), flux(&profile(&b, x)));
         worst_refined = worst_refined.max(er);
     }
     eprintln!("worst refined {worst_refined:.2e}");
@@ -413,6 +426,38 @@ fn a_body_force_accelerates_both_levels_alike() {
                 a[g.index([23, 1, 1])].1[0],
                 b[g.index([10, 1, 1])].1[0]
             );
+        }
+    }
+}
+
+/// A fluid at rest between walls (y) stays at rest through the strip, and a uniform stream between
+/// them keeps the density of the wall-adjacent interface cells within 0.5 %: the wall cells of the
+/// interface neither pile mass up nor lose it.
+#[test]
+fn the_wall_cells_of_the_interface_keep_their_density() {
+    for u in [[0.0; 3], [0.02, 0.0, 0.0]] {
+        let n = [64, 8, 4];
+        let mut d = all_periodic(n);
+        d.faces.y_min = FaceCondition::Wall {};
+        d.faces.y_max = FaceCondition::Wall {};
+        let dx: f64 = 0.05;
+        let dt: f64 = 0.05 * dx / 0.1;
+        let nu = 0.1 / 3.0 * dx * dx / dt;
+        let smag = Some(Turbulence::Smagorinsky { constant: 1e-4, prandtl: 0.9, van_driest: None, wall_model: None });
+        let m = model(1.0, nu, d, procedure(Collision::Hrr, smag));
+        let mut r = Refined::new(&m, None, &[], &Limits::default(), Strip { first: 24, last: 40, linear: true }).unwrap_or_else(|e| panic!("{e}"));
+        r.initialise(&|_x| (1.0, u));
+        let tolerance = if u == [0.0; 3] { 1e-12 } else { 5e-3 };
+        for step in 0..200 {
+            r.step().unwrap();
+            let c = r.composite_moments();
+            let g = r.coarse().grid();
+            for x in [23, 40] {
+                for y in [0, 7] {
+                    let rho = c[g.index([x, y, 1])].0;
+                    assert!((rho - 1.0).abs() <= tolerance, "u {u:?}, step {step}: density {rho} at the wall cell ({x}, {y})");
+                }
+            }
         }
     }
 }

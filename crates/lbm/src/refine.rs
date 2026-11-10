@@ -80,6 +80,11 @@ pub struct Refined {
     moments: Vec<Vec<(f64, [f64; 3])>>,
     /// Outbound populations that wall reflection left in the outer ghost layer after the first fine step, per side and coarse (y, z) cell, in coarse units.
     pending: Vec<[f64; Q]>,
+    /// Populations a wall-adjacent inner ghost cell must receive again after the first fine step
+    /// (the reflection there has nothing to reflect): cell, direction, value, coarse slot.
+    replenish: Vec<(usize, usize, f64, usize)>,
+    /// What was put back, per side and coarse (y, z) cell, in coarse units: the coarse cell gives it up.
+    replenished: Vec<[f64; Q]>,
 }
 
 /// ρ and u of a set of populations.
@@ -203,7 +208,18 @@ impl Refined {
             matches!(domain.faces.y_min, FaceCondition::Periodic {}) && matches!(domain.faces.y_max, FaceCondition::Periodic {}),
             matches!(domain.faces.z_min, FaceCondition::Periodic {}) && matches!(domain.faces.z_max, FaceCondition::Periodic {}),
         ];
-        let mut refined = Refined { coarse, fine, strip, nc, nf, periodic, moments: Vec::new(), pending: vec![[0.0; Q]; 2 * nc[1] * nc[2]] };
+        let mut refined = Refined {
+            coarse,
+            fine,
+            strip,
+            nc,
+            nf,
+            periodic,
+            moments: Vec::new(),
+            pending: vec![[0.0; Q]; 2 * nc[1] * nc[2]],
+            replenish: Vec::new(),
+            replenished: vec![[0.0; Q]; 2 * nc[1] * nc[2]],
+        };
         refined.check_interface_cells()?;
         // The ghost cells hold nothing between steps.
         refined.clear_ghosts();
@@ -244,6 +260,16 @@ impl Refined {
             }
         }
         Ok(())
+    }
+
+    /// The populations of a coarse cell, for studies.
+    pub fn coarse_populations(&self, x: usize, y: usize, z: usize) -> [f64; Q] {
+        self.coarse.cell_populations(self.coarse.grid().index([x, y, z]))
+    }
+
+    /// The populations of a fine cell, for studies.
+    pub fn fine_populations(&self, x: usize, y: usize, z: usize) -> [f64; Q] {
+        self.fine.cell_populations(self.fine.grid().index([x, y, z]))
     }
 
     pub fn coarse(&self) -> &Flow {
@@ -347,14 +373,22 @@ impl Refined {
         };
         let fy = (yf as f64 + 0.5) / RATIO as f64 - 0.5;
         let fz = (zf as f64 + 0.5) / RATIO as f64 - 0.5;
-        let axis = |f: f64, n: usize| -> (usize, usize, f64) {
-            let f = f.clamp(0.0, (n.saturating_sub(1)) as f64);
-            let i = f.floor();
-            let j = (i as usize + 1).min(n - 1);
-            (i as usize, j, f - i)
+        // Between the two cell centres around `f`; beyond the first or last centre the line through the
+        // nearest two continues (next to a wall), across a periodic face the cells wrap round.
+        let axis = |f: f64, n: usize, periodic: bool| -> (usize, usize, f64) {
+            if periodic {
+                let i = f.floor();
+                let (i0, i1) = ((i as i64).rem_euclid(n as i64) as usize, ((i as i64) + 1).rem_euclid(n as i64) as usize);
+                return (i0, i1, f - i);
+            }
+            if n < 2 {
+                return (0, 0, 0.0);
+            }
+            let i = f.floor().clamp(0.0, (n - 2) as f64);
+            (i as usize, i as usize + 1, f - i)
         };
-        let (y0, y1, ty) = axis(fy, ny);
-        let (z0, z1, tz) = axis(fz, nz);
+        let (y0, y1, ty) = axis(fy, ny, self.periodic[0]);
+        let (z0, z1, tz) = axis(fz, nz, self.periodic[1]);
         let mut rho = 0.0;
         let mut j = [0.0; 3];
         for (c, wx) in [(col0, 1.0 - tx), (col1, tx)] {
@@ -391,6 +425,7 @@ impl Refined {
 
     /// The coarse interface columns' post-collision populations that point into the strip go to the ghost cells.
     fn transfer_in(&mut self) {
+        self.replenish.clear();
         let [_, ny, nz] = self.nc;
         let linear = self.strip.linear;
         for side in 0..2 {
@@ -399,16 +434,28 @@ impl Refined {
             for z in 0..nz {
                 for y in 0..ny {
                     let a = self.coarse.cell_populations(at(y, z));
-                    // Central slopes along y and z, zero where a neighbour is missing or not fluid.
+                    // Slopes along y and z: central, one-sided next to a wall (the periodic or missing neighbour
+                    // does not count), zero where neither neighbour is a fluid cell.
                     let slope = |n: Option<usize>, p: Option<usize>| -> [f64; Q] {
-                        let (Some(n), Some(p)) = (n, p) else { return [0.0; Q] };
-                        if !self.coarse.is_fluid(n) || !self.coarse.is_fluid(p) {
-                            return [0.0; Q];
-                        }
-                        let (an, ap) = (self.coarse.cell_populations(n), self.coarse.cell_populations(p));
+                        let fluid = |c: Option<usize>| c.filter(|&c| self.coarse.is_fluid(c));
+                        let (n, p) = (fluid(n), fluid(p));
+                        let pop = |c: usize| self.coarse.cell_populations(c);
                         let mut s = [0.0; Q];
-                        for q in 0..Q {
-                            s[q] = 0.5 * (ap[q] - an[q]);
+                        match (n, p) {
+                            (Some(n), Some(p)) => {
+                                let (an, ap) = (pop(n), pop(p));
+                                for q in 0..Q {
+                                    s[q] = 0.5 * (ap[q] - an[q]);
+                                }
+                            }
+                            (None, Some(c)) | (Some(c), None) => {
+                                let (ac, a0) = (pop(c), a);
+                                let sign = if p.is_some() { 1.0 } else { -1.0 };
+                                for q in 0..Q {
+                                    s[q] = sign * (ac[q] - a0[q]);
+                                }
+                            }
+                            (None, None) => {}
                         }
                         s
                     };
@@ -421,6 +468,18 @@ impl Refined {
                             let mut g = [0.0; Q];
                             for &q in &sent {
                                 g[q] = a[q] + oy * sy[q] + oz * sz[q];
+                            }
+                            // Next to a wall the reflection of the cell's own outgoing population, which a ghost
+                            // cell does not have, would give the population that the inner ghost cell passes on in the second fine step.
+                            let inner = if side == 0 { RATIO - 1 } else { 0 };
+                            let fine_cell = self.ghost(side, y, z, [inner, dy, dz]);
+                            let (yf, zf) = ((RATIO * y + dy) as i64, (RATIO * z + dz) as i64);
+                            for &q in &sent {
+                                let behind =
+                                    |i: i64, c: i32, n: usize, periodic: bool| !periodic && (i - i64::from(c) < 0 || i - i64::from(c) >= n as i64);
+                                if behind(yf, C[q][1], self.nf[1], self.periodic[0]) || behind(zf, C[q][2], self.nf[2], self.periodic[1]) {
+                                    self.replenish.push((fine_cell, q, g[q], (side * nz + z) * ny + y));
+                                }
                             }
                             for dx in 0..RATIO {
                                 let cell = self.ghost(side, y, z, [dx, dy, dz]);
@@ -454,6 +513,19 @@ impl Refined {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    /// Put back the populations the inner ghost cells next to a wall lack (see `replenish`).
+    fn replenish_inner_ghosts(&mut self) {
+        let norm = (RATIO * RATIO * RATIO) as f64;
+        for (cell, q, value, slot) in std::mem::take(&mut self.replenish) {
+            let mut f = self.fine.cell_populations(cell);
+            f[q] = value;
+            self.fine.set_cell_populations(cell, &f);
+            if let Some(r) = self.replenished.get_mut(slot) {
+                r[q] += value / norm;
             }
         }
     }
@@ -499,18 +571,16 @@ impl Refined {
                             }
                         }
                     }
-                    // A slot whose source lies behind a wall face holds the wall's reflection of the
-                    // coarse cell's own population, which the fine flow does not carry: what the fine
-                    // flow sends is added to it. Any other slot held the covered cell's stand-in, which
-                    // the fine flow's populations replace.
-                    for q in (0..Q).filter(|&q| C[q][0] != 0) {
-                        if Strip::into_strip(side, q) {
-                            // Only a wall's reflection puts a population here, in a cell next to the wall.
-                            if !self.neighbour_exists(y, z, -C[q][1], -C[q][2]) {
-                                a[q] += sum[q];
-                            }
-                        } else {
-                            a[q] = sum[q] + self.pending.get((side * nz + z) * ny + y).map_or(0.0, |p| p[q]);
+                    // The slots that point out of the strip take what the fine flow sends. A population
+                    // that wall reflection turned around inside a ghost cell is back in the inward
+                    // direction: it belongs to the coarse cell's outgoing population of the opposite
+                    // direction, which the coarse step reflects at the wall itself.
+                    for q in (0..Q).filter(|&q| C[q][0] != 0 && !Strip::into_strip(side, q)) {
+                        a[q] = sum[q] + self.pending.get((side * nz + z) * ny + y).map_or(0.0, |p| p[q]);
+                    }
+                    for q in (0..Q).filter(|&q| C[q][0] != 0 && Strip::into_strip(side, q)) {
+                        if !self.neighbour_exists(y, z, -C[q][1], -C[q][2]) {
+                            a[q] += sum[q] - self.replenished.get((side * nz + z) * ny + y).map_or(0.0, |r| r[q]);
                         }
                     }
                     self.coarse.set_cell_populations(cell, &a);
@@ -518,6 +588,7 @@ impl Refined {
             }
         }
         self.pending.iter_mut().for_each(|p| *p = [0.0; Q]);
+        self.replenished.iter_mut().for_each(|p| *p = [0.0; Q]);
     }
 
     /// One coarse step (two fine steps).
@@ -532,6 +603,7 @@ impl Refined {
         self.fine.step_stream()?;
         // Second fine step: the ghost cells keep what they hold through the collision.
         self.harvest_outer_ghosts();
+        self.replenish_inner_ghosts();
         let saved = self.save_ghosts();
         self.fill_ghost_equilibrium();
         self.fine.step_collide()?;
