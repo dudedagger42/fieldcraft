@@ -72,6 +72,8 @@ pub mod ddes;
 pub mod distance;
 pub mod flow;
 pub mod hrr;
+#[cfg(test)]
+mod interface_study;
 pub mod lattice;
 pub mod memory;
 pub mod mrt;
