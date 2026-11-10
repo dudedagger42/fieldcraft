@@ -10,7 +10,7 @@
 //!
 //! Variants, all off by default: `STUDY_SIGMA` (the hybrid collision's σ, or `dynamic` with `STUDY_MODEL=vreman` or
 //! `smag`), `STUDY_MODEL` (`sa`, `sa_ddes`, `vreman`, `smag`), `STUDY_COLLISION` (`hrr`, `regularized`, `mrt`, `trt`),
-//! `STUDY_SLOT` (the slot's width in m, 0.1), `STUDY_INFLOW` (Spalart–Allmaras's ν̃/ν at the inflow) and `STUDY_LAYER=1` (the default absorbing layer).
+//! `STUDY_YFACES=slip` (slip instead of walls at y min and max), `STUDY_SLOT` (the slot's width in m, 0.1), `STUDY_INFLOW` (Spalart–Allmaras's ν̃/ν at the inflow) and `STUDY_LAYER=1` (the default absorbing layer).
 //!
 //! `STUDY_TAUS` (τ⁺ − ½, comma-separated), `STUDY_ULATS` (the inlet's peak lattice speed), `STUDY_STEPS`.
 #[path = "common/mod.rs"]
@@ -39,6 +39,10 @@ fn setup_of(ulat: f64, tau_half: f64, steps: u64) -> Option<(Setup, Vec<fieldcra
     d.faces.x_min = FaceCondition::Velocity { velocity: [0.1, 0.02, 0.0], profile: Profile::Parabolic };
     d.faces.x_max = FaceCondition::Pressure { pressure: 0.0, outflow: Outflow::Uniform };
     d.faces.z_max = FaceCondition::Slip {};
+    if word("STUDY_YFACES", "wall") == "slip" {
+        d.faces.y_min = FaceCondition::Slip {};
+        d.faces.y_max = FaceCondition::Slip {};
+    }
     d.acceleration = [0.0, 0.0, -0.01];
     d.obstacles = vec!["PlateLow".into(), "PlateHigh".into()];
     let slot = word("STUDY_SLOT", "0.1").parse::<f64>().unwrap_or(0.1);
