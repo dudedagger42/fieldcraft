@@ -431,9 +431,11 @@ Re_τ 182.088 (u_τ = 0.0637309 at U_b = 1; C_f = 8.123 × 10⁻³; M. Lee, R. D
   model's steady equation to round-off, and against the model's own one-dimensional solver
   relaxed from a different start.
 
-  **Held-out check at Re_τ 543** (`sa_law_channel_at_re_tau_550_meets_lee_and_moser`, run once after
-  the law was fixed, Lee & Moser's Re_τ 543.496 channel: Re_b 20 000, centreline U⁺ 21.0, C_f
-  5.908 × 10⁻³): centre U⁺ −1.6 % and −1.0 % on MRT at 16 and 24 cells per δ (y⁺₁ 34, 23), −1.9 % and
+  **Check at Re_τ 543, a report and not a validation** (`sa_law_channel_at_re_tau_550_meets_lee_and_moser`,
+  run once after the law was fixed, Lee & Moser's Re_τ 543.496 channel: Re_b 20 000, centreline U⁺
+  21.0, C_f 5.908 × 10⁻³; run by the session that tuned the law, so it shows the law at a third
+  Reynolds number but is not an independent test, which needs an unseen case run by another
+  session, still to do): centre U⁺ −1.6 % and −1.0 % on MRT at 16 and 24 cells per δ (y⁺₁ 34, 23), −1.9 % and
   −1.3 % on the hybrid collision at σ 0.99; C_f +0.9 %, −0.8 %, +1.4 %, +0.1 %. All inside the gates
   (centre ±2.5 %, C_f ±5 %).
 

@@ -783,8 +783,9 @@ const LEE_MOSER_550_BULK: f64 = 1.0 / 0.0543496;
 const LEE_MOSER_550_CF: f64 = 2.0 * 0.0543496 * 0.0543496;
 const LEE_MOSER_550_CENTRE: f64 = 21.0;
 
-/// The held-out check of the Spalart–Allmaras wall law: Re_τ 543, a Reynolds number the law was
-/// not built or tuned on (Re_τ 182 and 1000 were), MRT and the hybrid collision at σ 0.99, 16 and
+/// A check of the Spalart–Allmaras wall law at a third Reynolds number, Re_τ 543, one the law was
+/// not built or tuned on (Re_τ 182 and 1000 were) but run by the session that built it, so a report
+/// and not a validation: MRT and the hybrid collision at σ 0.99, 16 and
 /// 24 cells per δ (the first node at y⁺ 34 and 23). Gates: centreline U⁺ within 2.5 % of Lee &
 /// Moser, carried C_f within 5 %, the request within 1 % of the carried stress.
 ///
