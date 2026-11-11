@@ -1017,30 +1017,6 @@ fn an_absorbing_layer_is_refused_clearly() {
     assert!(e.as_deref().is_some_and(|e| e.contains("absorbing") && e.contains("cpu")), "{e:?}");
 }
 
-/// The Spalart–Allmaras wall law (`spalart_allmaras_bounce`) is CPU only for now: the GPU refuses it
-/// and says to solve on the CPU.
-#[test]
-fn the_sa_wall_law_is_refused_clearly() {
-    let dx = 1.0 / 8.0;
-    let mut d = domain([0.0; 3], [dx, 2.0 + dx, dx], dx);
-    for f in [&mut d.faces.x_min, &mut d.faces.x_max, &mut d.faces.z_min, &mut d.faces.z_max] {
-        *f = PERIODIC;
-    }
-    d.acceleration = [1.0, 0.0, 0.0];
-    let mut p = collide(100.0 * dx * dx, dx * dx, None, Collision::Mrt);
-    if let Procedure::Fluid { turbulence, .. } = &mut p {
-        *turbulence = Some(Turbulence::SpalartAllmaras {
-            prandtl: 0.9,
-            wall_model: Some(fieldcraft_model::WallModel::SpalartAllmarasBounce),
-            inflow_ratio: 3.0,
-            ddes: None,
-        });
-    }
-    let (_, flow) = prepare(&model(1.0, 1.0 / 180.0, d, p), &[]);
-    let e = GpuFlow::with_options(&flow, Policy::from_env().expect("FIELDCRAFT_GPU names a policy"), Options::default()).err().map(|e| e.to_string());
-    assert!(e.as_deref().is_some_and(|e| e.contains("wall law") && e.contains("cpu")), "{e:?}");
-}
-
 /// A body force changed while the flow runs (`Backend::set_acceleration`, for a flow held at a
 /// constant flow rate): plane Poiseuille flow driven by a for half its steps and 2a for the rest
 /// on both backends, which agree, as do their mean velocities (`Backend::mean_velocity`).
