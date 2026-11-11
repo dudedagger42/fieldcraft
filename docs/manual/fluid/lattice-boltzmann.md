@@ -363,6 +363,13 @@ operators](collision.md)).
 
 - One uniform grid: no local refinement. Walls are staircase (halfway bounce-back at cell
   faces); curved walls are first order in position.
+- Local refinement (a ratio-2 strip, library level only, not yet a command) puts a half-spacing grid
+  across part of the flow. A wall that lies between cell boundaries is voxelised by each grid on its
+  own, so the two levels can place it up to half a coarse cell apart. In the two coarse layers at
+  each interface the fine grid takes the coarse grid's solid cells, so the interface is consistent,
+  but inside the strip the wall sits where the fine grid puts it and the flow adjusts to the
+  difference: the error against the true wall is the voxelisation's, not the interface's, and
+  refining does not remove it. Keep the interface planes where the walls run along the strip's axis.
 - Weakly compressible: the pressure is tied to the density, and the error grows as Ma².
 - Newtonian fluids only.
 - Obstacles do not move; a moving-wall condition gives a face a tangential velocity, the body stays

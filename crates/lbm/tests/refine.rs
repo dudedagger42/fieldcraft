@@ -978,8 +978,8 @@ fn walls_made_of_obstacles_act_like_the_box_walls_at_the_interface() {
     assert!(worst <= 1e-10 * peak.max(1.0), "obstacle walls differ from box walls by {worst:e} (peak {peak:e})");
 }
 
-/// An obstacle that does not meet the interface on coarse cell boundaries, or that ends at the
-/// interface plane, is refused with the reason.
+/// An obstacle that ends beside the interface column is refused with the reason; one off the coarse
+/// cell boundaries is accepted.
 #[test]
 fn obstacles_that_do_not_fit_the_interface_are_refused() {
     let dx = 0.05;
@@ -991,16 +991,187 @@ fn obstacles_that_do_not_fit_the_interface_are_refused() {
         d.obstacles = vec!["Lo".into()];
         (d, [obstacle("Lo", cuboid([-1.0, -1.0, -1.0], [x_end, top, 2.0]), &CUBOID_FACES)])
     };
-    for (top, x_end, reason) in [(2.3 * dx, 5.0, "coarse cell boundaries"), (2.0 * dx, 24.0 * dx, "differ in being solid")] {
-        let (d, obstacles) = channel(top, x_end);
-        let r = Refined::new(&box_model(d, procedure(Collision::Hrr, None)), None, &obstacles, &Limits::default(), strip);
-        match r {
-            Err(e) => assert!(e.to_string().contains(reason), "{e}"),
-            Ok(_) => panic!("accepted an obstacle that ends at the interface or is off the cell boundaries ({reason})"),
-        }
+    let reason = "differ in being solid";
+    let (d, obstacles) = channel(2.0 * dx, 23.0 * dx);
+    match Refined::new(&box_model(d, procedure(Collision::Hrr, None)), None, &obstacles, &Limits::default(), strip) {
+        Err(e) => assert!(e.to_string().contains(reason), "{e}"),
+        Ok(_) => panic!("accepted an obstacle that ends beside the interface column ({reason})"),
     }
+    // Off the cell boundaries it is accepted: the fine grid takes the coarse cells at the interface.
+    let (d, obstacles) = channel(2.3 * dx, 5.0);
+    Refined::new(&box_model(d, procedure(Collision::Hrr, None)), None, &obstacles, &Limits::default(), strip).unwrap_or_else(|e| panic!("{e}"));
     let (d, obstacles) = channel(2.0 * dx, 5.0);
     let r =
         Refined::new(&box_model(d, procedure(Collision::Hrr, None)), None, &obstacles, &Limits::default(), strip).unwrap_or_else(|e| panic!("{e}"));
     assert!(!r.coarse().is_fluid(r.coarse().grid().index([23, 1, 1])) && r.coarse().is_fluid(r.coarse().grid().index([23, 3, 1])));
+}
+
+// ---- walls that lie between the coarse cell boundaries --------------------------------------------
+
+/// The channel `[64, 12, 4]` driven along x with two obstacle slabs for walls, the lower one ending
+/// at `(2 + off)` coarse cells and the upper one starting at `(10 - off)`.
+fn slab_channel(off: f64) -> (FluidDomain, [Obstacle; 2]) {
+    let dx = 0.05;
+    let mut d = all_periodic([64, 12, 4]);
+    d.faces.y_min = FaceCondition::Wall {};
+    d.faces.y_max = FaceCondition::Wall {};
+    d.acceleration = [0.002, 0.0, 0.0];
+    d.obstacles = vec!["Lo".into(), "Hi".into()];
+    let obstacles = [
+        obstacle("Lo", cuboid([-1.0, -1.0, -1.0], [5.0, (2.0 + off) * dx, 2.0]), &CUBOID_FACES),
+        obstacle("Hi", cuboid([-1.0, (10.0 - off) * dx, -1.0], [5.0, 2.0, 2.0]), &CUBOID_FACES),
+    ];
+    (d, obstacles)
+}
+
+/// What a column of the slab channel shows.
+struct SlabColumn {
+    x: usize,
+    /// Distance of the refined and of the unrefined profile from the Poiseuille parabola between the
+    /// true wall positions, as a share of its peak.
+    refined: f64,
+    unrefined: f64,
+    /// The volume flux of the refined and of the unrefined flow, in coarse cells times lattice speed.
+    flux: f64,
+    flux_unrefined: f64,
+    /// Distance of the refined profile from the parabola of its own level's voxelised walls with the
+    /// column's flux, as a share of the peak.
+    shape: f64,
+}
+
+const SLAB_COLUMNS: [usize; 10] = [10, 22, 23, 24, 26, 32, 38, 40, 41, 50];
+
+fn slab_channel_columns(off: f64, steps: usize) -> Vec<SlabColumn> {
+    let (d, obstacles) = slab_channel(off);
+    let dx: f64 = 0.05;
+    let dt: f64 = 0.05 * dx / 0.1;
+    let nu_lattice = 0.1 / 3.0;
+    let smag = Some(Turbulence::Smagorinsky { constant: 1e-4, prandtl: 0.9, van_driest: None, wall_model: None });
+    let m = model(1.0, nu_lattice * dx * dx / dt, d, procedure(Collision::Hrr, smag));
+    let strip = Strip { first: 24, last: 40, linear: true };
+    let build = || Refined::new(&m, None, &obstacles, &Limits::default(), strip).unwrap_or_else(|e| panic!("{e}"));
+    let (mut with, mut without) = (build(), build());
+    let mass = with.mass();
+    for _ in 0..steps {
+        with.step().unwrap();
+        without.step_unrefined().unwrap();
+    }
+    assert!(((with.mass() - mass) / mass).abs() <= 1e-10, "mass drift");
+    let g_lattice = 0.002 * dt * dt / dx;
+    let (y0, y1) = (2.0 + off, 10.0 - off);
+    let exact = |y: f64| g_lattice / (2.0 * nu_lattice) * (y - y0) * (y1 - y);
+    let peak = exact(0.5 * (y0 + y1));
+    let g = with.coarse().grid();
+    let (a, b) = (with.composite_moments(), without.coarse_moments());
+    let fine = with.fine_moments();
+    let fg = with.fine().grid();
+    SLAB_COLUMNS
+        .iter()
+        .map(|&x| {
+            // The refined level's profile: in the strip the fine column, elsewhere the coarse one, as
+            // (row centre in coarse cells, row height, velocity) of the fluid rows.
+            let rows: Vec<(f64, f64, f64)> = if (24..40).contains(&x) {
+                let xf = 2 * (x - 23);
+                (0..24)
+                    .filter(|&y| with.fine().is_fluid(fg.index([xf, y, 2])))
+                    .map(|y| ((y as f64 + 0.5) / 2.0, 0.5, fine[fg.index([xf, y, 2])].1[0]))
+                    .collect()
+            } else {
+                (0..12).filter(|&y| with.coarse().is_fluid(g.index([x, y, 1]))).map(|y| (y as f64 + 0.5, 1.0, a[g.index([x, y, 1])].1[0])).collect()
+            };
+            let plain: Vec<(f64, f64, f64)> =
+                (0..12).filter(|&y| with.coarse().is_fluid(g.index([x, y, 1]))).map(|y| (y as f64 + 0.5, 1.0, b[g.index([x, y, 1])].1[0])).collect();
+            let err = |r: &[(f64, f64, f64)]| r.iter().map(|&(y, _, u)| (u - exact(y)).abs()).fold(0.0f64, f64::max) / peak;
+            let flux = |r: &[(f64, f64, f64)]| r.iter().map(|&(_, h, u)| h * u).sum::<f64>();
+            let q = flux(&rows);
+            let (w0, w1) = (rows.first().map_or(0.0, |r| r.0 - r.1 / 2.0), rows.last().map_or(0.0, |r| r.0 + r.1 / 2.0));
+            let h = w1 - w0;
+            let shape = rows.iter().map(|&(y, _, u)| (u - 6.0 * q / (h * h * h) * (y - w0) * (w1 - y)).abs()).fold(0.0f64, f64::max) / peak;
+            SlabColumn { x, refined: err(&rows), unrefined: err(&plain), flux: q, flux_unrefined: flux(&plain), shape }
+        })
+        .collect()
+}
+
+#[test]
+#[ignore = "report: walls between the coarse cell boundaries"]
+fn walls_between_coarse_cell_boundaries_report() {
+    for off in [0.0, 0.26, 0.3, 0.5, 0.7] {
+        eprintln!("offset {off}:");
+        for c in slab_channel_columns(off, 2500) {
+            eprintln!(
+                "  column {:2}: parabola error refined {:.3e} unrefined {:.3e}; flux {:.4e} (unrefined {:.4e}); shape error {:.3e}",
+                c.x, c.refined, c.unrefined, c.flux, c.flux_unrefined, c.shape
+            );
+        }
+    }
+}
+
+/// A wall between the coarse cell boundaries. The coarse grid puts it on a boundary, the fine grid on
+/// one of its own, and in the two coarse layers at each interface the fine grid takes the coarse
+/// wall. Aligned (offset 0) the refined profile is no further from the Poiseuille parabola than the
+/// unrefined one plus 1 % of the peak in every column. Off the boundaries the distance from the
+/// parabola between the true wall positions is the voxelisation's (the walls of the two levels
+/// differ by up to half a coarse cell, which no interface treatment can remove; see the report
+/// test), so the gate is what the interface decides: the volume flux is the same in every column
+/// (within 1.2 %), and the profile in the strip's middle is the parabola of the fine level's own
+/// walls (within 1 % of the peak).
+#[test]
+fn a_wall_between_coarse_cell_boundaries_keeps_the_flux_and_the_profile() {
+    for (x, c) in SLAB_COLUMNS.iter().zip(slab_channel_columns(0.0, 2500)) {
+        assert!(c.refined <= c.unrefined + 0.01, "aligned walls, column {x}: refined {:e} against unrefined {:e}", c.refined, c.unrefined);
+    }
+    for off in [0.3, 0.7] {
+        let columns = slab_channel_columns(off, 2500);
+        let q0 = columns.first().map_or(1.0, |c| c.flux);
+        for c in &columns {
+            assert!((c.flux / q0 - 1.0).abs() <= 0.012, "offset {off}, column {}: flux {:e} against {q0:e}", c.x, c.flux);
+        }
+        let middle = columns.iter().find(|c| c.x == 32).map_or(1.0, |c| c.shape);
+        assert!(middle <= 0.01, "offset {off}: the profile in the strip's middle is {middle:e} of the peak off its parabola");
+    }
+}
+
+/// The Spalart–Allmaras model with obstacle walls (aligned, and 0.3 of a coarse cell off the cell
+/// boundaries, each level with the wall distance of its own cells): the refined channel differs
+/// from the unrefined one no more than it does without the model, plus 0.5 % of the peak.
+#[test]
+fn spalart_allmaras_with_obstacle_walls_matches_the_unrefined_flow() {
+    let difference = |off: f64, sa: bool| {
+        let (d, obstacles) = slab_channel(off);
+        let m = if sa {
+            sa_model(d, None)
+        } else {
+            let smag = Some(Turbulence::Smagorinsky { constant: 1e-4, prandtl: 0.9, van_driest: None, wall_model: None });
+            let (dx, dt): (f64, f64) = (0.05, 0.05 * 0.05 / 0.1);
+            model(1.0, 0.1 / 3.0 * dx * dx / dt, d, procedure(Collision::Hrr, smag))
+        };
+        let strip = Strip { first: 24, last: 40, linear: true };
+        let build = || Refined::new(&m, None, &obstacles, &Limits::default(), strip).unwrap_or_else(|e| panic!("{e}"));
+        let (mut with, mut without) = (build(), build());
+        let mass = with.mass();
+        for _ in 0..3000 {
+            with.step().unwrap();
+            without.step_unrefined().unwrap();
+        }
+        assert!(((with.mass() - mass) / mass).abs() <= 1e-10, "mass drift");
+        let g = with.coarse().grid();
+        let (a, b) = (with.composite_moments(), without.coarse_moments());
+        let peak = b[g.index([10, 6, 1])].1[0];
+        assert!(peak > 1e-3);
+        [10, 20, 23, 24, 30, 40, 41, 50]
+            .iter()
+            .map(|&x| {
+                (0..12)
+                    .filter(|&y| with.coarse().is_fluid(g.index([x, y, 1])))
+                    .map(|y| (a[g.index([x, y, 1])].1[0] - b[g.index([x, y, 1])].1[0]).abs())
+                    .fold(0.0f64, f64::max)
+                    / peak
+            })
+            .fold(0.0f64, f64::max)
+    };
+    for off in [0.0, 0.3] {
+        let (plain, sa) = (difference(off, false), difference(off, true));
+        eprintln!("offset {off}: refined against unrefined {plain:.2e} without the model, {sa:.2e} with it");
+        assert!(sa <= plain + 0.005, "offset {off}: SA {sa:e} against {plain:e} without the model");
+    }
 }

@@ -686,6 +686,14 @@ impl Flow {
     /// Build the grid (voxelising the obstacles), the streaming rules and the initial state (at
     /// rest or the domain's initial velocity, density 1).
     pub fn new(setup: &Setup, obstacles: &[Obstacle]) -> Result<Flow> {
+        Flow::new_with_mask(setup, obstacles, &|_| None)
+    }
+
+    /// As [`Flow::new`], with `mask` consulted for every cell (by its grid coordinates) after the
+    /// obstacles are voxelised: `Some(true)` makes the cell solid, `Some(false)` fluid, `None`
+    /// leaves what the obstacles gave. Local refinement uses it to give a fine grid the solid
+    /// cells of the coarse one where the two meet.
+    pub fn new_with_mask(setup: &Setup, obstacles: &[Obstacle], mask: &dyn Fn([usize; 3]) -> Option<bool>) -> Result<Flow> {
         let grid = setup.grid;
         let [nx, ny, nz] = grid.cells;
         let n = grid.len();
@@ -726,6 +734,16 @@ impl Flow {
             base.push(groups.len() as u32);
             groups.extend(faces.names.iter().map(|name| Group { name: name.clone(), body: Some(o.body.clone()) }));
             obstacle_walls.extend((0..faces.names.len()).map(|t| Some(setup.to_lattice(faces.velocities.get(t).copied().unwrap_or([0.0; 3])))));
+        }
+        for c in 0..n {
+            match mask(grid.coords(c)) {
+                Some(true) => fluid[c] = false,
+                Some(false) => {
+                    fluid[c] = true;
+                    owner[c] = NONE;
+                }
+                None => {}
+            }
         }
 
         // Conducting cells: per grid cell its index among them (empty without conducting solids),

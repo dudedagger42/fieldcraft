@@ -49,9 +49,13 @@
 //! channel made of obstacles): a population whose source cell along the interface is solid is
 //! treated as one whose source is beyond a wall face, the slopes along the interface are one-sided
 //! next to a solid cell, and the coarse values the ghost cells interpolate from take the linear
-//! extrapolation of the two fluid cells beside each solid cell. The two levels must agree on
-//! the solid cells of the interface layers (an obstacle meets the interface on coarse cell
-//! boundaries) and these run along the strip's axis; anything else is refused with the reason.
+//! extrapolation of the two fluid cells beside each solid cell. In the two coarse layers at each
+//! interface the fine grid takes the solid cells of the coarse interface column, extruded along the
+//! strip's axis, wherever the obstacle's surface lies between the cell boundaries (so a wall that
+//! is off the coarse cell boundaries sits where the coarse grid puts it there, and where the fine
+//! grid puts it inside the strip). On the coarse side the obstacle must run along the strip's axis
+//! (the cell outside the interface column is solid exactly when the column's cell is); anything
+//! else is refused with the reason.
 //!
 //! # The Spalart–Allmaras model
 //! ν̃ is transported on both levels. The fine ghost cells take the coarse ν̃ interpolated like the
@@ -281,8 +285,33 @@ impl Refined {
         }
         fine_model.replace_step(fine_step)?;
         let fine_setup = Setup::new(&fine_model, step, obstacles, limits)?;
-        let fine = Flow::new(&fine_setup, obstacles)?;
         let nf = loc(fine_setup.grid.cells);
+        // In the two coarse layers at each interface the fine grid takes the coarse grid's solid
+        // cells of the interface column, extruded along the strip's axis: both levels see the same
+        // wall there, wherever the obstacle's surface lies between the cell boundaries.
+        let coarse_grid = *coarse.grid();
+        let nat = move |l: [usize; 3]| {
+            let mut p = [0; 3];
+            for (i, &a) in perm.iter().enumerate() {
+                p[a] = l[i];
+            }
+            p
+        };
+        let layer = RATIO * 2;
+        let nf0 = nf[0];
+        let interface_mask = |p: [usize; 3]| -> Option<bool> {
+            let l = loc(p);
+            let column = if l[0] < layer {
+                first - 1
+            } else if l[0] >= nf0.saturating_sub(layer) {
+                last
+            } else {
+                return None;
+            };
+            let a = coarse_grid.index(nat([column, l[1] / RATIO, l[2] / RATIO]));
+            Some(!coarse.is_fluid(a))
+        };
+        let fine = Flow::new_with_mask(&fine_setup, obstacles, &interface_mask)?;
         if nf != [RATIO * (last - first + 2), RATIO * nc[1], RATIO * nc[2]] {
             return Err(Error::Invalid(format!("the fine grid {nf:?} does not cover the strip {first}..{last} of the coarse grid {nc:?}")));
         }
@@ -354,39 +383,21 @@ impl Refined {
         }
     }
 
-    /// Solid cells may cross the interface plane (the walls of a channel made of obstacles), but the
-    /// two levels must agree on them and they must run along the strip's axis: a coarse cell is solid
-    /// exactly when the eight fine cells in it are, and the solid cells of the interface layer are
-    /// solid in the layers on both sides of it too.
+    /// Solid cells may cross the interface plane (the walls of a channel made of obstacles): the
+    /// fine grid takes the coarse grid's solid cells of the interface column in the two coarse layers
+    /// at the interface (see [`Refined::new_along`]), so the two levels agree on them by
+    /// construction. They must run along the strip's axis on the coarse side too: the coarse cell
+    /// outside the interface column is solid exactly when the interface column's cell is.
     fn check_interface_cells(&self) -> Result<()> {
         let Strip { first, last, .. } = self.strip;
         let [_, ny, nz] = self.nc;
         for z in 0..nz {
             for y in 0..ny {
-                for columns in [[first - 2, first - 1, first], [last - 1, last, last + 1]] {
-                    let solid = !self.coarse.is_fluid(self.cidx([columns[1], y, z]));
-                    for x in columns {
-                        let here = !self.coarse.is_fluid(self.cidx([x, y, z]));
-                        if here != solid {
-                            return Err(Error::Invalid(format!(
-                                "coarse cells ({}, {y}, {z}) and ({x}, {y}, {z}) next to the interface differ in being solid: an obstacle may cross the interface plane only along the strip's axis",
-                                columns[1]
-                            )));
-                        }
-                        // The fine cells that lie in this coarse cell (the covered column `first − 2` and `last + 1` have none).
-                        if x == first - 2 || x == last + 1 {
-                            continue;
-                        }
-                        let x0 = RATIO * (x - (first - 1));
-                        let fine_solid = (0..RATIO * RATIO * RATIO)
-                            .filter(|k| !self.fine.is_fluid(self.fidx([x0 + k % 2, RATIO * y + (k / 2) % 2, RATIO * z + k / 4])))
-                            .count();
-                        if fine_solid != 0 && fine_solid != RATIO * RATIO * RATIO || (fine_solid != 0) != here {
-                            return Err(Error::Invalid(format!(
-                                "the obstacle does not meet the interface on coarse cell boundaries at coarse cell ({x}, {y}, {z}): {fine_solid} of its 8 fine cells are solid, the coarse cell is {}",
-                                if here { "solid" } else { "fluid" }
-                            )));
-                        }
+                for (a, outside) in [(first - 1, first - 2), (last, last + 1)] {
+                    if self.coarse.is_fluid(self.cidx([a, y, z])) != self.coarse.is_fluid(self.cidx([outside, y, z])) {
+                        return Err(Error::Invalid(format!(
+                            "coarse cells ({a}, {y}, {z}) and ({outside}, {y}, {z}) next to the interface differ in being solid: an obstacle may cross the interface plane only along the strip's axis",
+                        )));
                     }
                 }
             }
@@ -1027,6 +1038,13 @@ impl Refined {
             }
         }
         m
+    }
+
+    /// The moments of every fine cell, indexed as the fine grid (solid cells give `(0, 0)`).
+    pub fn fine_moments(&self) -> Vec<(f64, [f64; 3])> {
+        (0..self.fine.grid().len())
+            .map(|c| if self.fine.is_fluid(c) { moments_of(&self.fine.cell_populations(c)) } else { (0.0, [0.0; 3]) })
+            .collect()
     }
 
     /// ρ and u (lattice units) of every coarse cell: the coarse values outside the strip, the
