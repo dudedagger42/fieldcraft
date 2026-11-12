@@ -2,7 +2,8 @@
 //! impinging jet): a smoke study of the set-up, not a gate. It reports the actual inflow against the
 //! bore's area times the bulk velocity (a staircase bore feeds 80–120 % of the true area, so the
 //! flow and the Reynolds number can shift by that much), the inlet's density deviation and the
-//! fastest cell, as the flow develops.
+//! fastest cell, as the flow develops, and at every report the wall jet's U_max at r/D 0.5…3 and,
+//! at the end, whether each changed by under 0.5 % over the run's last fifth.
 //!
 //! `FIELDCRAFT_JET_STUDY=1 cargo test --release -p fieldcraft-lbm --test impinging_jet -- --ignored
 //! --nocapture smoke` (`FIELDCRAFT_JET_N` cells across the pipe diameter, default 32;
@@ -91,6 +92,7 @@ fn smoke() {
     }
     let quarter = std::f64::consts::PI * 0.25 / 4.0 * n * n; // cells
     println!("inflow: {fed} cells fed, {:.4} of the true quarter bore area, flux {:.4} of U·πR²/4", fed as f64 / quarter, sum / (u * quarter));
+    println!("inlet corner rule: {:?}", flow.inlet_corner_report());
     let layer_cells = m
         .fluid_domain("Flow")
         .and_then(|d| d.absorbing.as_ref().map(|a| a.thickness.map_or(fieldcraft_model::fluids::DEFAULT_ABSORBING_CELLS as f64, |t| t * n)));
@@ -116,6 +118,7 @@ fn smoke() {
         format!("x {x:.3} y {y:.3} z {z:.3} r {r:.3} ({label})")
     };
     let report = var("FIELDCRAFT_JET_REPORT", 1000.0) as u64;
+    let mut history: Vec<(u64, Vec<f64>)> = Vec::new();
     let clock = std::time::Instant::now();
     for s in 1..=setup.steps {
         flow.step().unwrap();
@@ -166,6 +169,13 @@ fn smoke() {
                 clock.elapsed().as_secs_f64()
             );
             assert!(mean.is_finite() && deviation.is_finite() && fastest.is_finite(), "the flow blew up at step {s}");
+            // The wall jet: at each station r/D, the azimuthal mean of the radial velocity over the
+            // cells within half a cell of the station's radius, in each layer behind the plate; its
+            // maximum over the layers is U_max(r/D), in units of the bulk velocity.
+            let peaks = wall_jet_peaks(&flow, n, u);
+            let line: Vec<String> = peaks.iter().zip(STATIONS).map(|(p, st)| format!("{st}: {:.4} at z/D {:.3}", p.0, p.1)).collect();
+            println!("step {s}: U_max/U_b at r/D {}", line.join("; "));
+            history.push((s, peaks.iter().map(|p| p.0).collect::<Vec<f64>>()));
             if s == setup.steps {
                 // Columns 4…10 (past the flange): in each, the mean of ρ − 1 over its fluid cells
                 // and the largest deviation from it, over every cell and away from the rim cells
@@ -201,4 +211,59 @@ fn smoke() {
             }
         }
     }
+    // Settled: U_max at each station changed by under 0.5 % over the last fifth of the run.
+    let from = history.iter().find(|(s, _)| *s as f64 >= 0.8 * setup.steps as f64);
+    if let (Some((s0, first)), Some((s1, last))) = (from, history.last()) {
+        if s0 == s1 {
+            println!("settled check: the run has no report in its last fifth before the final one");
+            return;
+        }
+        let changes: Vec<f64> = first.iter().zip(last).map(|(a, b)| (b - a) / a).collect();
+        println!(
+            "settled check, steps {s0} to {s1}: U_max change per station {}; {}",
+            changes.iter().zip(STATIONS).map(|(c, st)| format!("{st}: {:+.2} %", 100.0 * c)).collect::<Vec<_>>().join(", "),
+            if changes.iter().all(|c| c.abs() < 0.005) { "settled (< 0.5 %)" } else { "NOT settled" }
+        );
+    }
+}
+
+/// The wall-jet stations, r/D.
+const STATIONS: [f64; 6] = [0.5, 1.0, 1.5, 2.0, 2.5, 3.0];
+
+/// For each station: the peak over the layers behind the plate of the azimuthal mean radial velocity
+/// (in units of `bulk`, the lattice bulk velocity), and its distance from the plate in D. The cells
+/// of a station are those whose radius is within half a cell of it; the plate is the box's last face.
+fn wall_jet_peaks(flow: &fieldcraft_lbm::Flow, n: f64, bulk: f64) -> Vec<(f64, f64)> {
+    let grid = *flow.grid();
+    let [nx, ny, nz] = grid.cells;
+    // (sum, count) per station and layer.
+    let mut acc = vec![vec![(0.0f64, 0usize); nx]; STATIONS.len()];
+    for k in 0..nz {
+        for j in 0..ny {
+            for i in 0..nx {
+                let cell = grid.index([i, j, k]);
+                let [_, y, z] = grid.centre(cell);
+                let r = y.hypot(z);
+                let Some(st) = STATIONS.iter().position(|&st| (r - st).abs() < 0.5 / n) else { continue };
+                if let Some((_, v)) = flow.moments(cell)
+                    && r > 0.0
+                    && let Some(layer) = acc.get_mut(st).and_then(|a| a.get_mut(i))
+                {
+                    layer.0 += (y * v[1] + z * v[2]) / r;
+                    layer.1 += 1;
+                }
+            }
+        }
+    }
+    let length = grid.centre(grid.index([nx.saturating_sub(1), 0, 0]))[0] + 0.5 / n;
+    acc.iter()
+        .map(|layers| {
+            layers
+                .iter()
+                .enumerate()
+                .filter(|(_, l)| l.1 > 0)
+                .map(|(i, l)| (l.0 / l.1 as f64 / bulk, length - grid.centre(grid.index([i, 0, 0]))[0]))
+                .fold((f64::NEG_INFINITY, 0.0), |a, b| if b.0 > a.0 { b } else { a })
+        })
+        .collect()
 }
