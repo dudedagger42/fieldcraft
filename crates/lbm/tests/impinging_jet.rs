@@ -164,6 +164,39 @@ fn smoke() {
                 clock.elapsed().as_secs_f64()
             );
             assert!(mean.is_finite() && deviation.is_finite() && fastest.is_finite(), "the flow blew up at step {s}");
+            if s == setup.steps {
+                // Columns 4…10 (past the flange): in each, the mean of ρ − 1 over its fluid cells
+                // and the largest deviation from it, over every cell and away from the rim cells
+                // (r within 0.1 D of the bore's wall), each with the worst cell's place.
+                for i in 4..11.min(nx) {
+                    let cells: Vec<(usize, f64)> = (0..nz)
+                        .flat_map(|k| (0..ny).map(move |j| (j, k)))
+                        .filter_map(|(j, k)| {
+                            let cell = grid.index([i, j, k]);
+                            flow.moments(cell).map(|(r, _)| (cell, r - 1.0))
+                        })
+                        .collect();
+                    let section_mean = cells.iter().map(|c| c.1).sum::<f64>() / cells.len().max(1) as f64;
+                    let worst = |away_from_rim: bool| {
+                        cells
+                            .iter()
+                            .filter(|(cell, _)| {
+                                let [_, y, z] = grid.centre(*cell);
+                                !away_from_rim || (y.hypot(z) - 0.5).abs() >= 0.1
+                            })
+                            .map(|&(cell, r)| (cell, (r - section_mean).abs()))
+                            .fold((0usize, 0.0f64), |a, b| if b.1 > a.1 { b } else { a })
+                    };
+                    let (all, away) = (worst(false), worst(true));
+                    println!(
+                        "column {i}: mean ρ − 1 {section_mean:+.3e}; max deviation from the mean, all cells {:.3e} at {}; away from the rim {:.3e} at {}",
+                        all.1,
+                        place(all.0),
+                        away.1,
+                        place(away.0)
+                    );
+                }
+            }
         }
     }
 }
