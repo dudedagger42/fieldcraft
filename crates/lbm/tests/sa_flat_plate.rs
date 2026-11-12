@@ -176,8 +176,10 @@ impl Plate {
     /// averaging windows of two acoustic periods rounded to whole samples) or the step cap; each
     /// strip's means over the last window, whether they settled, and the steps taken.
     fn run(&self) -> (Vec<Station>, bool, u64) {
-        let (_, mut flow, strips) = self.build();
+        let (setup, mut flow, strips) = self.build();
         let grid = *flow.grid();
+        println!("setup warnings: {:?}", setup.warnings);
+        println!("inlet corner rule: {:?}", flow.inlet_corner_report());
         // Every force group of each strip (its shear is its whole x force; see body_groups).
         let groups: Vec<Vec<usize>> = (0..strips.len()).map(|s| body_groups(&flow, &format!("Strip{s}"))).collect();
         let nu = self.lattice_nu();
@@ -193,7 +195,8 @@ impl Plate {
             let last = gated.iter().map(|&s| strips[s].1).fold(0.0, f64::max);
             let thickness = layer.thickness.unwrap_or(fieldcraft_model::fluids::DEFAULT_ABSORBING_CELLS as f64 * self.spacing);
             assert!(
-                -self.upstream + thickness <= 1e-12 && self.length - thickness >= last - 1e-12,
+                // A slab that starts at the inlet face (no upstream floor) has the layer over its first cells.
+                (self.upstream == 0.0 || -self.upstream + thickness <= 1e-12) && self.length - thickness >= last - 1e-12,
                 "the absorbing layer ({thickness} thick) reaches the plate or the gated strips (−{} to {}, gated up to {last})",
                 self.upstream,
                 self.length
@@ -670,6 +673,17 @@ impl PlateGrid {
             sample: 2000,
         }
     }
+
+    /// The grid with the study's environment overrides: `FIELDCRAFT_PLATE_UPSTREAM` (the slip floor ahead
+    /// of the plate, 0: the plate starts at the inlet face), `FIELDCRAFT_PLATE_SIGMA` (the hybrid
+    /// collision's σ) and `FIELDCRAFT_PLATE_MAX_STEPS`.
+    fn with_overrides(mut self) -> PlateGrid {
+        let var = |name: &str| std::env::var(name).ok().and_then(|v| v.parse::<f64>().ok());
+        self.upstream = var("FIELDCRAFT_PLATE_UPSTREAM").unwrap_or(self.upstream);
+        self.sigma = var("FIELDCRAFT_PLATE_SIGMA").or(self.sigma);
+        self.max_steps = var("FIELDCRAFT_PLATE_MAX_STEPS").map_or(self.max_steps, |v| v as u64);
+        self
+    }
 }
 
 /// The result of a 2DZP run: each strip's reading, the 15a gate at the expected.json Re_θ, and
@@ -824,7 +838,7 @@ fn study_spalart_allmaras_on_han_s_wall_meets_karman_schoenherr() {
         println!("the 2DZP study runs only with {STUDY}=1 (hours long): skipped");
         return;
     }
-    let mut grid = PlateGrid::wall_function();
+    let mut grid = PlateGrid::wall_function().with_overrides();
     if std::env::var("FIELDCRAFT_PLATE_FILTER").is_ok_and(|v| v == "quarter") {
         // A quarter of the quarter wave's period, in model time (one step is U_lat Δ / U, U = 1).
         let dx = 1.0 / grid.cells_per_unit;
