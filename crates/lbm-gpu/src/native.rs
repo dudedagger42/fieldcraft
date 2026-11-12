@@ -337,6 +337,8 @@ pub struct GpuFlow {
     /// dispatch.
     sa_wall_rows: u32,
     sa_wall_groups: Option<(u32, u32)>,
+    /// The absorbing layer's cells (`absorb`).
+    absorb_groups: Option<(u32, u32)>,
 }
 
 /// The Spalart–Allmaras model on the device (see `lbm.wgsl`): its ν̃ buffer and the chunk's
@@ -616,7 +618,7 @@ fn solid_data(solid: &fieldcraft_lbm::conduction::SolidHeat, t0: f64) -> Result<
 }
 
 /// The entry points of `lbm.wgsl` a flow dispatches.
-const KERNELS: [&str; 39] = [
+const KERNELS: [&str; 40] = [
     "clear_eddy",
     "gradient_velocity",
     "fan_partials",
@@ -627,6 +629,7 @@ const KERNELS: [&str; 39] = [
     "damping_refresh",
     "bounce_sample",
     "node_bounce",
+    "absorb",
     "stream",
     "stream_links",
     "stream_links_exchange",
@@ -920,11 +923,6 @@ impl GpuFlow {
         }
         if flow.free_surface() {
             return Err(Error::Invalid("a free surface is not on the GPU backend yet: solve on the CPU (`backend: \"cpu\"`)".into()));
-        }
-        if !flow.absorbing_cells().is_empty() {
-            return Err(Error::Invalid(
-                "not supported yet on the GPU: the absorbing layer (`absorbing`) at the velocity and pressure faces; solve on the CPU (`backend: \"cpu\"`)".into(),
-            ));
         }
         if flow.wall_nodes().is_some_and(|n| !matches!(n.law(), fieldcraft_lbm::sa::WallLaw::Spalding | fieldcraft_lbm::sa::WallLaw::SpalartAllmaras))
         {
@@ -1403,6 +1401,15 @@ impl GpuFlow {
                 wall_rows.extend(row.map(|v| v as f32));
             }
         }
+        // The absorbing layer's rows after those (lbm.wgsl `absorb`): three per layer cell, the
+        // cell and its strength, then the reference's two rows, which the first step fills.
+        let (absorb_cells, absorb_strength, absorb_filter) = flow.absorbing_layer();
+        let absorb_first = u32::try_from(wall_rows.len() / 4).map_err(|_| Error::Limit("too many wall rows for the GPU solver".into()))?;
+        let absorb_count = u32::try_from(absorb_cells.len()).map_err(|_| Error::Limit("too many absorbing-layer cells for the GPU solver".into()))?;
+        for (cell, strength) in absorb_cells.iter().zip(absorb_strength) {
+            wall_rows.extend([f32::from_bits(*cell), *strength as f32, 0.0, 0.0]);
+            wall_rows.extend([0.0; 8]);
+        }
         let sa_inflow = flow.spalart_allmaras().map_or(0.0, |f| f.inflow());
         let params = [0u32, 1].map(|phase| {
             let mut bytes = params.clone();
@@ -1421,7 +1428,8 @@ impl GpuFlow {
                 sa_flags(true, c_des.is_some()),
             ]));
             // `ramp` (RAMP): full speed until a chunk writes the ramp's factors.
-            bytes.extend_from_slice(&bytes_f32(&[1.0, 0.0, 0.0, 0.0]));
+            // With the absorbing layer: the filter's rate, and its rows' start and number.
+            bytes.extend_from_slice(&bytes_f32(&[1.0, absorb_filter as f32, f32::from_bits(absorb_first), f32::from_bits(absorb_count)]));
             device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("lbm params"),
                 contents: &bytes,
@@ -1654,6 +1662,7 @@ impl GpuFlow {
             sa_cells: sa_faces.map(|_| sa_cell),
             sa_wall_rows,
             sa_wall_groups: if sa_wall_rows > 0 { Some(groups(sa_wall_rows as usize)?) } else { None },
+            absorb_groups: if absorb_count > 0 { Some(groups(absorb_count as usize)?) } else { None },
         })
     }
 
@@ -1974,7 +1983,7 @@ impl GpuFlow {
     fn dispatches_per_step(&self) -> usize {
         let solid = self.solid.as_ref().map_or(0, |sd| 3 + sd.substeps as usize);
         let sa = self.sa.as_ref().map_or(0, |s| 1 + 2 * s.substeps.unwrap_or(SA_MAX_SUBSTEPS) as usize);
-        13 + solid + sa + if self.zones.fans > 0 { 2 } else { 0 }
+        14 + solid + sa + if self.zones.fans > 0 { 2 } else { 0 }
     }
 
     /// One submission of `steps` (≤ MAX_CHUNK) time steps, then the stability check.
@@ -2032,6 +2041,9 @@ impl GpuFlow {
             commands.push((self.current, "collide", self.cells));
             if let Some(groups) = self.wall_groups.filter(|_| self.on_node) {
                 commands.push((self.current, "node_bounce", groups));
+            }
+            if let Some(groups) = self.absorb_groups {
+                commands.push((self.current, "absorb", groups));
             }
             if !self.aa {
                 commands.push((self.current, "stream", self.cells));

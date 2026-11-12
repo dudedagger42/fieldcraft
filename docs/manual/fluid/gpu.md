@@ -144,7 +144,7 @@ whose forces are read back (a submission's last). The temperature lattice is two
 | The Spalart–Allmaras model (`turbulence: {"type": "spalart_allmaras"}`), with DDES, resolved to the wall or on Han et al.'s on-node wall | yes; with `musker`, Van Driest damping, heat or the dynamic σ it is refused (CPU only) |
 | The Spalart–Allmaras wall law on the on-node wall (`wall_model: "spalart_allmaras_bounce"`) | yes: the device searches the host's table (sent as f32 segments) and matches the CPU to about 1e-6 in the velocity and the friction velocities; Musker's wall model and the halfway bounce stay CPU only |
 | Han et al.'s on-node wall-function bounce (`wall_model: "spalding_bounce"`, their eq. 14) | yes: box faces, obstacles, edges, corners and the cells where a wall meets an open face |
-| The absorbing layer at velocity and pressure faces (`absorbing`) | no: refused (CPU only) |
+| The absorbing layer at velocity and pressure faces (`absorbing`) | yes: the `absorb` kernel runs between the collision and the streaming; it matches the CPU to 1e-6 (velocity and density, 1000 steps) on a velocity inlet and a pressure outlet |
 
 ## Algorithm
 

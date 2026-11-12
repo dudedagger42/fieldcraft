@@ -394,7 +394,7 @@ this resolution: c_D 3.4 % above).
   reported speed extremes (`max_speed`, slice ranges) leave every inlet and outlet layer out for
   this reason, convective outlets included.
 - Inlets and outlets reflect pressure waves. The absorbing layer (`absorbing`) drains them, on the
-  CPU only, without heat or a free surface.
+  CPU and the GPU, without heat or a free surface.
 - Fans and porous zones must stay at least one cell inside the inlet and outlet layers.
 
 ## Implementation

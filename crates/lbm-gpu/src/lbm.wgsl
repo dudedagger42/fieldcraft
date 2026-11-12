@@ -191,7 +191,9 @@ struct Params {
     // DDES (with C_DES Δ in `les.w`).
     sa: vec4<u32>,
     // The moving walls' ramp: this step's factor on every link's moving-wall term (x; 1 without
-    // a ramp and after it, `fieldcraft_lbm::lattice::wall_ramp`), padding (yzw).
+    // a ramp and after it, `fieldcraft_lbm::lattice::wall_ramp`); with the absorbing layer, the
+    // reference filter's rate 1/N_f (y), the first row of its cells in `walls` (z) and their number
+    // (w), the last two as bits (`absorb`).
     ramp: vec4<f32>,
 };
 
@@ -1640,6 +1642,74 @@ fn sa_wall_function(@builtin(local_invocation_index) lid: u32, @builtin(workgrou
     nu_tilde[cell] = v;
     moments[cell] = vec4<f32>(moments[cell].xyz, sa_nu_t(v, nu));
     walls[base + 2u] = vec4<f32>(ut, v, 0.0, 0.0);
+}
+
+// The absorbing layer (fieldcraft_lbm::absorbing, Xu and Sagaut's type II term), after the
+// collision and the boundary nodes' and before the streaming, as the CPU applies it: on each layer
+// cell's post-collision populations
+//   f_q += s [f^eq_q(ρ̄, ū) − f^eq_q(ρ, u)],   s = w χ,
+// (ρ, u) the cell's own plain-sum moments, (ρ̄, ū) the filtered reference; then the reference takes
+// ρ̄ += (ρ' − ρ̄) / N_f with the moments ρ' of the damped populations. Three rows in `walls` per
+// cell, from `params.ramp`: the cell (bits), s and whether the reference was taken yet (x, y, z);
+// the moments the last step ended with (ρ − 1, ρ u); and the reference less those (the lag).
+// The lag, not the reference, is what is kept: the reference moves by about 1e-7 per step on a
+// value near 3e-2, below f32's resolution there (2e-9), where the lag, δ' = (1 − 1/N_f)(δ − Δ)
+// with Δ the step's change in the moments (a difference of close numbers, exact), keeps its own
+// digits; no sum depends on being done in a stated order. The reference is taken from the first
+// state the layer sees, whose term is then zero, as on the CPU. Each cell is one thread's.
+@compute @workgroup_size(256)
+fn absorb(@builtin(local_invocation_index) lid: u32, @builtin(workgroup_id) wg: vec3<u32>) {
+    let k = cell_of(lid, wg);
+    if k >= bitcast<u32>(params.ramp.w) { return; }
+    let base = bitcast<u32>(params.ramp.z) + 3u * k;
+    let head = walls[base];
+    let cell = bitcast<u32>(head.x);
+    let strength = head.y;
+    let primed = head.z != 0.0;
+    let xyz = aa_coords(cell);
+    var fq: array<f32, 19>;
+    var drho = 0.0;
+    var j = vec3<f32>(0.0);
+    for (var q = 0u; q < Q; q = q + 1u) {
+        let v = f[post_index(q, cell, xyz)];
+        fq[q] = v;
+        drho = drho + v;
+        j = j + vec3<f32>(c_of(q)) * v;
+    }
+    var last = walls[base + 1u];
+    var lag = walls[base + 2u];
+    if !primed {
+        last = vec4<f32>(drho, j);
+        lag = vec4<f32>(0.0);
+    }
+    // The reference, ρ̄ − 1 and ρ̄ ū.
+    let mean = last + lag;
+    let rho = 1.0 + drho;
+    let rho_bar = 1.0 + mean.x;
+    var now = vec4<f32>(drho, j);
+    if primed && rho > 0.0 && rho_bar > 0.0 && strength > 0.0 {
+        let u = j / rho;
+        let ub = mean.yzw / rho_bar;
+        let uu = dot(u, u);
+        let uub = dot(ub, ub);
+        var dr = 0.0;
+        var dj = vec3<f32>(0.0);
+        for (var q = 0u; q < Q; q = q + 1u) {
+            let c = vec3<f32>(c_of(q));
+            let cu = dot(c, u);
+            let cub = dot(c, ub);
+            let d = strength * w_of(q) * ((rho_bar - rho) + rho_bar * (3.0 * cub + 4.5 * cub * cub - 1.5 * uub) - rho * (3.0 * cu + 4.5 * cu * cu - 1.5 * uu));
+            f[post_index(q, cell, xyz)] = fq[q] + d;
+            dr = dr + d;
+            dj = dj + c * d;
+        }
+        now = vec4<f32>(drho + dr, j + dj);
+    }
+    // δ' = (1 − 1/N_f)(δ − Δ), Δ the step's change in the moments.
+    let new_lag = (1.0 - params.ramp.y) * (lag - (now - last));
+    walls[base] = vec4<f32>(head.x, head.y, 1.0, 0.0);
+    walls[base + 1u] = now;
+    walls[base + 2u] = new_lag;
 }
 
 // The rate of an explicit eddy viscosity, τ̄ = 3 (ν + ν_t) + ½.
