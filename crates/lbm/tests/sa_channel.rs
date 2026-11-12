@@ -959,3 +959,32 @@ fn sa_law_channel_at_re_tau_550_meets_lee_and_moser() {
     assert!(failures.is_empty(), "{failures:?}");
     assert!(score.passes());
 }
+
+/// The held-out Re_τ 543.496 channel (Lee & Moser) on the half-way wall, SA law, the hybrid collision at
+/// σ 0.95 (the duct's), 20 cells per δ (the first open cell at y⁺ 13.6, the sampled second at 40.8). Run
+/// once, with nothing changed after it; gate: carried C_f within 3 %, request = carried within 1 %.
+#[test]
+#[ignore = "heavy: cargo xtask test --heavy (CI heavy job)"]
+fn sa_rans_channel_at_re_tau_550_on_the_half_way_wall() {
+    let r = Channel {
+        re_tau: LEE_MOSER_550_RE_TAU,
+        cells: 20,
+        bulk_guess: LEE_MOSER_550_BULK,
+        lattice_bulk: 0.1,
+        collision: Collision::Hrr,
+        sigma: Some(0.95),
+        turbulence: Some(sa(WallModel::SpalartAllmarasBounceSurface)),
+        on_node: false,
+        slabs: true,
+        max_steps: 3_000_000,
+        sample: 100,
+        settling: GATED,
+    }
+    .run();
+    report("held-out Re_τ 550, half-way wall, HRR σ 0.95, 20 cells per δ", &r, LEE_MOSER_550_BULK, LEE_MOSER_550_CF);
+    let error = r.carried / LEE_MOSER_550_CF - 1.0;
+    println!("Re_τ 550: C_f carried {:+.2} % against Lee & Moser; centre U⁺ {:.2} (ref {LEE_MOSER_550_CENTRE})", 100.0 * error, r.centre);
+    assert!(r.settled, "not settled in {} steps", r.steps);
+    assert!(error.abs() < 0.03, "C_f error {:+.2} %", 100.0 * error);
+    assert!((r.requested.unwrap_or(f64::NAN) / r.carried - 1.0).abs() < 0.01);
+}
