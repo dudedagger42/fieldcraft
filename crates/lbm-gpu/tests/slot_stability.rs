@@ -65,8 +65,10 @@ fn slotted_channel_stability() {
     // SURFACE=2: the half-way-true slot: the open (fluid) rows are exactly the geometric 0.2 m (cells rows), the wall-node rows
     // lie outside them (cells + 2 rows from node to node), and the solid part of the plate is 0.2 m thick in x.
     let half_way = env("SURFACE", 0.0) > 1.5;
+    // PLATE_T (m, default 0.2): the plate's thickness in x for SURFACE=2, so L/w = PLATE_T / 0.2 (0.1 is half a slot width).
+    let plate_t = env("PLATE_T", 0.2);
     let (z_hi, x_hi) = if half_way {
-        (0.6 + 2.0 * dx, 0.8)
+        (0.6 + 2.0 * dx, 0.6 + plate_t)
     } else if surface {
         (0.6 + dx, 0.6 + (cells - 1.0) * dx)
     } else {
