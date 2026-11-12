@@ -3,7 +3,7 @@
 //! Fields are in lattice units (velocity and density as the solver holds them), so peak u and U_in are comparable.
 //! The plate across the channel has a slot `SLOT_CELLS` cells wide (0.2 m, so dx = 0.2 / SLOT_CELLS); the box faces
 //! y min/max and z min are walls with the named wall law (`LAW`: spalding or sa), z max is slip.
-//! Environment: SURFACE (1: wall-node rows exactly 0.2 m apart across the slot and through the plate), TURB (sa, vreman, none), SLOT_CELLS (4), LAW (spalding), LAYER (1: the default absorbing layer), STEPS (20000), CHUNK (500), TAU (2.4e-4), ULAT (inlet mean lattice
+//! Environment: SURFACE (1: wall-node rows exactly 0.2 m apart across the slot and through the plate; 2: the open rows exactly 0.2 m, wall nodes outside them), TURB (sa, vreman, none), SLOT_CELLS (4), LAW (spalding), LAYER (1: the default absorbing layer), STEPS (20000), CHUNK (500), TAU (2.4e-4), ULAT (inlet mean lattice
 //! speed, 0.014), LAYER_CELLS (the layer's thickness in cells of this grid; hold the physical thickness: 10/20/40 at
 //! 4/8/16 cells), EXT_UP / EXT_DN (m of box added upstream / downstream; 0.5 and 0.5 give a 0.5 m layer room on every grid), ZMAX (wall: z max a wall), TAU (tau+-1/2; hold Re: 2.4e-4/4.8e-4/9.6e-4 at 4/8/16 cells), CPU (1: compare with the CPU each chunk; 0: device only), GPU (1).
 // A local harness: index loops over the grid and nested ifs read better than iterator chains here.
@@ -62,7 +62,16 @@ fn slotted_channel_stability() {
     // from wall node to wall node) and 0.2 m through the plate. The solid part of the plate is one cell thinner than the
     // geometry in z (the upper block starts a cell higher) and (cells - 1) cells thick in x.
     let surface = env("SURFACE", 0.0) > 0.5;
-    let (z_hi, x_hi) = if surface { (0.6 + dx, 0.6 + (cells - 1.0) * dx) } else { (0.6, 0.8) };
+    // SURFACE=2: the half-way-true slot: the open (fluid) rows are exactly the geometric 0.2 m (cells rows), the wall-node rows
+    // lie outside them (cells + 2 rows from node to node), and the solid part of the plate is 0.2 m thick in x.
+    let half_way = env("SURFACE", 0.0) > 1.5;
+    let (z_hi, x_hi) = if half_way {
+        (0.6 + 2.0 * dx, 0.8)
+    } else if surface {
+        (0.6 + dx, 0.6 + (cells - 1.0) * dx)
+    } else {
+        (0.6, 0.8)
+    };
     let obstacles = vec![
         obstacle("PlateLow", cuboid([0.6, 0.0, 0.0], [x_hi, 1.0, 0.4]), &CUBOID_FACES),
         obstacle("PlateHigh", cuboid([0.6, 0.0, z_hi], [x_hi, 1.0, 1.0]), &CUBOID_FACES),
@@ -348,10 +357,25 @@ fn slotted_channel_stability() {
             worst.0
         );
     }
-    if env("DIAG4", 0.0) > 0.5 && cpu_ok {
+    // DIAG4 reads the final fields from the CPU flow when it ran, else from the device (CPU=0): the same prints either way.
+    // The device's nu_tilde may be missing, then the viscosity line reads zero.
+    let diag4 = if env("DIAG4", 0.0) <= 0.5 {
+        None
+    } else if cpu_ok {
+        match (Backend::fields(&mut cpu), Backend::nu_tilde(&mut cpu)) {
+            (Ok(f), Ok(n)) => Some((f, n, Backend::eddy_viscosity_ratio(&cpu), "cpu")),
+            _ => None,
+        }
+    } else if let (true, Some(g)) = (gpu_ok, gpu.as_mut()) {
+        Backend::fields(g).ok().map(|f| (f, Backend::nu_tilde(g).ok().flatten(), Backend::eddy_viscosity_ratio(g), "gpu"))
+    } else {
+        None
+    };
+    if let Some((fl, nt, evr, source)) = diag4 {
         let nu_lat = setup.tau_plus - 0.5;
         let nu_lat = nu_lat / 3.0;
-        if let (Ok(fl), Ok(nt)) = (Backend::fields(&mut cpu), Backend::nu_tilde(&mut cpu)) {
+        println!("DIAG4 source: {source} fields at step {done}");
+        {
             let sec = |i: usize| -> (usize, f64, f64, f64, f64) {
                 // open cells, total, mean density, mean u_x over open cells (lattice), max |u| (lattice)
                 let (mut open, mut rho, mut ux, mut um) = (0usize, 0.0, 0.0, 0.0f64);
@@ -427,7 +451,7 @@ fn slotted_channel_stability() {
                 let (open, tot, _, _, _) = sec(i);
                 let u_open = flow_per_area / (open as f64 / tot);
                 println!(
-                    "DIAG4 (f) surface-true: K_w = dp/(0.5 (Q/0.2 m wall-to-wall)^2) = {:.3}; K_fluid = dp/(0.5 (Q/fluid-cell width)^2) = {:.3} (fluid width {:.4} m of the 0.2 wall-to-wall, mean u {u_open:.5}); dp per head of the peak {:.3}",
+                    "DIAG4 (f) surface-true: K_w = dp/(0.5 (Q/0.2 m wall-to-wall)^2) = {:.3}; K_fluid (= K_open = K_slot (open fraction / 0.2)^2) = dp/(0.5 (Q/fluid-cell width)^2) = {:.3} (fluid width {:.4} m of the 0.2 wall-to-wall, mean u {u_open:.5}); dp per head of the peak {:.3}",
                     dp_end / (0.5 * u_nom * u_nom),
                     dp_end / (0.5 * u_open * u_open),
                     open as f64 / tot,
@@ -502,7 +526,7 @@ fn slotted_channel_stability() {
             let slot_w = cells; // cells
             println!(
                 "DIAG4 (c) nu_lat {nu_lat:.3e}; backend eddy_viscosity_ratio (max nu_t/nu, last step) {:.3}; from nu_tilde: max nu_t/nu {rmax:.3} at {ri:?} (x {:.3} m); in the jet region x 0.8..1.2: max {jmax:.3} at {ji:?}; nu_t/(U_in * slot width) there = {:.4e} (U_in {u_in}, slot {slot_w} cells), molecular nu/(U_in * slot width) = {:.4e}",
-                Backend::eddy_viscosity_ratio(&cpu),
+                evr,
                 dx * (ri[0] as f64 + 0.5) - ext_up,
                 jmax * nu_lat / (u_in * slot_w),
                 nu_lat / (u_in * slot_w)
