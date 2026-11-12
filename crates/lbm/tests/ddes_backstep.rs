@@ -418,7 +418,14 @@ impl Step {
         (flow, strips, built)
     }
 
+    /// [`Step::try_run`], panicking (test code) on an error.
     fn run(&self) -> Run {
+        self.try_run().unwrap_or_else(|e| panic!("the step run: {e}"))
+    }
+
+    /// The run; an error, with the step and the numbers, when the flow stops stepping or a wall
+    /// shear sample is not finite.
+    fn try_run(&self) -> Result<Run, String> {
         let (mut flow, strips, _) = self.build();
         let grid = *flow.grid();
         let h = self.spacing();
@@ -449,6 +456,7 @@ impl Step {
         let mut missing = (0usize, None);
         let mut steps = 0;
         let mut interval = vec![0.0; strips.len()];
+        let mut last_face_mean = 0.0;
         let floor_x: Vec<f64> = strips.iter().filter(|s| s.floor).map(|s| 0.5 * (s.x.0 + s.x.1)).collect();
         let floor_of = |v: &[f64]| strips.iter().zip(v).filter(|(s, _)| s.floor).map(|(_, &t)| t).collect::<Vec<f64>>();
         let mut rule = None;
@@ -463,10 +471,12 @@ impl Step {
         let mut samples: Vec<Vec<f64>> = Vec::new();
         // One sample into the statistics; the rule that settles the run, if one does. Each
         // completed block prints a line: its reattachment, the running mean and, when given, the
-        // inlet's largest |ρ − 1| (its first four columns).
+        // inlet's first four columns split into the face mean of ρ − 1 (the pressure level, whose
+        // change since the last sample is what says whether it is still moving) and the largest
+        // deviation from that mean (the grid-scale mode the absorbing layer damps).
         let take = |sample: &[f64],
                     steps: u64,
-                    inlet: Option<f64>,
+                    inlet: Option<[f64; 3]>,
                     shear: &mut Shear,
                     blocks: &mut Blocks,
                     missing: &mut (usize, Option<NoReattachment>),
@@ -490,12 +500,14 @@ impl Step {
                 }
             }
             println!(
-                "step {steps}: block {} x_r {last:?}, mean {:.3} H over {} blocks ({} refused), inlet |ρ − 1| {}, {:.0} s",
+                "step {steps}: block {} x_r {last:?}, mean {:.3} H over {} blocks ({} refused), inlet ρ − 1: face mean {}, change {}, deviation {}, {:.0} s",
                 shear.blocks(),
                 blocks.mean(),
                 blocks.means().len(),
                 missing.0,
-                inlet.map_or("(replayed)".into(), |v| format!("{v:.2e}")),
+                inlet.map_or("(replayed)".into(), |v| format!("{:+.4e}", v[0])),
+                inlet.map_or("(replayed)".into(), |v| format!("{:+.1e}", v[1])),
+                inlet.map_or("(replayed)".into(), |v| format!("{:.2e}", v[2])),
                 clock.elapsed().as_secs_f64()
             );
             if steady_run {
@@ -516,8 +528,8 @@ impl Step {
             samples = kept;
         }
         while steps < self.max_steps && rule.is_none() {
-            flow.step().unwrap();
             steps += 1;
+            flow.step().map_err(|e| format!("step {steps}: {e}"))?;
             if steps <= startup {
                 if let Some(path) = self.checkpoint.as_ref().filter(|_| steps.is_multiple_of(CHECKPOINT_STEPS)) {
                     save(path, &mut flow, steps, &samples);
@@ -533,12 +545,21 @@ impl Step {
             }
             // One sample: each strip's mean shear over the interval.
             let sample: Vec<f64> = interval.iter().map(|t| t / self.sample as f64).collect();
-            assert!(sample.iter().all(|s| s.is_finite()), "the wall shear is not finite after {steps} steps");
+            if let Some((strip, v)) = sample.iter().enumerate().find(|(_, v)| !v.is_finite()) {
+                return Err(format!(
+                    "the wall shear is not finite after {steps} steps: strip {strip} of {} reads {v}, last inlet face mean of ρ − 1 {last_face_mean:+.3e}",
+                    sample.len()
+                ));
+            }
             interval.iter_mut().for_each(|v| *v = 0.0);
-            let inlet = (0..4.min(nx))
+            let rhos: Vec<f64> = (0..4.min(nx))
                 .flat_map(|i| (0..nz).flat_map(move |k| (0..ny).map(move |j| [i, j, k])))
-                .filter_map(|c| flow.moments(grid.index(c)).map(|m| (m.0 - 1.0).abs()))
-                .fold(0.0, f64::max);
+                .filter_map(|c| flow.moments(grid.index(c)).map(|m| m.0 - 1.0))
+                .collect();
+            let face_mean = rhos.iter().sum::<f64>() / rhos.len().max(1) as f64;
+            let deviation = rhos.iter().map(|r| (r - face_mean).abs()).fold(0.0, f64::max);
+            let inlet = [face_mean, face_mean - last_face_mean, deviation];
+            last_face_mean = face_mean;
             rule = take(&sample, steps, Some(inlet), &mut shear, &mut blocks, &mut missing, &mut recent);
             samples.push(sample);
             // Sample boundaries carry no partial interval, so the file holds the whole state.
@@ -567,7 +588,7 @@ impl Step {
         // U_ref in units of the inlet speed (the lattice speeds are scaled by U_lat).
         let u_ref_inlet = u_ref / self.lattice_velocity;
         let crossing = wall_crossing(&flow, self, 0);
-        Run {
+        Ok(Run {
             cf,
             cp,
             x_r,
@@ -578,7 +599,7 @@ impl Step {
             steps,
             settled: rule.is_some(),
             rule,
-        }
+        })
     }
 }
 
@@ -1048,9 +1069,9 @@ fn a_restart_files_readings() {
             Err(why) => println!("wall reader shifted {shift:+} cells: none ({why})"),
         }
     }
-    // The gate reading: x_r is the wall (y = 0) value, the linear extrapolation of the u = 0
-    // crossings of rows 1 and 2 to y = 0; the uncertainty band is that against the row-1 value and
-    // the extrapolation from rows 2 and 3. No variant is picked by its nearness to the experiment.
+    // The gate reading: x_r is the wall (y = 0) value of the least-squares line through the u = 0
+    // crossings of rows 2, 3 and 4 (row 1, the wall-modelled row, reads long on every grid and is
+    // reported beside it). No variant is picked by its nearness to the experiment.
     let first_row = if flow.on_node_bounce() { 2 } else { 1 };
     let rows: Vec<Result<(f64, f64), String>> = (0..6).map(|n| crossing_at(&flow, &step, first_row + n)).collect();
     for (n, r) in rows.iter().enumerate() {
@@ -1059,11 +1080,12 @@ fn a_restart_files_readings() {
             Err(why) => println!("u = 0 crossing, row {}: none ({why})", n + 1),
         }
     }
-    if let [Ok(r1), Ok(r2), Ok(r3), ..] = rows.as_slice() {
-        let (wall, row1, from_23) = (intercept(&[*r1, *r2], 1), r1.1, intercept(&[*r2, *r3], 1));
-        let (lo, hi) = (wall.min(row1).min(from_23), wall.max(row1).max(from_23));
+    if let [Ok(r1), Ok(r2), Ok(r3), Ok(r4), ..] = rows.as_slice() {
+        let wall = intercept(&[*r2, *r3, *r4], 1);
         println!(
-            "x_r at the wall (y = 0, rows 1–2 extrapolated): {wall:.3} H; band: row-1 value {row1:.3}, rows 2–3 extrapolated {from_23:.3}; {lo:.3} … {hi:.3} H (experiment 6.26 ± 0.10); wall law {}",
+            "x_r at the wall (y = 0, rows 2-4 least squares): {wall:.3} H; row 1 beside it: {:.3} H; rows 2-3 only: {:.3} H (experiment 6.26 ± 0.10); wall law {}",
+            r1.1,
+            intercept(&[*r2, *r3], 1),
             study_wall_law().1
         );
     }
