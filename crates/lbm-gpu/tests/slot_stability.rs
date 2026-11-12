@@ -4,7 +4,7 @@
 //! y min/max and z min are walls with the named wall law (`LAW`: spalding or sa), z max is slip.
 //! Environment: SLOT_CELLS (4), LAW (spalding), LAYER (1: the default absorbing layer), STEPS (20000), CHUNK (500), TAU (2.4e-4), ULAT (inlet mean lattice
 //! speed, 0.014), LAYER_CELLS (the layer's thickness in cells of this grid; hold the physical thickness: 10/20/40 at
-//! 4/8/16 cells), ZMAX (wall: z max a wall), TAU (tau+-1/2; hold Re: 2.4e-4/4.8e-4/9.6e-4 at 4/8/16 cells), CPU (1: compare with the CPU each chunk; 0: device only), GPU (1).
+//! 4/8/16 cells), EXT_UP / EXT_DN (m of box added upstream / downstream; 0.5 and 0.5 give a 0.5 m layer room on every grid), ZMAX (wall: z max a wall), TAU (tau+-1/2; hold Re: 2.4e-4/4.8e-4/9.6e-4 at 4/8/16 cells), CPU (1: compare with the CPU each chunk; 0: device only), GPU (1).
 // A local harness: index loops over the grid and nested ifs read better than iterator chains here.
 #![allow(clippy::needless_range_loop, clippy::collapsible_if)]
 #[path = "../../lbm/tests/common/mod.rs"]
@@ -36,7 +36,10 @@ fn slotted_channel_stability() {
     let dx = 0.2 / cells;
     let dt = u_in * dx / 0.1;
     let nu = tau_half / 3.0 * dx * dx / dt;
-    let mut d = domain([0.0; 3], [2.0, 1.0, 1.0], dx);
+    // EXT_UP / EXT_DN (m): the box grows upstream / downstream of the 2 m the plate sits in (x 0 to 2, the plate at 0.6 to
+    // 0.8), so a layer of fixed physical thickness stays within a fifth of the box's length on every grid.
+    let (ext_up, ext_dn) = (env("EXT_UP", 0.0), env("EXT_DN", 0.0));
+    let mut d = domain([-ext_up, 0.0, 0.0], [2.0 + ext_dn, 1.0, 1.0], dx);
     d.faces.x_min = FaceCondition::Velocity { velocity: [0.1, 0.02, 0.0], profile: Profile::Parabolic };
     d.faces.x_max = FaceCondition::Pressure { pressure: 0.0, outflow: Outflow::Uniform };
     d.faces.z_max = FaceCondition::Slip {};
@@ -79,8 +82,7 @@ fn slotted_channel_stability() {
     let setup = match Setup::new(&m, None, &obstacles, &Limits::default()) {
         Ok(s) => s,
         Err(e) => {
-            println!("RESULT setup refused: {e}");
-            return;
+            panic!("setup refused: {e}");
         }
     };
     let mut cpu = fieldcraft_lbm::Flow::new(&setup, &obstacles).unwrap();
@@ -100,8 +102,7 @@ fn slotted_channel_stability() {
                 Some(g)
             }
             Err(e) => {
-                println!("RESULT device refused: {e}");
-                return;
+                panic!("device refused: {e}");
             }
         }
     } else {
@@ -114,13 +115,15 @@ fn slotted_channel_stability() {
     let grid = *cpu.grid();
     let print_every = env("PRINT", 2000.0) as u64;
     let diag = env("DIAG", 0.0) > 0.5;
-    let (i_in, i_out) = ((0.3 / dx) as usize, nx - 1 - (0.3 / dx) as usize);
+    // the flux planes at x = 0.3 m and 1.7 m, the pressure planes at x = 0.5 m and 0.9 m, on every grid
+    let at = |x: f64| ((x + ext_up) / dx).round() as usize;
+    let (i_in, i_out) = (at(0.3), at(1.7));
     // the two pressure planes sit at x = 0.5 m and 0.9 m on every grid: the mean of the cell layers either side
-    let (i_up, i_dn) = (((0.5 / dx).round() as usize).max(1), ((0.9 / dx).round() as usize).max(1));
+    let (i_up, i_dn) = (at(0.5).max(1), at(0.9).max(1));
     println!(
         "PLANES pressure planes at x = {:.4} m and {:.4} m (mean of cell layers {}/{} and {}/{}); the plate spans x 0.6 to 0.8 m",
-        dx * i_up as f64,
-        dx * i_dn as f64,
+        dx * i_up as f64 - ext_up,
+        dx * i_dn as f64 - ext_up,
         i_up - 1,
         i_up,
         i_dn - 1,
