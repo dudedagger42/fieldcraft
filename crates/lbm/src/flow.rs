@@ -267,6 +267,38 @@ fn cell_state(fq: &mut [f64; Q], cell: usize, a: [f64; 3], walls: Option<&Walls>
 /// The fluid cell next to the cell at `p` along `axis` (towards `+axis` with `up`): across a
 /// periodic face its periodic image, as streaming pulls; `None` when that cell is not a fluid
 /// cell or lies outside a face that is not periodic.
+/// The most cells a radial inflow's wall taper searches for a solid cell around a cell of the face.
+const WALL_TAPER_WINDOW: usize = 64;
+
+/// How far from a solid cell, in cells, a cell still counts as touching the wall.
+const WALL_TAPER_REACH: f64 = 1.5;
+
+/// The distance from the centre of cell `(i, j)` of the face layer `layer` (across axes `t`) to the
+/// nearest solid cell of that layer, less half a cell (the staircase wall lies halfway), looking
+/// `WALL_TAPER_WINDOW` cells around; infinite when there is none within `WALL_TAPER_REACH` cells.
+fn wall_distance(fluid: &[bool], grid: &Grid, axis: usize, layer: usize, t: [usize; 2], at: [usize; 2]) -> f64 {
+    let w = WALL_TAPER_WINDOW as isize;
+    let mut nearest = f64::INFINITY;
+    for dj in -w..=w {
+        for di in -w..=w {
+            let (Some(i), Some(j)) = (at[0].checked_add_signed(di), at[1].checked_add_signed(dj)) else { continue };
+            if i >= grid.cells[t[0]] || j >= grid.cells[t[1]] {
+                continue;
+            }
+            let mut ijk = [0usize; 3];
+            ijk[axis] = layer;
+            ijk[t[0]] = i;
+            ijk[t[1]] = j;
+            if !fluid.get(grid.index(ijk)).copied().unwrap_or(true) {
+                nearest = nearest.min((di as f64).hypot(dj as f64));
+            }
+        }
+    }
+    // Only cells touching the wall (a face or diagonal neighbour): further in, the staircase's
+    // distance says little about the cell's place in the profile.
+    if nearest <= WALL_TAPER_REACH { (nearest - 0.5) * grid.spacing } else { f64::INFINITY }
+}
+
 #[inline(always)]
 pub(crate) fn neighbour(grid: &Grid, periodic: [bool; 3], fluid: &[bool], p: [usize; 3], axis: usize, up: bool) -> Option<usize> {
     let n = *grid.cells.get(axis)?;
@@ -1210,7 +1242,16 @@ impl Flow {
                                 let axis = domain.radial_inflow.as_ref();
                                 let across =
                                     |t: usize| c.get(t).copied().unwrap_or(0.0) - axis.and_then(|r| r.axis_point.get(t).copied()).unwrap_or(0.0);
-                                scale = axis.map_or(0.0, |r| r.factor(across(t1).hypot(across(t2))));
+                                let r_axis = across(t1).hypot(across(t2));
+                                scale = axis.map_or(0.0, |r| r.factor(r_axis));
+                                // A wall taper reads the table at the distance from the staircase wall.
+                                if scale > 0.0
+                                    && let Some(table) = axis.filter(|r| r.wall_taper)
+                                {
+                                    let outer = table.table.last().map_or(0.0, |p| p[0]);
+                                    let wall = wall_distance(&fluid, &grid, a, layer, [t1, t2], [i, j]);
+                                    scale = table.factor(r_axis.max(outer - wall));
+                                }
                                 if scale > 0.0 {
                                     radial.push((open.len(), scale));
                                 }

@@ -8,7 +8,8 @@
 //! --nocapture smoke` (`FIELDCRAFT_JET_N` cells across the pipe diameter, default 32;
 //! `FIELDCRAFT_JET_RE`, default 23000; `FIELDCRAFT_JET_STEPS`, default 20000;
 //! `FIELDCRAFT_JET_LAYER=1` adds the absorbing layer; the inflow is scaled to the bore's area,
-//! `FIELDCRAFT_JET_FED=1` to the mean over the fed cells).
+//! `FIELDCRAFT_JET_FED=1` to the mean over the fed cells; `FIELDCRAFT_JET_RIM_TAPER=1` reads the
+//! profile at the distance from the staircase wall).
 
 mod common;
 
@@ -38,6 +39,7 @@ fn jet(n: f64, re: f64, h: f64, layer: bool) -> (fieldcraft_model::Model, Vec<Ob
     d.faces.z_max = FaceCondition::Pressure { pressure: 0.0, outflow: Outflow::Convective };
     d.radial_inflow = RadialInflow::power_law([0.0, 0.0, 0.0], 0.5, if re > 4.0e4 { 7.0 } else { 6.6 }, 256).ok().map(|r| RadialInflow {
         scale: if std::env::var("FIELDCRAFT_JET_FED").is_ok_and(|v| v == "1") { RadialScale::Fed } else { RadialScale::Area },
+        wall_taper: std::env::var("FIELDCRAFT_JET_RIM_TAPER").is_ok_and(|v| v == "1"),
         ..r
     });
     d.absorbing = layer.then_some(AbsorbingLayer { thickness: None, strength: None, filter_time: None });

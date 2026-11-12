@@ -910,6 +910,9 @@ const RADIAL_INFLOW: Field = group(
         choice("scale", "Scaled to", &[("fed", "Fed cells' mean"), ("area", "Area")])
             .help("Fed: the velocity is the mean over the fluid cells the table reaches. Area: the flow is the velocity times the area the table covers, counting solid cells too, so a staircase bore that leaves less fluid than its area still carries the intended flow.")
             .def("\"fed\""),
+        flag("wall_taper", "Taper at the wall")
+            .help("Read the table at the distance of each cell from the nearest solid cell of the face (less half a cell) instead of from the axis, so a cell beside a staircase wall gets the table's near-wall value whatever its distance from the axis. Then scaled as above.")
+            .def("false"),
     ],
 )
 .help("The profile that velocity faces with the radial profile read: a turbulent pipe flow entering the box.");

@@ -166,6 +166,14 @@ pub struct RadialInflow {
     /// What the factors are scaled to (`"scale": "fed"` or `"area"`; default `fed`).
     #[serde(default, skip_serializing_if = "RadialScale::is_fed")]
     pub scale: RadialScale,
+    /// Read the table at the radius `R − y` instead of a cell's distance from the axis, where `R`
+    /// is the table's last radius and `y` the distance of the cell from the nearest solid cell
+    /// of the same face less half a cell (the staircase wall lies halfway), for the cells that touch
+    /// a solid cell (face or diagonal neighbours), never closer to the axis than the cell is: a
+    /// cell beside a staircase wall gets the table's near-wall value whatever its distance from the
+    /// axis. Cells further in are unchanged. Then scaled as `scale` says. Default off.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub wall_taper: bool,
 }
 
 /// What a [`RadialInflow`] is read from.
@@ -179,6 +187,8 @@ struct RadialInflowInput {
     power_law: Option<PowerLaw>,
     #[serde(default)]
     scale: RadialScale,
+    #[serde(default)]
+    wall_taper: bool,
 }
 
 #[derive(Deserialize)]
@@ -201,7 +211,7 @@ impl TryFrom<RadialInflowInput> for RadialInflow {
             }
             _ => return Err("give either `table` or `power_law`, not both and not neither".into()),
         };
-        Ok(RadialInflow { axis_point: input.axis_point, table, scale: input.scale })
+        Ok(RadialInflow { axis_point: input.axis_point, table, scale: input.scale, wall_taper: input.wall_taper })
     }
 }
 
@@ -224,7 +234,7 @@ impl RadialInflow {
                 [radius * s, peak * (1.0 - s).powf(1.0 / exponent)]
             })
             .collect();
-        Ok(RadialInflow { axis_point, table, scale: RadialScale::Fed })
+        Ok(RadialInflow { axis_point, table, scale: RadialScale::Fed, wall_taper: false })
     }
 
     /// Check the numbers.
@@ -1262,12 +1272,14 @@ mod tests {
     /// beyond the last; bad tables are refused with the point named.
     #[test]
     fn a_radial_inflow_table_interpolates_and_is_checked() {
-        let r = RadialInflow { axis_point: [0.0; 3], table: vec![[0.1, 2.0], [0.3, 1.0], [0.5, 0.0]], scale: RadialScale::Fed };
+        let r = RadialInflow { axis_point: [0.0; 3], table: vec![[0.1, 2.0], [0.3, 1.0], [0.5, 0.0]], scale: RadialScale::Fed, wall_taper: false };
         r.validate().unwrap();
         for (at, want) in [(0.0, 2.0), (0.1, 2.0), (0.2, 1.5), (0.4, 0.5), (0.5, 0.0), (0.6, 0.0)] {
             assert!((r.factor(at) - want).abs() < 1e-12, "{at}: {}", r.factor(at));
         }
-        let bad = |table: Vec<[f64; 2]>| RadialInflow { axis_point: [0.0; 3], table, scale: RadialScale::Fed }.validate().unwrap_err().to_string();
+        let bad = |table: Vec<[f64; 2]>| {
+            RadialInflow { axis_point: [0.0; 3], table, scale: RadialScale::Fed, wall_taper: false }.validate().unwrap_err().to_string()
+        };
         assert!(bad(vec![[0.0, 1.0]]).contains("2 to"));
         assert!(bad(vec![[0.0, 1.0], [0.0, 1.0]]).contains("point 1"));
         assert!(bad(vec![[0.0, 1.0], [1.0, -1.0]]).contains("point 1"));
@@ -1276,7 +1288,12 @@ mod tests {
         assert!(bad(vec![[0.0, f64::INFINITY], [1.0, 1.0]]).contains("finite") && bad(vec![[0.0, 1.0], [f64::NAN, 1.0]]).contains("finite"));
         assert!(bad((0..=MAX_RADIAL_POINTS).map(|k| [k as f64, 1.0]).collect()).contains("2 to"));
         // An unchecked table with a repeated radius does not divide by zero.
-        let unchecked = RadialInflow { axis_point: [0.0; 3], table: vec![[0.0, 1.0], [0.5, 2.0], [0.5, 3.0], [1.0, 0.0]], scale: RadialScale::Fed };
+        let unchecked = RadialInflow {
+            axis_point: [0.0; 3],
+            table: vec![[0.0, 1.0], [0.5, 2.0], [0.5, 3.0], [1.0, 0.0]],
+            scale: RadialScale::Fed,
+            wall_taper: false,
+        };
         assert!((0..=20).all(|k| unchecked.factor(k as f64 * 0.05).is_finite()));
         assert!(bad(vec![[-1.0, 1.0], [1.0, 1.0]]).contains("point 0"));
         assert!(RadialInflow::power_law([0.0; 3], 1.0, 0.5, 16).is_err() && RadialInflow::power_law([0.0; 3], -1.0, 7.0, 16).is_err());

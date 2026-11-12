@@ -105,6 +105,46 @@ fn an_area_scaled_radial_inlet_carries_the_flow_of_the_whole_bore() {
     assert!((area - 1.0).abs() <= (fed - 1.0).abs() + 1e-12, "area {area}, fed {fed}");
 }
 
+/// A wall taper gives the cells beside the staircase wall the table's near-wall value (never
+/// more than without it), leaves the cells away from the wall alone, and keeps the flux.
+#[test]
+fn a_wall_taper_lowers_the_rim_cells_and_keeps_the_flux() {
+    let cells = |taper: bool| {
+        let (mut m, pipe) = jet();
+        let mut d = m.fluid_domain("Flow").unwrap().clone();
+        let r = d.radial_inflow.as_mut().unwrap();
+        r.scale = RadialScale::Area;
+        r.wall_taper = taper;
+        m.replace_fluid_domain("Flow", d).unwrap();
+        let (setup, flow) = prepare(&m, &[pipe]);
+        let lattice = setup.to_lattice([0.1, 0.0, 0.0])[0];
+        let grid = *flow.grid();
+        flow.open_cells()
+            .iter()
+            .filter(|oc| oc.axis == 0 && oc.inward > 0.0)
+            .filter_map(|oc| match oc.target {
+                Target::Velocity(v) if v[0] > 0.0 => {
+                    let c = grid.centre(oc.cell as usize);
+                    Some(((c[1] - AXIS[0]).hypot(c[2] - AXIS[1]), v[0] / lattice))
+                }
+                _ => None,
+            })
+            .collect::<Vec<(f64, f64)>>()
+    };
+    let (plain, tapered) = (cells(false), cells(true));
+    let flux = |c: &[(f64, f64)]| c.iter().map(|x| x.1).sum::<f64>();
+    assert!((flux(&tapered) / flux(&plain) - 1.0).abs() < 1e-12, "the same flux: {} against {}", flux(&tapered), flux(&plain));
+    // Relative to the centre (the flux is kept, so the whole profile rescales): no cell runs faster,
+    // and some cell beside the wall runs slower.
+    assert_eq!(plain.len(), tapered.len());
+    let centre = |c: &[(f64, f64)]| c.iter().filter(|x| x.0 < 0.1).map(|x| x.1).fold(0.0, f64::max);
+    let (cp, ct) = (centre(&plain), centre(&tapered));
+    let ratios: Vec<f64> = plain.iter().zip(&tapered).map(|(p, t)| (t.1 / ct) / (p.1 / cp)).collect();
+    assert!(ratios.iter().all(|r| *r <= 1.0 + 1e-9), "a cell runs faster: {:?}", ratios.iter().cloned().fold(0.0, f64::max));
+    let lowest = ratios.iter().cloned().fold(f64::INFINITY, f64::min);
+    assert!(lowest < 0.99, "no cell beside the wall slowed down: the lowest ratio is {lowest}");
+}
+
 /// The jet runs: 100 steps with the flange over the face stay finite, and the bore's centre
 /// cell moves with the inlet (a smoke test; the developed profile is for the jet studies).
 #[test]
@@ -135,6 +175,7 @@ fn an_uneven_radial_table_is_refused_before_the_run() {
         axis_point: [0.0, AXIS[0], AXIS[1]],
         table: vec![[0.0, 1e-9], [0.0353, 1e-9], [0.03536, 1e9], [0.0354, 1e-9], [0.4, 1e-9]],
         scale: RadialScale::Fed,
+        wall_taper: false,
     });
     m.replace_fluid_domain("Flow", d).unwrap();
     let setup = fieldcraft_lbm::Setup::new(&m, None, std::slice::from_ref(&pipe), &fieldcraft_lbm::Limits::default()).unwrap();
