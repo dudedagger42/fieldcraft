@@ -320,7 +320,7 @@ pub fn solve_fluid(model: &Model, step: Option<&str>, obstacles: &[Obstacle], li
 
 /// [`solve_fluid`] on the backend `choice` names (the registered device backend, or the CPU).
 pub fn solve_fluid_on(model: &Model, step: Option<&str>, obstacles: &[Obstacle], limits: &Limits, choice: Choice) -> Result<FluidResult> {
-    let setup = Setup::new(model, step, obstacles, limits)?;
+    let setup = Setup::new_for(model, step, obstacles, limits, choice)?;
     crate::memory::Memory::of(&setup, choice)?.check(limits)?;
     let flow = Flow::new(&setup, obstacles)?;
     let mut backend = crate::backend::backend(choice, flow, &setup)?;

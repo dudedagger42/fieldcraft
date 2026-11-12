@@ -344,6 +344,12 @@ pub enum WallModel {
     /// Malaspinas and Sagaut's lattice Boltzmann wall model with Musker's profile of the
     /// boundary layer (the viscous sublayer, the buffer layer and the log law in one formula).
     Musker,
+    /// A wall function, whichever law the solve's backend uses by default: the recommended way to
+    /// ask for one. On the CPU, with `spalart_allmaras` turbulence it is
+    /// [`WallModel::SpalartAllmarasBounce`] (the model's own law); with a subgrid model, and on
+    /// the GPU for either, it is [`WallModel::SpaldingBounce`] until the GPU runs the model's
+    /// own law as its default. The explicit values below stay what they say.
+    WallFunction,
     /// Han, Ooka and Kikumoto's wall-function bounce, on-node, as their eq. 14 states it: the
     /// outermost cell layer at a plane no-slip box face at rest is the wall (boundary nodes, the
     /// wall plane through their centres); instead of colliding, each bounces its populations

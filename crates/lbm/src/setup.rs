@@ -595,9 +595,34 @@ fn shear_dependent_floor(rheology: &Rheology, domain: &FluidDomain, initial_kelv
     Ok(())
 }
 
+/// The law the `wall_function` wall model resolves to on the device backend: Spalding's, until the
+/// device runs the Spalart–Allmaras model's own law as its default. This is the one constant to flip
+/// when its parity gate is accepted (its parity test already passes).
+pub const DEVICE_WALL_FUNCTION: WallModel = WallModel::SpaldingBounce;
+
+/// What `wall_function` means on `choice` for a model that is (`spalart_allmaras`) or is not
+/// Spalart–Allmaras: on the CPU the model's own law for Spalart–Allmaras, and Spalding's for a
+/// subgrid model, whose wall law has no model of its own; on the device [`DEVICE_WALL_FUNCTION`] for
+/// Spalart–Allmaras (a subgrid model's law is Spalding's on both). Any other wall model is returned
+/// as it is.
+pub fn resolve_wall_function(wall_model: WallModel, spalart_allmaras: bool, choice: crate::backend::Choice) -> WallModel {
+    match (wall_model, spalart_allmaras, choice) {
+        (WallModel::WallFunction, true, crate::backend::Choice::Cpu) => WallModel::SpalartAllmarasBounce,
+        (WallModel::WallFunction, true, crate::backend::Choice::Device) => DEVICE_WALL_FUNCTION,
+        (WallModel::WallFunction, false, _) => WallModel::SpaldingBounce,
+        (other, ..) => other,
+    }
+}
+
 impl Setup {
     /// Convert a fluid step, checking it against the stability limits and `limits`.
     pub fn new(model: &Model, step: Option<&str>, obstacles: &[Obstacle], limits: &Limits) -> Result<Setup> {
+        Setup::new_for(model, step, obstacles, limits, crate::backend::Choice::Cpu)
+    }
+
+    /// [`Setup::new`] for the backend `choice` solves on: the one place the `wall_function` wall
+    /// model becomes a law ([`resolve_wall_function`]).
+    pub fn new_for(model: &Model, step: Option<&str>, obstacles: &[Obstacle], limits: &Limits, choice: crate::backend::Choice) -> Result<Setup> {
         // The model checked the domain and its material when they were defined.
         let (s, domain) = fluid_step(model, step)?;
         let Procedure::Fluid { end_time, steps, time_step, frames, magic, sigma, collision, turbulence, steady, .. } = &s.procedure else {
@@ -674,6 +699,7 @@ impl Setup {
                 }
             }
         };
+        let wall_model = wall_model.map(|w| resolve_wall_function(w, spalart_allmaras.is_some(), choice));
         let material = model.material(&domain.material);
         let (Some(density), Some(fluid)) = (material.and_then(|m| m.density), material.and_then(|m| m.fluid)) else {
             return Err(Error::Invalid(format!("material `{}` needs a density and fluid behaviour", domain.material)));

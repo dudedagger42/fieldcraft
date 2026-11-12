@@ -1696,6 +1696,11 @@ mod tests {
         let own = turbulence(serde_json::json!({"type": "spalart_allmaras", "wall_model": "spalart_allmaras_bounce"})).unwrap();
         assert_eq!(own.wall_model(), Some(crate::WallModel::SpalartAllmarasBounce));
         assert_eq!(serde_json::from_str::<crate::Turbulence>(&serde_json::to_string(&own).unwrap()).unwrap(), own);
+        // `wall_function` is read, written back and left unresolved in the model (the solver resolves it per backend).
+        let function = turbulence(serde_json::json!({"type": "spalart_allmaras", "wall_model": "wall_function"})).unwrap();
+        assert_eq!(function.wall_model(), Some(crate::WallModel::WallFunction));
+        assert!(serde_json::to_string(&function).unwrap().contains("\"wall_function\""));
+        assert_eq!(serde_json::from_str::<crate::Turbulence>(&serde_json::to_string(&function).unwrap()).unwrap(), function);
         let ddes = turbulence(serde_json::json!({"type": "spalart_allmaras", "ddes": {}, "wall_model": "musker", "inflow_ratio": 5})).unwrap();
         assert_eq!(
             ddes,

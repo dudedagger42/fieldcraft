@@ -12,11 +12,10 @@
 
 mod common;
 
+use common::cases::study_wall_law;
 use common::*;
 use fieldcraft_lbm::{Limits, Obstacle, Setup, Target};
-use fieldcraft_model::{
-    AbsorbingLayer, Collision, FaceCondition, HrrSigma, Outflow, Procedure, Profile, RadialInflow, RadialScale, Turbulence, WallModel,
-};
+use fieldcraft_model::{AbsorbingLayer, Collision, FaceCondition, HrrSigma, Outflow, Procedure, Profile, RadialInflow, RadialScale, Turbulence};
 
 /// The hybrid collision's σ.
 const SIGMA: f64 = 0.95;
@@ -56,7 +55,7 @@ fn jet(n: f64, re: f64, h: f64, layer: bool) -> (fieldcraft_model::Model, Vec<Ob
         magic: None,
         sigma: Some(HrrSigma::Value(SIGMA)),
         collision: Some(Collision::Hrr),
-        turbulence: Some(Turbulence::SpalartAllmaras { prandtl: 0.9, wall_model: Some(WallModel::SpaldingBounce), inflow_ratio: 3.0, ddes: None }),
+        turbulence: Some(Turbulence::SpalartAllmaras { prandtl: 0.9, wall_model: Some(study_wall_law().0), inflow_ratio: 3.0, ddes: None }),
         steady: None,
     };
     (model(1.0, 1.0 / re, d, p), vec![flange, pipe])
@@ -94,7 +93,8 @@ fn smoke() {
         .fluid_domain("Flow")
         .and_then(|d| d.absorbing.as_ref().map(|a| a.thickness.map_or(fieldcraft_model::fluids::DEFAULT_ABSORBING_CELLS as f64, |t| t * n)));
     println!(
-        "header: σ {SIGMA} (hybrid collision); absorbing layer {layer_cells:?} cells (None: no layer); τ − ½ from the warning above; D = {n} cells"
+        "header: σ {SIGMA} (hybrid collision); wall law {}; absorbing layer {layer_cells:?} cells (None: no layer); τ − ½ from the warning above; D = {n} cells",
+        study_wall_law().1
     );
     // Where a cell sits in the face plane (D = 1, the axis at y = z = 0, the bore's rim at r = 0.5).
     let place = |cell: usize| {

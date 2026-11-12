@@ -963,14 +963,11 @@ fn sa_step(sa: Turbulence) -> Step {
     Step { cells_per_h, ..Step::driver_seegmiller(sa, 0.0) }
 }
 
-/// The SA run's model: on Han's on-node wall with Spalding's law, or with the model's own with
-/// `FIELDCRAFT_WALL_LAW=spalart_allmaras`.
+/// The SA run's model: on Han's on-node wall with the model's own law, or with Spalding's with
+/// `FIELDCRAFT_WALL_LAW=spalding` ([`study_wall_law`]; the law is printed).
 fn sa_rans() -> Turbulence {
-    let wall = if std::env::var("FIELDCRAFT_WALL_LAW").is_ok_and(|v| v == "spalart_allmaras") {
-        WallModel::SpalartAllmarasBounce
-    } else {
-        WallModel::SpaldingBounce
-    };
+    let (wall, name) = study_wall_law();
+    println!("step study: wall law {name}");
     Turbulence::SpalartAllmaras { prandtl: 0.9, wall_model: Some(wall), inflow_ratio: 3.0, ddes: None }
 }
 
@@ -1007,14 +1004,14 @@ fn the_floor_crossing_of_a_restart_file() {
 /// What a finished SA run's restart file says without stepping: the gated x_r from the stored
 /// samples, the floor crossing read from rows shifted one cell each way, and the incoming layer at
 /// x = −4 H (Re_θ and δ₉₉ against the experiment's 5000 and about 1.5 H, and the inflow C_f the
-/// scorer gates against). The wall law is the run's: `FIELDCRAFT_WALL_LAW=spalart_allmaras` or
-/// Spalding's by default, `FIELDCRAFT_STEP_CELLS_PER_H` the run's grid. Seconds, no solver step:
+/// scorer gates against). The wall law is the run's: the model's own by default, or
+/// `FIELDCRAFT_WALL_LAW=spalding`, `FIELDCRAFT_STEP_CELLS_PER_H` the run's grid. Seconds, no solver step:
 /// `FIELDCRAFT_STEP_RESTART=<copy> FIELDCRAFT_STEP_CELLS_PER_H=24 cargo test --release -p fieldcraft-lbm --test ddes_backstep a_restart_files_readings -- --ignored --nocapture`.
 #[test]
 #[ignore = "reads a restart file: FIELDCRAFT_STEP_RESTART"]
 fn a_restart_files_readings() {
     let file = std::path::PathBuf::from(std::env::var("FIELDCRAFT_STEP_RESTART").unwrap());
-    let sa_law = std::env::var("FIELDCRAFT_WALL_LAW").is_ok_and(|v| v == "spalart_allmaras");
+    let sa_law = study_wall_law().0 == WallModel::SpalartAllmarasBounce;
     let step = sa_step(sa_rans());
     let (mut flow, strips, _) = step.build();
     let (at, samples) = load(&file, &mut flow);

@@ -27,6 +27,21 @@ pub fn momentum_thickness(u: &[f64], spacing: f64, edge: f64) -> f64 {
     u.iter().map(|&v| (v / edge) * (1.0 - v / edge)).sum::<f64>() * spacing
 }
 
+/// The wall law a long study runs on Han's on-node wall: the Spalart–Allmaras model's own constant-stress
+/// law by default, Spalding's with `FIELDCRAFT_WALL_LAW=spalding` (`spalart_allmaras` is accepted
+/// too). Changes a default: studies ran Spalding's law unless told otherwise. Every study prints
+/// the law it ran with [`study_wall_law`]'s name.
+pub fn study_wall_law() -> (fieldcraft_model::WallModel, &'static str) {
+    match std::env::var("FIELDCRAFT_WALL_LAW").as_deref() {
+        Ok("spalding") => (fieldcraft_model::WallModel::SpaldingBounce, "spalding_bounce"),
+        Ok("spalart_allmaras") | Err(_) => (fieldcraft_model::WallModel::SpalartAllmarasBounce, "spalart_allmaras_bounce"),
+        Ok(other) => {
+            eprintln!("FIELDCRAFT_WALL_LAW={other} is not `spalart_allmaras` or `spalding`: running the default, the model's own law");
+            (fieldcraft_model::WallModel::SpalartAllmarasBounce, "spalart_allmaras_bounce")
+        }
+    }
+}
+
 /// The displacement thickness δ* = ∫ (1 − u/U_e) dz, sampled as [`momentum_thickness`].
 pub fn displacement_thickness(u: &[f64], spacing: f64, edge: f64) -> f64 {
     u.iter().map(|&v| 1.0 - v / edge).sum::<f64>() * spacing
