@@ -323,8 +323,11 @@ pub fn solve_fluid_on(model: &Model, step: Option<&str>, obstacles: &[Obstacle],
     let setup = Setup::new_for(model, step, obstacles, limits, choice)?;
     crate::memory::Memory::of(&setup, choice)?.check(limits)?;
     let flow = Flow::new(&setup, obstacles)?;
+    let corners = flow.inlet_corner_report().message();
     let mut backend = crate::backend::backend(choice, flow, &setup)?;
-    run(&setup, backend.as_mut(), limits)
+    let mut result = run(&setup, backend.as_mut(), limits)?;
+    result.warnings.extend(corners);
+    Ok(result)
 }
 
 /// An explicit CPU checkpoint/resume run. The store checks model/settings identity and owns
