@@ -3,7 +3,7 @@
 //! Fields are in lattice units (velocity and density as the solver holds them), so peak u and U_in are comparable.
 //! The plate across the channel has a slot `SLOT_CELLS` cells wide (0.2 m, so dx = 0.2 / SLOT_CELLS); the box faces
 //! y min/max and z min are walls with the named wall law (`LAW`: spalding or sa), z max is slip.
-//! Environment: SLOT_CELLS (4), LAW (spalding), LAYER (1: the default absorbing layer), STEPS (20000), CHUNK (500), TAU (2.4e-4), ULAT (inlet mean lattice
+//! Environment: TURB (sa, vreman, none), SLOT_CELLS (4), LAW (spalding), LAYER (1: the default absorbing layer), STEPS (20000), CHUNK (500), TAU (2.4e-4), ULAT (inlet mean lattice
 //! speed, 0.014), LAYER_CELLS (the layer's thickness in cells of this grid; hold the physical thickness: 10/20/40 at
 //! 4/8/16 cells), EXT_UP / EXT_DN (m of box added upstream / downstream; 0.5 and 0.5 give a 0.5 m layer room on every grid), ZMAX (wall: z max a wall), TAU (tau+-1/2; hold Re: 2.4e-4/4.8e-4/9.6e-4 at 4/8/16 cells), CPU (1: compare with the CPU each chunk; 0: device only), GPU (1).
 // A local harness: index loops over the grid and nested ifs read better than iterator chains here.
@@ -66,7 +66,12 @@ fn slotted_channel_stability() {
         "none" => None,
         _ => Some(WallModel::SpaldingBounce),
     };
-    let sa = Turbulence::SpalartAllmaras { prandtl: 0.9, wall_model, inflow_ratio: 3.0, ddes: None };
+    // TURB: sa (default), vreman (a subgrid eddy viscosity that vanishes in laminar shear; the wall law is kept), none
+    let sa = match std::env::var("TURB").as_deref() {
+        Ok("vreman") => Some(Turbulence::Vreman { constant: 0.17, prandtl: 0.9, wall_model }),
+        Ok("none") => None,
+        _ => Some(Turbulence::SpalartAllmaras { prandtl: 0.9, wall_model, inflow_ratio: 3.0, ddes: None }),
+    };
     let p = Procedure::Fluid {
         domain: "Flow".into(),
         end_time: None,
@@ -76,7 +81,7 @@ fn slotted_channel_stability() {
         magic: None,
         sigma: Some(HrrSigma::Value(0.95)),
         collision: Some(Collision::Hrr),
-        turbulence: Some(sa),
+        turbulence: sa,
         steady: None,
     };
     let m = model(1.0, nu, d, p);
@@ -329,7 +334,7 @@ fn slotted_channel_stability() {
     if env("DIAG4", 0.0) > 0.5 && cpu_ok {
         let nu_lat = setup.tau_plus - 0.5;
         let nu_lat = nu_lat / 3.0;
-        if let (Ok(fl), Ok(Some(nt))) = (Backend::fields(&mut cpu), Backend::nu_tilde(&mut cpu)) {
+        if let (Ok(fl), Ok(nt)) = (Backend::fields(&mut cpu), Backend::nu_tilde(&mut cpu)) {
             let sec = |i: usize| -> (usize, f64, f64, f64, f64) {
                 // open cells, total, mean density, mean u_x over open cells (lattice), max |u| (lattice)
                 let (mut open, mut rho, mut ux, mut um) = (0usize, 0.0, 0.0, 0.0f64);
@@ -377,6 +382,32 @@ fn slotted_channel_stability() {
                 }
             }
             println!("DIAG4 (a) global max|u| {gm:.5} lattice at cell {gi:?} (x {:.3} m)", dx * (gi[0] as f64 + 0.5) - ext_up);
+            // K_slot: the plate's pressure drop over 0.5 u_nom^2, u_nom = the volume flow over the nominal opening (0.2 m of the
+            // 1 m height, the geometric slot rather than the open-cell count); the flow is the inlet section's, x 0.3 m
+            let flow_per_area = {
+                let mut q = 0.0;
+                for k in 0..nz {
+                    for j in 0..ny {
+                        let c = grid.index([i_in, j, k]);
+                        if fluid[c] {
+                            q += fl.density[c] * fl.velocity[c][0];
+                        }
+                    }
+                }
+                q / (ny * nz) as f64
+            };
+            let dens = |i: usize| sec(i).2;
+            let dp_end = (0.5 * (dens(i_up - 1) + dens(i_up)) - 0.5 * (dens(i_dn - 1) + dens(i_dn))) / 3.0;
+            let u_nom = flow_per_area / 0.2;
+            println!(
+                "DIAG4 (e) K_slot = dp/(0.5 u_nom^2) = {:.3} (dp {dp_end:.5e}, u_nom {u_nom:.5} = inlet flow per section area {flow_per_area:.5} / 0.2); dp/(0.5 u_peak^2) = {:.3} (peak {gm:.5}); open-cell fraction at the plate {:.4}",
+                dp_end / (0.5 * u_nom * u_nom),
+                dp_end / (0.5 * gm * gm),
+                sec(at(0.7)).0 as f64 / sec(at(0.7)).1
+            );
+            if gm > 0.10 {
+                println!("DIAG4 (e) WARNING true max|u| {gm:.4} lattice is above 0.10 (Mach {:.3})", gm * 3.0f64.sqrt());
+            }
             println!(
                 "DIAG4 (b) section-mean density by station (x m, layer, rho-1, jet heads of that drop = 3 drop / u_ref^2 uses u_ref in the line above):"
             );
@@ -423,7 +454,7 @@ fn slotted_channel_stability() {
                         if !fluid[c] {
                             continue;
                         }
-                        let chi = nt[c] / nu_lat;
+                        let chi = nt.as_ref().and_then(|v| v.get(c)).copied().unwrap_or(0.0) / nu_lat;
                         let fv1 = chi.powi(3) / (chi.powi(3) + 7.1f64.powi(3));
                         let r = chi * fv1;
                         if r > rmax {
