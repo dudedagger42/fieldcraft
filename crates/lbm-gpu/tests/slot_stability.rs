@@ -3,7 +3,10 @@
 //! The plate across the channel has a slot `SLOT_CELLS` cells wide (0.2 m, so dx = 0.2 / SLOT_CELLS); the box faces
 //! y min/max and z min are walls with the named wall law (`LAW`: spalding or sa), z max is slip.
 //! Environment: SLOT_CELLS (4), LAW (spalding), LAYER (1: the default absorbing layer), STEPS (20000), CHUNK (500), TAU (2.4e-4), ULAT (inlet mean lattice
-//! speed, 0.014), CPU (1: compare with the CPU each chunk; 0: device only), GPU (1).
+//! speed, 0.014), LAYER_CELLS (the layer's thickness in cells of this grid; hold the physical thickness: 10/20/40 at
+//! 4/8/16 cells), ZMAX (wall: z max a wall), TAU (tau+-1/2; hold Re: 2.4e-4/4.8e-4/9.6e-4 at 4/8/16 cells), CPU (1: compare with the CPU each chunk; 0: device only), GPU (1).
+// A local harness: index loops over the grid and nested ifs read better than iterator chains here.
+#![allow(clippy::needless_range_loop, clippy::collapsible_if)]
 #[path = "../../lbm/tests/common/mod.rs"]
 mod common;
 
@@ -37,13 +40,17 @@ fn slotted_channel_stability() {
     d.faces.x_min = FaceCondition::Velocity { velocity: [0.1, 0.02, 0.0], profile: Profile::Parabolic };
     d.faces.x_max = FaceCondition::Pressure { pressure: 0.0, outflow: Outflow::Uniform };
     d.faces.z_max = FaceCondition::Slip {};
+    if std::env::var("ZMAX").is_ok_and(|v| v == "wall") {
+        d.faces.z_max = FaceCondition::Wall {};
+    }
     if std::env::var("SPAN").is_ok_and(|v| v == "periodic") {
         d.faces.y_min = FaceCondition::Periodic {};
         d.faces.y_max = FaceCondition::Periodic {};
     }
     d.acceleration = [0.0, 0.0, -0.01];
     if env("LAYER", 1.0) > 0.5 {
-        d.absorbing = Some(fieldcraft_model::AbsorbingLayer { thickness: None, strength: None, filter_time: None });
+        let thickness = std::env::var("LAYER_CELLS").ok().and_then(|v| v.parse::<f64>().ok()).map(|c| c * dx);
+        d.absorbing = Some(fieldcraft_model::AbsorbingLayer { thickness, strength: None, filter_time: None });
     }
     d.obstacles = vec!["PlateLow".into(), "PlateHigh".into()];
     let obstacles = vec![
@@ -81,9 +88,10 @@ fn slotted_channel_stability() {
     let [nx, ny, nz] = cpu.grid().cells;
     let scale = setup.velocity_scale();
     println!(
-        "CASE wall law {law}; slot {cells} cells; grid {nx}x{ny}x{nz} = {n} cells; tau+-1/2 {:.3e}; tau- -1/2 {:.3e}; sigma 0.95 HRR; dt {dt:.5} s; velocity scale {scale:.4} m/s; steps {steps}; chunk {chunk}",
+        "CASE wall law {law}; slot {cells} cells; grid {nx}x{ny}x{nz} = {n} cells; tau+-1/2 {:.3e}; tau- -1/2 {:.3e}; sigma 0.95 HRR; dt {dt:.5} s; velocity scale {scale:.4} m/s; steps {steps}; chunk {chunk}; layer {}",
         setup.tau_plus - 0.5,
-        setup.tau_minus - 0.5
+        setup.tau_minus - 0.5,
+        std::env::var("LAYER_CELLS").map_or("default 10 cells".to_string(), |c| format!("{c} cells = {:.4} m", c.parse::<f64>().unwrap_or(0.0) * dx))
     );
     let mut gpu = if use_gpu {
         match GpuFlow::with_options(&cpu, Policy::from_env().unwrap(), Options::default()) {
@@ -103,11 +111,21 @@ fn slotted_channel_stability() {
     let (mut worst_u, mut worst_r) = (0.0f64, 0.0f64);
     let (mut t_gpu, mut t_cpu) = (0.0f64, 0.0f64);
     let fluid: Vec<bool> = (0..n).map(|c| Backend::is_fluid(&cpu, c)).collect();
-    let grid = cpu.grid().clone();
+    let grid = *cpu.grid();
     let print_every = env("PRINT", 2000.0) as u64;
     let diag = env("DIAG", 0.0) > 0.5;
     let (i_in, i_out) = ((0.3 / dx) as usize, nx - 1 - (0.3 / dx) as usize);
-    let (i_up, i_dn) = ((0.5 / dx) as usize, (0.9 / dx) as usize);
+    // the two pressure planes sit at x = 0.5 m and 0.9 m on every grid: the mean of the cell layers either side
+    let (i_up, i_dn) = (((0.5 / dx).round() as usize).max(1), ((0.9 / dx).round() as usize).max(1));
+    println!(
+        "PLANES pressure planes at x = {:.4} m and {:.4} m (mean of cell layers {}/{} and {}/{}); the plate spans x 0.6 to 0.8 m",
+        dx * i_up as f64,
+        dx * i_dn as f64,
+        i_up - 1,
+        i_up,
+        i_dn - 1,
+        i_dn
+    );
     // per sample: (step, peak |u| lattice, rho min, rho max, rho mean over fluid, flux in, flux out, plate dp (lattice, (rho_up - rho_dn)/3))
     type S = (u64, f64, f64, f64, f64, f64, f64, f64);
     let stats = |f: &fieldcraft_lbm::backend::Fields, step: u64| -> Option<S> {
@@ -141,7 +159,8 @@ fn slotted_channel_stability() {
         };
         let area = (ny * nz) as f64;
         let fl = |i: usize| plane(i, &|c| f.density[c] * f.velocity[c][0]) * area / scale;
-        let dp = (plane(i_up, &|c| f.density[c]) - plane(i_dn, &|c| f.density[c])) / 3.0;
+        let at = |i: usize| 0.5 * (plane(i - 1, &|c| f.density[c]) + plane(i, &|c| f.density[c]));
+        let dp = (at(i_up) - at(i_dn)) / 3.0;
         Some((step, um / scale, rmin, rmax, rsum / cnt as f64, fl(i_in), fl(i_out), dp))
     };
     let (mut sc, mut sg): (Vec<S>, Vec<S>) = (vec![], vec![]);
@@ -235,6 +254,23 @@ fn slotted_channel_stability() {
         } else if let Some(a) = sa.or(sb) {
             line += &format!(" peak u {:.4} rho {:.4}..{:.4} flux out/in {:.4}", a.1, a.2, a.3, a.6 / a.5);
         }
+        if done % print_every == 0 {
+            if let Some(f) = fa.as_ref().or(fb.as_ref()) {
+                let mut rim = 0.0f64;
+                for k in 0..nz {
+                    for j in 0..ny {
+                        for i in 0..2.min(nx) {
+                            let near = j < 2 || j + 2 >= ny || k < 2 || k + 2 >= nz;
+                            let c = grid.index([i, j, k]);
+                            if near && fluid[c] && f.density[c].is_finite() {
+                                rim = rim.max((f.density[c] - 1.0).abs());
+                            }
+                        }
+                    }
+                }
+                line += &format!(" inlet-rim max|rho-1| {rim:.4};");
+            }
+        }
         if done % print_every == 0 || (done <= 1000 && done % 100 == 0 && use_gpu && use_cpu) {
             println!("{line} gpu s {t_gpu:.2} cpu s {t_cpu:.2}");
         }
@@ -250,10 +286,12 @@ fn slotted_channel_stability() {
         let rms = (w.iter().map(|s| (s.1 - um).powi(2)).sum::<f64>() / w.len() as f64).sqrt();
         let (r0, r1) = (w.iter().map(|s| s.2).fold(f64::INFINITY, f64::min), w.iter().map(|s| s.3).fold(0.0, f64::max));
         Some(format!(
-            "steps {lo}..{hi} ({} samples): mean out/in {:.5}, plate dp {:.5e} (lattice), peak u mean {um:.5} rms {rms:.5}, rho {r0:.4}..{r1:.4}",
+            "steps {lo}..{hi} ({} samples): mean out/in {:.5}, plate dp {:.5e} (lattice), K = dp/(0.5 U_in^2) {:.3}, peak u mean {um:.5} rms {rms:.5}, peak/U_in {:.4}, rho {r0:.4}..{r1:.4}",
             w.len(),
             fo / fi,
-            dp
+            dp,
+            dp / (0.5 * u_in * u_in),
+            um / u_in
         ))
     };
     let (h, q) = (steps / 2, steps / 4);
