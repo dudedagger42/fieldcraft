@@ -40,7 +40,16 @@ fn slotted_channel_stability() {
     // EXT_UP / EXT_DN (m): the box grows upstream / downstream of the 2 m the plate sits in (x 0 to 2, the plate at 0.6 to
     // 0.8), so a layer of fixed physical thickness stays within a fifth of the box's length on every grid.
     let (ext_up, ext_dn) = (env("EXT_UP", 0.0), env("EXT_DN", 0.0));
-    let mut d = domain([-ext_up, 0.0, 0.0], [2.0 + ext_dn, 1.0, 1.0], dx);
+    // LAW=sa_surface / spalding_surface: the half-way wall, whose walls are obstacle slabs two cells thick (the box
+    // faces y min/max and z min become slip faces behind them), so the open region is the same 2 x 1 x 1 m.
+    let slabs = law.ends_with("_surface");
+    let lo = if slabs { -2.0 * dx } else { 0.0 };
+    let mut d = domain([-ext_up, lo, lo], [2.0 + ext_dn, 1.0 - lo, 1.0], dx);
+    if slabs {
+        d.faces.y_min = FaceCondition::Slip {};
+        d.faces.y_max = FaceCondition::Slip {};
+        d.faces.z_min = FaceCondition::Slip {};
+    }
     d.faces.x_min = FaceCondition::Velocity { velocity: [0.1, 0.02, 0.0], profile: Profile::Parabolic };
     d.faces.x_max = FaceCondition::Pressure { pressure: 0.0, outflow: Outflow::Uniform };
     d.faces.z_max = FaceCondition::Slip {};
@@ -57,6 +66,9 @@ fn slotted_channel_stability() {
         d.absorbing = Some(fieldcraft_model::AbsorbingLayer { thickness, strength: None, filter_time: None });
     }
     d.obstacles = vec!["PlateLow".into(), "PlateHigh".into()];
+    if slabs {
+        d.obstacles.extend(["SlabYLow".into(), "SlabYHigh".into(), "SlabZLow".into()]);
+    }
     // SURFACE=1: the slot and the plate are built so the wall-node rows (the fluid cells next to the plate's solid cells, which
     // the on-node wall law makes wall nodes) are exactly the geometric distance apart: 0.2 m across the slot (cells + 1 rows
     // from wall node to wall node) and 0.2 m through the plate. The solid part of the plate is one cell thinner than the
@@ -74,12 +86,21 @@ fn slotted_channel_stability() {
     } else {
         (0.6, 0.8)
     };
-    let obstacles = vec![
-        obstacle("PlateLow", cuboid([0.6, 0.0, 0.0], [x_hi, 1.0, 0.4]), &CUBOID_FACES),
-        obstacle("PlateHigh", cuboid([0.6, 0.0, z_hi], [x_hi, 1.0, 1.0]), &CUBOID_FACES),
+    let (y0, y1, z0) = if slabs { (-1.0, 2.0, -1.0) } else { (0.0, 1.0, 0.0) };
+    let mut obstacles = vec![
+        obstacle("PlateLow", cuboid([0.6, y0, z0], [x_hi, y1, 0.4]), &CUBOID_FACES),
+        obstacle("PlateHigh", cuboid([0.6, y0, z_hi], [x_hi, y1, 1.0 + 1.0]), &CUBOID_FACES),
     ];
+    if slabs {
+        let (a, b) = (-ext_up - 1.0, 3.0 + ext_dn);
+        obstacles.push(obstacle("SlabYLow", cuboid([a, -1.0, -1.0], [b, 0.0, 2.0]), &CUBOID_FACES));
+        obstacles.push(obstacle("SlabYHigh", cuboid([a, 1.0, -1.0], [b, 2.0, 2.0]), &CUBOID_FACES));
+        obstacles.push(obstacle("SlabZLow", cuboid([a, -1.0, -1.0], [b, 2.0, 0.0]), &CUBOID_FACES));
+    }
     let wall_model = match law.as_str() {
         "sa" => Some(WallModel::SpalartAllmarasBounce),
+        "sa_surface" => Some(WallModel::SpalartAllmarasBounceSurface),
+        "spalding_surface" => Some(WallModel::SpaldingBounceSurface),
         "none" => None,
         _ => Some(WallModel::SpaldingBounce),
     };
