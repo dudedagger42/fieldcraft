@@ -566,7 +566,7 @@ impl Step {
         let delta = u.iter().position(|&v| v >= 0.99 * u_ref).map_or(f64::NAN, |k| (k as f64 + 0.5) * h);
         // U_ref in units of the inlet speed (the lattice speeds are scaled by U_lat).
         let u_ref_inlet = u_ref / self.lattice_velocity;
-        let crossing = wall_crossing(&flow, self);
+        let crossing = wall_crossing(&flow, self, 0);
         Run {
             cf,
             cp,
@@ -716,7 +716,7 @@ fn intercept(points: &[(f64, f64)], degree: usize) -> f64 {
 }
 
 /// The floor's u = 0 crossing behind the step in the final field ([`WallCrossing`]).
-fn wall_crossing(flow: &Flow, step: &Step) -> Result<WallCrossing, String> {
+fn wall_crossing(flow: &Flow, step: &Step, shift: isize) -> Result<WallCrossing, String> {
     let g = flow.grid();
     let h = step.spacing();
     let [nx, ny, _] = g.cells;
@@ -724,6 +724,8 @@ fn wall_crossing(flow: &Flow, step: &Step) -> Result<WallCrossing, String> {
     // is at z = 0, so its first rows are 1…4 at y = Δ/2 …; Han's wall is the node row 1 at z = Δ/2,
     // so its first rows are 2…5 at y = Δ … 4Δ.
     let (first, wall) = if flow.on_node_bounce() { (2, 0.5 * h) } else { (1, 0.0) };
+    // `shift` moves the four rows the crossing is read from, up (+) or down (−) the wall in cells.
+    let first = usize::try_from(first as isize + shift).map_err(|_| format!("a shift of {shift} rows puts the first row below the box"))?;
     let x = |i: usize| -step.upstream + (i as f64 + 0.5) * h;
     let u = |i: usize, k: usize| (0..ny).filter_map(|j| flow.moments(g.index([i, j, k])).map(|m| m.1[0])).sum::<f64>() / ny as f64;
     let mut rows = Vec::new();
@@ -984,7 +986,7 @@ fn the_floor_crossing_of_a_restart_file() {
     let (mut flow, strips, _) = step.build();
     let (at, samples) = load(&file, &mut flow);
     println!("{}: step {at}, {} samples", file.display(), samples.len());
-    println!("{}", wall_crossing(&flow, &step).unwrap());
+    println!("{}", wall_crossing(&flow, &step, 0).unwrap());
     // The floor shear's sign change over the next 500 steps, as the run reads it.
     let h = step.spacing();
     let floor: Vec<&Strip> = strips.iter().filter(|s| s.floor).collect();
@@ -1000,6 +1002,94 @@ fn the_floor_crossing_of_a_restart_file() {
     let x: Vec<f64> = floor.iter().map(|s| 0.5 * (s.x.0 + s.x.1)).collect();
     let per_area: Vec<f64> = shear.iter().zip(&floor).map(|(t, s)| t / ((s.x.1 - s.x.0) / h).round()).collect();
     println!("the floor shear's sign change over the next 500 steps: {:?}", reattachment(&x, &per_area));
+}
+
+/// What a finished SA run's restart file says without stepping: the gated x_r from the stored
+/// samples, the floor crossing read from rows shifted one cell each way, and the incoming layer at
+/// x = −4 H (Re_θ and δ₉₉ against the experiment's 5000 and about 1.5 H, and the inflow C_f the
+/// scorer gates against). The wall law is the run's: `FIELDCRAFT_WALL_LAW=spalart_allmaras` or
+/// Spalding's by default, `FIELDCRAFT_STEP_CELLS_PER_H` the run's grid. Seconds, no solver step:
+/// `FIELDCRAFT_STEP_RESTART=<copy> FIELDCRAFT_STEP_CELLS_PER_H=24 cargo test --release -p fieldcraft-lbm --test ddes_backstep a_restart_files_readings -- --ignored --nocapture`.
+#[test]
+#[ignore = "reads a restart file: FIELDCRAFT_STEP_RESTART"]
+fn a_restart_files_readings() {
+    let file = std::path::PathBuf::from(std::env::var("FIELDCRAFT_STEP_RESTART").unwrap());
+    let sa_law = std::env::var("FIELDCRAFT_WALL_LAW").is_ok_and(|v| v == "spalart_allmaras");
+    let step = sa_step(sa_rans());
+    let (mut flow, strips, _) = step.build();
+    let (at, samples) = load(&file, &mut flow);
+    let h = step.spacing();
+    println!(
+        "wall law {}; {}: step {at}, {} samples, {} cells per H",
+        if sa_law { "spalart_allmaras" } else { "spalding" },
+        file.display(),
+        samples.len(),
+        step.cells_per_h
+    );
+    // The gated reading: the stored samples replayed into the strips' block means, as the run does.
+    let mut shear = Shear::new(strips.len(), step.block);
+    samples.iter().for_each(|s| {
+        shear.push(s);
+    });
+    let mean = shear.mean();
+    let floor_x: Vec<f64> = strips.iter().filter(|s| s.floor).map(|s| 0.5 * (s.x.0 + s.x.1)).collect();
+    let floor: Vec<f64> = strips.iter().zip(&mean).filter(|(s, _)| s.floor).map(|(_, &t)| t).collect();
+    println!("gated x_r from the stored samples: {:?} (experiment 6.26 ± 0.10)", reattachment(&floor_x, &floor));
+    // The floor crossing, the wall reader moved one cell down and up the wall.
+    for shift in [-1isize, 0, 1] {
+        match wall_crossing(&flow, &step, shift) {
+            Ok(c) => println!("wall reader shifted {shift:+} cells: first row x {:.3}; {c}", c.rows.first().map_or(f64::NAN, |r| r.1)),
+            Err(why) => println!("wall reader shifted {shift:+} cells: none ({why})"),
+        }
+    }
+    // The incoming layer at x = −4 H, up to mid-channel, as the run reads it, and with the wall
+    // interval (the first node above the wall to the wall node) from the wall law.
+    let g = *flow.grid();
+    let [nx, ny, nz] = g.cells;
+    let column = |x: f64| ((x + step.upstream) / h).floor().clamp(0.0, nx as f64 - 1.0) as usize;
+    let row = |z: f64| ((z + h) / h).floor().clamp(0.0, nz as f64 - 1.0) as usize;
+    let span_mean = |i: usize, k: usize| {
+        let (mut rho, mut u) = (0.0, 0.0);
+        for j in 0..ny {
+            let (r, v) = flow.moments(g.index([i, j, k])).unwrap_or((f64::NAN, [f64::NAN; 3]));
+            rho += r;
+            u += v[0];
+        }
+        (rho / ny as f64, u / ny as f64)
+    };
+    let middle = 0.5 * (1.0 + step.roof());
+    let (rho_ref, u_ref) = span_mean(column(-4.0), row(middle));
+    let i = column(-4.0);
+    let u: Vec<f64> = (row(1.0) + 1..=row(middle)).map(|k| span_mean(i, k).1).collect();
+    let lat = step.lattice_velocity;
+    let (edge, nu) = (u_ref / lat, 1.0 / step.re_h);
+    let up: Vec<f64> = u.iter().map(|v| v / lat).collect();
+    let theta_run = momentum_thickness(&u, h, u_ref);
+    // Trapezoid over the nodes from the first one above the wall to mid-channel, plus the interval below.
+    let f = |v: f64| (v / edge) * (1.0 - v / edge);
+    let beyond = h * (up.iter().skip(1).map(|&v| f(v)).sum::<f64>() + 0.5 * f(up[0]) - 0.5 * f(up[up.len() - 1]));
+    let interval = up.first().and_then(|&u1| if sa_law { WallInterval::new_sa_law(u1, h, nu) } else { WallInterval::new(u1, h, nu) });
+    let [wall_law, wall_trap] = interval.map_or([f64::NAN; 2], |w| w.momentum_thickness(edge));
+    let delta = u.iter().position(|&v| v >= 0.99 * u_ref).map_or(f64::NAN, |k| (k as f64 + 0.5) * h);
+    let re = |theta: f64| edge * theta * step.re_h;
+    println!(
+        "inflow at x = −4 H (U_ref {edge:.4}, Re_H {:.0}): Re_θ as the run logs it {:.0}; trapezoid from u = 0 at the wall node {:.0}; with the {} wall interval {:.0}; experiment 5000. δ₉₉ {:.2} H (experiment ≈ 1.5)",
+        edge * step.re_h,
+        re(theta_run),
+        re(beyond + wall_trap),
+        if sa_law { "SA-law" } else { "Spalding" },
+        re(beyond + wall_law),
+        delta
+    );
+    let q = 0.5 * rho_ref * u_ref * u_ref;
+    let cf: Vec<(f64, f64)> = strips.iter().zip(&mean).map(|(s, t)| (0.5 * (s.x.0 + s.x.1), t / q)).collect();
+    let (xs, cfs): (Vec<f64>, Vec<f64>) = cf.iter().copied().unzip();
+    let reference = expected("ddes-backstep-driver-seegmiller").into_iter().find(|(id, ..)| id == "cf_inflow");
+    println!(
+        "inflow C_f at x/H −3.956: run {:.3e}; the scorer's reference {:?} (tolerance, relative)",
+        interpolate(&xs, &cfs, -3.956).unwrap_or(f64::NAN),
+        reference.map(|(_, v, t)| (v, t))
+    );
 }
 
 /// Spalart–Allmaras RANS on Han's wall in 2D (one cell of span), the case's grid and inlet: the
