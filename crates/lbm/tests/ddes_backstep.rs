@@ -715,32 +715,36 @@ fn intercept(points: &[(f64, f64)], degree: usize) -> f64 {
     a[0][n] / a[0][0]
 }
 
-/// The floor's u = 0 crossing behind the step in the final field ([`WallCrossing`]).
-fn wall_crossing(flow: &Flow, step: &Step, shift: isize) -> Result<WallCrossing, String> {
+/// The last negative → non-negative change of u along cell row `k` behind the step (linear between
+/// cell centres): `(y, x)` with y the row's height above the wall (Han's wall: the node row's centre).
+fn crossing_at(flow: &Flow, step: &Step, k: usize) -> Result<(f64, f64), String> {
     let g = flow.grid();
     let h = step.spacing();
     let [nx, ny, _] = g.cells;
+    let wall = if flow.on_node_bounce() { 0.5 * h } else { 0.0 };
+    let x = |i: usize| -step.upstream + (i as f64 + 0.5) * h;
+    let u = |i: usize, k: usize| (0..ny).filter_map(|j| flow.moments(g.index([i, j, k])).map(|m| m.1[0])).sum::<f64>() / ny as f64;
+    let y = (k as f64 - 0.5) * h - wall;
+    let crossing = (0..nx.saturating_sub(1))
+        .rev()
+        .filter(|&i| x(i) > 0.0)
+        .find_map(|i| {
+            let (a, b) = (u(i, k), u(i + 1, k));
+            (a < 0.0 && b >= 0.0).then(|| x(i) + h * a / (a - b))
+        })
+        .ok_or_else(|| format!("no negative → non-negative change of u in the row at y = {y:.4} H"))?;
+    Ok((y, crossing))
+}
+
+/// The floor's u = 0 crossing behind the step in the final field ([`WallCrossing`]).
+fn wall_crossing(flow: &Flow, step: &Step, shift: isize) -> Result<WallCrossing, String> {
     // Cell row k's centre is at z = (k − ½) Δ (the box starts at z = −Δ). The floor's halfway wall
     // is at z = 0, so its first rows are 1…4 at y = Δ/2 …; Han's wall is the node row 1 at z = Δ/2,
     // so its first rows are 2…5 at y = Δ … 4Δ.
-    let (first, wall) = if flow.on_node_bounce() { (2, 0.5 * h) } else { (1, 0.0) };
+    let first = if flow.on_node_bounce() { 2 } else { 1 };
     // `shift` moves the four rows the crossing is read from, up (+) or down (−) the wall in cells.
     let first = usize::try_from(first as isize + shift).map_err(|_| format!("a shift of {shift} rows puts the first row below the box"))?;
-    let x = |i: usize| -step.upstream + (i as f64 + 0.5) * h;
-    let u = |i: usize, k: usize| (0..ny).filter_map(|j| flow.moments(g.index([i, j, k])).map(|m| m.1[0])).sum::<f64>() / ny as f64;
-    let mut rows = Vec::new();
-    for k in first..first + 4 {
-        let y = (k as f64 - 0.5) * h - wall;
-        let crossing = (0..nx.saturating_sub(1))
-            .rev()
-            .filter(|&i| x(i) > 0.0)
-            .find_map(|i| {
-                let (a, b) = (u(i, k), u(i + 1, k));
-                (a < 0.0 && b >= 0.0).then(|| x(i) + h * a / (a - b))
-            })
-            .ok_or_else(|| format!("no negative → non-negative change of u in the row at y = {y:.4} H"))?;
-        rows.push((y, crossing));
-    }
+    let rows = (first..first + 4).map(|k| crossing_at(flow, step, k)).collect::<Result<Vec<_>, _>>()?;
     let fits = [intercept(&rows[..2], 1), intercept(&rows[..3], 1), intercept(&rows, 1), intercept(&rows, 2)];
     Ok(WallCrossing { rows, fits })
 }
@@ -957,10 +961,15 @@ fn driver_seegmiller(step: &Step) -> (Run, Score) {
     (r, score)
 }
 
-/// The SA run's step: the case at `FIELDCRAFT_STEP_CELLS_PER_H` cells per H (16 by default).
+/// The SA run's step: the case at `FIELDCRAFT_STEP_CELLS_PER_H` cells per H (16 by default). The
+/// inlet is a uniform velocity that develops a boundary layer, so `FIELDCRAFT_STEP_EXTRA_UPSTREAM`
+/// (H, a whole number of cells; 0 by default) lengthens the inflow to raise the Re_θ at x = −4 H:
+/// ΔL/H ≈ 1270 / (0.00155 Re_H), about 22 H at the case's Re_H 37 349 (Re_θ 5000 from about 3900).
 fn sa_step(sa: Turbulence) -> Step {
     let cells_per_h = std::env::var("FIELDCRAFT_STEP_CELLS_PER_H").ok().and_then(|v| v.parse().ok()).unwrap_or(16);
-    Step { cells_per_h, ..Step::driver_seegmiller(sa, 0.0) }
+    let extra: f64 = std::env::var("FIELDCRAFT_STEP_EXTRA_UPSTREAM").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0);
+    let case = Step::driver_seegmiller(sa, 0.0);
+    Step { cells_per_h, upstream: case.upstream + extra, ..case }
 }
 
 /// The SA run's model: on Han's on-node wall with the model's own law, or with Spalding's with
@@ -1038,6 +1047,25 @@ fn a_restart_files_readings() {
             Ok(c) => println!("wall reader shifted {shift:+} cells: first row x {:.3}; {c}", c.rows.first().map_or(f64::NAN, |r| r.1)),
             Err(why) => println!("wall reader shifted {shift:+} cells: none ({why})"),
         }
+    }
+    // The gate reading: x_r is the wall (y = 0) value, the linear extrapolation of the u = 0
+    // crossings of rows 1 and 2 to y = 0; the uncertainty band is that against the row-1 value and
+    // the extrapolation from rows 2 and 3. No variant is picked by its nearness to the experiment.
+    let first_row = if flow.on_node_bounce() { 2 } else { 1 };
+    let rows: Vec<Result<(f64, f64), String>> = (0..6).map(|n| crossing_at(&flow, &step, first_row + n)).collect();
+    for (n, r) in rows.iter().enumerate() {
+        match r {
+            Ok((y, x)) => println!("u = 0 crossing, row {} (y = {y:.4} H): x {x:.3} H", n + 1),
+            Err(why) => println!("u = 0 crossing, row {}: none ({why})", n + 1),
+        }
+    }
+    if let [Ok(r1), Ok(r2), Ok(r3), ..] = rows.as_slice() {
+        let (wall, row1, from_23) = (intercept(&[*r1, *r2], 1), r1.1, intercept(&[*r2, *r3], 1));
+        let (lo, hi) = (wall.min(row1).min(from_23), wall.max(row1).max(from_23));
+        println!(
+            "x_r at the wall (y = 0, rows 1–2 extrapolated): {wall:.3} H; band: row-1 value {row1:.3}, rows 2–3 extrapolated {from_23:.3}; {lo:.3} … {hi:.3} H (experiment 6.26 ± 0.10); wall law {}",
+            study_wall_law().1
+        );
     }
     // The incoming layer at x = −4 H, up to mid-channel, as the run reads it, and with the wall
     // interval (the first node above the wall to the wall node) from the wall law.
