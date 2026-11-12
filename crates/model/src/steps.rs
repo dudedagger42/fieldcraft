@@ -357,7 +357,11 @@ pub enum WallModel {
     /// stress Spalding's law (κ 0.41, B 5.5) gives at the interior node one cell above it
     /// (M. Han, R. Ooka, H. Kikumoto, *A wall function approach in lattice Boltzmann method:
     /// algorithm and validation using turbulent channel flow*, Fluid Dyn. Res. 53:045506, 2021,
-    /// doi:10.1088/1873-7005/ac1782).
+    /// doi:10.1088/1873-7005/ac1782). A cell in a velocity inlet's layer that touches two walls (a box
+    /// edge, a staircase step on an obstacle's rim) is a wall cell, plain bounce-back with no inlet
+    /// condition and no wall law, because the inlet and the law together grow a density mode there; the
+    /// inlet's velocity is raised to keep its volume flow, and an inlet that would lose more than a tenth
+    /// of its cells is refused. Other wall treatments are unchanged.
     SpaldingBounce,
     /// Han, Ooka and Kikumoto's on-node wall-function bounce ([`WallModel::SpaldingBounce`]) with
     /// the wall law of the Spalart–Allmaras model itself in place of Spalding's: the stress is the
