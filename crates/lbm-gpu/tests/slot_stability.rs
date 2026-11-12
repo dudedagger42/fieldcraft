@@ -3,7 +3,7 @@
 //! Fields are in lattice units (velocity and density as the solver holds them), so peak u and U_in are comparable.
 //! The plate across the channel has a slot `SLOT_CELLS` cells wide (0.2 m, so dx = 0.2 / SLOT_CELLS); the box faces
 //! y min/max and z min are walls with the named wall law (`LAW`: spalding or sa), z max is slip.
-//! Environment: TURB (sa, vreman, none), SLOT_CELLS (4), LAW (spalding), LAYER (1: the default absorbing layer), STEPS (20000), CHUNK (500), TAU (2.4e-4), ULAT (inlet mean lattice
+//! Environment: SURFACE (1: wall-node rows exactly 0.2 m apart across the slot and through the plate), TURB (sa, vreman, none), SLOT_CELLS (4), LAW (spalding), LAYER (1: the default absorbing layer), STEPS (20000), CHUNK (500), TAU (2.4e-4), ULAT (inlet mean lattice
 //! speed, 0.014), LAYER_CELLS (the layer's thickness in cells of this grid; hold the physical thickness: 10/20/40 at
 //! 4/8/16 cells), EXT_UP / EXT_DN (m of box added upstream / downstream; 0.5 and 0.5 give a 0.5 m layer room on every grid), ZMAX (wall: z max a wall), TAU (tau+-1/2; hold Re: 2.4e-4/4.8e-4/9.6e-4 at 4/8/16 cells), CPU (1: compare with the CPU each chunk; 0: device only), GPU (1).
 // A local harness: index loops over the grid and nested ifs read better than iterator chains here.
@@ -57,9 +57,15 @@ fn slotted_channel_stability() {
         d.absorbing = Some(fieldcraft_model::AbsorbingLayer { thickness, strength: None, filter_time: None });
     }
     d.obstacles = vec!["PlateLow".into(), "PlateHigh".into()];
+    // SURFACE=1: the slot and the plate are built so the wall-node rows (the fluid cells next to the plate's solid cells, which
+    // the on-node wall law makes wall nodes) are exactly the geometric distance apart: 0.2 m across the slot (cells + 1 rows
+    // from wall node to wall node) and 0.2 m through the plate. The solid part of the plate is one cell thinner than the
+    // geometry in z (the upper block starts a cell higher) and (cells - 1) cells thick in x.
+    let surface = env("SURFACE", 0.0) > 0.5;
+    let (z_hi, x_hi) = if surface { (0.6 + dx, 0.6 + (cells - 1.0) * dx) } else { (0.6, 0.8) };
     let obstacles = vec![
-        obstacle("PlateLow", cuboid([0.6, 0.0, 0.0], [0.8, 1.0, 0.4]), &CUBOID_FACES),
-        obstacle("PlateHigh", cuboid([0.6, 0.0, 0.6], [0.8, 1.0, 1.0]), &CUBOID_FACES),
+        obstacle("PlateLow", cuboid([0.6, 0.0, 0.0], [x_hi, 1.0, 0.4]), &CUBOID_FACES),
+        obstacle("PlateHigh", cuboid([0.6, 0.0, z_hi], [x_hi, 1.0, 1.0]), &CUBOID_FACES),
     ];
     let wall_model = match law.as_str() {
         "sa" => Some(WallModel::SpalartAllmarasBounce),
@@ -101,6 +107,17 @@ fn slotted_channel_stability() {
         setup.tau_minus - 0.5,
         std::env::var("LAYER_CELLS").map_or("default 10 cells".to_string(), |c| format!("{c} cells = {:.4} m", c.parse::<f64>().unwrap_or(0.0) * dx))
     );
+    if surface {
+        let (nx0, ny0) = (((0.7 + ext_up) / dx) as usize, 0usize);
+        let g = *cpu.grid();
+        let col: String = (0..nz).map(|k| if Backend::is_fluid(&cpu, g.index([nx0, ny0, k])) { 'f' } else { 'S' }).collect();
+        let kc = ((0.2 / dx) as usize).min(nz - 1);
+        let row: String = (((0.5 + ext_up) / dx) as usize..((1.0 + ext_up) / dx) as usize)
+            .map(|i| if Backend::is_fluid(&cpu, g.index([i, ny0, kc])) { 'f' } else { 'S' })
+            .collect();
+        println!("SURFACE z column through the plate (k=0..{nz}; f fluid, S solid or wall node): {col}");
+        println!("SURFACE x row through the plate at z {:.3} m, x 0.5 m to 1.0 m (f fluid, S solid or wall node): {row}", (kc as f64 + 0.5) * dx);
+    }
     let mut gpu = if use_gpu {
         match GpuFlow::with_options(&cpu, Policy::from_env().unwrap(), Options::default()) {
             Ok(g) => {
@@ -405,6 +422,18 @@ fn slotted_channel_stability() {
                 dp_end / (0.5 * gm * gm),
                 sec(at(0.7)).0 as f64 / sec(at(0.7)).1
             );
+            {
+                let i = at(0.7);
+                let (open, tot, _, _, _) = sec(i);
+                let u_open = flow_per_area / (open as f64 / tot);
+                println!(
+                    "DIAG4 (f) surface-true: K_w = dp/(0.5 (Q/0.2 m wall-to-wall)^2) = {:.3}; K_fluid = dp/(0.5 (Q/fluid-cell width)^2) = {:.3} (fluid width {:.4} m of the 0.2 wall-to-wall, mean u {u_open:.5}); dp per head of the peak {:.3}",
+                    dp_end / (0.5 * u_nom * u_nom),
+                    dp_end / (0.5 * u_open * u_open),
+                    open as f64 / tot,
+                    dp_end / (0.5 * gm * gm)
+                );
+            }
             if gm > 0.10 {
                 println!("DIAG4 (e) WARNING true max|u| {gm:.4} lattice is above 0.10 (Mach {:.3})", gm * 3.0f64.sqrt());
             }
