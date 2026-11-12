@@ -131,6 +131,16 @@ impl Layer {
         &self.cells
     }
 
+    /// Each layer cell's strength `w χ`, in the order of [`Layer::cells`].
+    pub(crate) fn strengths(&self) -> &[f64] {
+        &self.strength
+    }
+
+    /// The reference filter's rate 1/N_f.
+    pub(crate) fn filter(&self) -> f64 {
+        self.filter
+    }
+
     /// The term on every layer cell of the populations `f` (direction stride `stride`). Cells
     /// are worked out in parallel into scratch, then stored in cell order.
     pub(crate) fn apply(&mut self, f: &mut [f64], stride: usize, block: usize) {

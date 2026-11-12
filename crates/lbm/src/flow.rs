@@ -1668,6 +1668,12 @@ impl Flow {
         self.absorbing.cells()
     }
 
+    /// The absorbing layer as a device needs it: its cells (increasing), each one's strength
+    /// `w χ` per step, and the reference filter's rate 1/N_f (empty without a layer).
+    pub fn absorbing_layer(&self) -> (&[u32], &[f64], f64) {
+        (self.absorbing.cells(), self.absorbing.strengths(), self.absorbing.filter())
+    }
+
     /// With a free surface: how it fared so far ([`SurfaceReport`]).
     pub fn surface_report(&self) -> Option<SurfaceReport> {
         self.surface.as_ref().map(|s| s.report(&self.f, self.stride))
