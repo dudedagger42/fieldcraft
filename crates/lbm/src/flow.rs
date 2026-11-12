@@ -596,6 +596,7 @@ pub struct Flow {
     nodes: Option<WallNodes>,
     /// The inlet cells the on-node wall law's corner rule made wall cells.
     inlet_corners: InletCornerReport,
+    wall_layer: crate::wall_layer::WallLayerReport,
     /// With it, the cells that collide: the fluid cells less the boundary nodes (empty
     /// otherwise: every fluid cell collides).
     bulk: Vec<bool>,
@@ -656,7 +657,7 @@ pub struct Flow {
     pub(crate) surface: Option<Surface>,
 }
 
-const NONE: u32 = u32::MAX;
+pub(crate) const NONE: u32 = u32::MAX;
 
 /// The Spalart–Allmaras model's state in the flow ([`crate::sa`]): ν̃ on the cells that collide,
 /// each cell's distance to the nearest no-slip wall ([`crate::distance`]) and the vorticity of the
@@ -843,7 +844,15 @@ impl Flow {
         // refused. Other wall treatments are unchanged. Radial profiles are left as they are.
         let mut inlet_corners = InletCornerReport::default();
         let mut inlet_rescale = [1.0f64; 6];
-        if matches!(setup.wall_model, Some(WallModel::SpaldingBounce | WallModel::SpalartAllmarasBounce)) {
+        if matches!(
+            setup.wall_model,
+            Some(
+                WallModel::SpaldingBounce
+                    | WallModel::SpalartAllmarasBounce
+                    | WallModel::SpaldingBounceSurface
+                    | WallModel::SpalartAllmarasBounceSurface
+            )
+        ) {
             for face in BoxFace::ALL {
                 let profile = match *domain.faces.get(face) {
                     FaceCondition::Velocity { profile, .. } if profile != Profile::Radial => profile,
@@ -929,6 +938,63 @@ impl Flow {
                 inlet_corners.flux_rescale = inlet_corners.flux_rescale.max(flux_before / flux_after);
             }
         }
+        // The half-way wall (`spalding_bounce_surface`): the first solid layer becomes the boundary nodes,
+        // flagged fluid for the node loop below ([`crate::wall_layer`]). Obstacle walls only: an open
+        // cell on a wall face of the box would be an on-node wall through its centre, so it is refused.
+        let surface_model = matches!(setup.wall_model, Some(WallModel::SpaldingBounceSurface | WallModel::SpalartAllmarasBounceSurface));
+        let mut wall_layer = crate::wall_layer::WallLayerReport::default();
+        if surface_model {
+            if !solid_cells.is_empty() {
+                return Err(Error::Invalid(
+                    "not supported yet: the wall model `spalding_bounce_surface` with a conducting solid; use `spalding_bounce` or leave the solid out".into(),
+                ));
+            }
+            let on_wall_face = |p: [usize; 3]| {
+                (0..3).filter(|a| !periodic[*a]).any(|a| {
+                    [(p[a] == 0, BoxFace::of(a, false)), (p[a] + 1 == grid.cells[a], BoxFace::of(a, true))]
+                        .iter()
+                        .any(|(at, face)| *at && wall_velocity(*face).is_some())
+                })
+            };
+            if let Some(c) = (0..n).find(|c| fluid.get(*c).copied().unwrap_or(false) && on_wall_face(grid.coords(*c))) {
+                let p = grid.coords(c);
+                return Err(Error::Invalid(format!(
+                    "not supported yet: the wall model `{}` with an open cell {p:?} on a no-slip face of the box; fill the face with a solid slab two cells thick (obstacle walls only)",
+                    if setup.wall_model == Some(WallModel::SpaldingBounceSurface) {
+                        "spalding_bounce_surface"
+                    } else {
+                        "spalart_allmaras_bounce_surface"
+                    }
+                )));
+            }
+            let open_face = |p: [usize; 3]| {
+                (0..3).filter(|a| !periodic[*a]).any(|a| {
+                    [(p[a] == 0, BoxFace::of(a, false)), (p[a] + 1 == grid.cells[a], BoxFace::of(a, true))]
+                        .iter()
+                        .any(|(at, face)| *at && wall_velocity(*face).is_none())
+                })
+            };
+            // Walls with no centre inside: the flow would leak through them.
+            let solid: Vec<bool> = fluid.iter().zip(&owner).map(|(f, o)| !*f && *o != NONE).collect();
+            let (mut unsealed, mut area) = (0.0, 0.0);
+            for faces in &setup.obstacles {
+                let o = obstacles.get(faces.index).ok_or_else(|| Error::NotFound(format!("obstacle {}", faces.index)))?;
+                let (bad, total) = crate::wall_layer::unsealed_area(&o.surface, &grid, &solid)?;
+                unsealed += bad;
+                area += total;
+            }
+            let unsealed_share = if area > 0.0 { unsealed / area } else { 0.0 };
+            if unsealed_share > crate::wall_layer::UNSEALED_LIMIT {
+                return Err(Error::Invalid(format!(
+                    "{:.1} % of the obstacles' surface area has no cell centre inside it (walls thinner than the spacing, {}), above the {:.0} % the half-way wall accepts: the flow would leak through them; refine the spacing or thicken them",
+                    100.0 * unsealed_share,
+                    grid.spacing,
+                    100.0 * crate::wall_layer::UNSEALED_LIMIT
+                )));
+            }
+            wall_layer = crate::wall_layer::promote(&grid, periodic, &mut fluid, &mut owner, &open_face)?;
+            wall_layer.unsealed_share = unsealed_share;
+        }
         // The wall-function bounce reflects at its walls instead of bouncing back; only at rest.
         let wall_bounce = setup.wall_model == Some(WallModel::SpaldingBounceHalfway);
         if wall_bounce && let Some(face) = BoxFace::ALL.iter().find(|f| matches!(domain.faces.get(**f), FaceCondition::MovingWall { .. })) {
@@ -957,8 +1023,8 @@ impl Flow {
         // layer; at an obstacle, the fluid layer next to it. A node with one wall direction has a
         // normal; its links take their roles from its neighbours (`bounce::roles`): Han's eq. 14
         // where its fluid side is whole, bounce-back on every other link to the fluid.
-        let on_node = matches!(setup.wall_model, Some(WallModel::SpaldingBounce | WallModel::SpalartAllmarasBounce));
-        let node_law = if setup.wall_model == Some(WallModel::SpalartAllmarasBounce) {
+        let on_node = surface_model || matches!(setup.wall_model, Some(WallModel::SpaldingBounce | WallModel::SpalartAllmarasBounce));
+        let node_law = if matches!(setup.wall_model, Some(WallModel::SpalartAllmarasBounce | WallModel::SpalartAllmarasBounceSurface)) {
             crate::sa::WallLaw::SpalartAllmaras
         } else {
             crate::sa::WallLaw::Spalding
@@ -1551,7 +1617,18 @@ impl Flow {
                     // and the midpoint of every halfway link that remains beside them (a junction
                     // cell's wall links, a diagonal off a convex corner): K2's "the wall points
                     // the solver uses".
-                    let mut points: Vec<[f64; 3]> = node_list.iter().map(|w| grid.coords(w.cell as usize).map(|v| v as f64)).collect();
+                    // On the half-way wall the node's centre is half a cell behind the wall.
+                    let behind = if surface_model { 0.5 } else { 0.0 };
+                    let mut points: Vec<[f64; 3]> = node_list
+                        .iter()
+                        .map(|w| {
+                            let mut p = grid.coords(w.cell as usize).map(|v| v as f64);
+                            if let Some(v) = p.get_mut(usize::from(w.axis).min(2)) {
+                                *v += behind * f64::from(w.inward.signum());
+                            }
+                            p
+                        })
+                        .collect();
                     for l in &links {
                         if let Rule::Bounce { group, .. } = l.rule
                             && no_slip.get(group as usize).copied().unwrap_or(false)
@@ -1604,8 +1681,9 @@ impl Flow {
             walls,
             wall_model: setup.wall_model == Some(WallModel::Musker),
             wall_bounce: setup.wall_model == Some(WallModel::SpaldingBounceHalfway),
-            nodes: on_node.then(|| WallNodes::new(node_list, nu, node_law)),
+            nodes: on_node.then(|| WallNodes::new(node_list, nu, node_law).with_distance(if surface_model { 0.5 } else { 1.0 })),
             inlet_corners,
+            wall_layer,
             bulk,
             rheology: setup.rheology,
             clamps: Clamps::default(),
@@ -1922,6 +2000,24 @@ impl Flow {
     /// What the corner rule did to the velocity inlets (all zero without an on-node wall law).
     pub fn inlet_corner_report(&self) -> InletCornerReport {
         self.inlet_corners
+    }
+
+    /// Evaluate the wall law at `distance` cells from the wall instead of the model's own (½ on the
+    /// half-way wall, 1 on Han et al.'s on-node wall): the contrast the half-way wall's gate measures.
+    /// Refused without boundary nodes, or for a distance outside (0, 2].
+    pub fn set_wall_distance(&mut self, distance: f64) -> Result<()> {
+        if !(distance.is_finite() && distance > 0.0 && distance <= 2.0) {
+            return Err(Error::Invalid(format!("the wall law's distance is {distance} cells: give one in (0, 2]")));
+        }
+        let nodes = self.nodes.take().ok_or_else(|| Error::Invalid("this flow has no boundary nodes".into()))?;
+        self.nodes = Some(nodes.with_distance(distance));
+        Ok(())
+    }
+
+    /// What the half-way wall (`spalding_bounce_surface`) made of the obstacles' walls: its nodes, and
+    /// the share of the wall area that runs plain bounce-back (all zero for any other wall model).
+    pub fn wall_layer_report(&self) -> crate::wall_layer::WallLayerReport {
+        self.wall_layer
     }
 
     /// Whether Han et al.'s on-node wall-function bounce runs (`spalding_bounce`).
@@ -2764,7 +2860,7 @@ impl Flow {
     /// walls share a node); none without a wall model. The one place it comes from (slice 8's
     /// u_τ(h) replaces it here):
     /// - Han, Ooka & Kikumoto's on-node bounce: u_τ = √(|τ|/ρ) from the stress each boundary node
-    ///   applies, sampled this step from its interior node, which is the first fluid node, y = 1;
+    ///   applies, sampled this step from its interior node, which is the first fluid node, y = 1 (½ for the half-way wall);
     /// - Musker's wall model: the u_τ of its wall law at each modelled wall cell, y its distance.
     fn wall_friction(&self) -> Vec<(usize, f64, f64)> {
         let mut out: Vec<(usize, f64, f64)> = if let Some(nodes) = &self.nodes {
@@ -2777,7 +2873,7 @@ impl Flow {
                     // The law's stress at the node (equal to the applied one on a flat node).
                     let tau = w.wanted.iter().map(|s| s * s).sum::<f64>().sqrt();
                     let ut = self.moments(cell).map_or(0.0, |(rho, _)| (tau / rho).sqrt());
-                    (cell, 1.0, if ut.is_finite() { ut } else { 0.0 })
+                    (cell, nodes.distance(), if ut.is_finite() { ut } else { 0.0 })
                 })
                 .collect()
         } else if let Some(walls) = self.walls.as_ref().filter(|_| self.wall_model) {
@@ -3428,6 +3524,7 @@ impl crate::backend::Backend for Flow {
             wall_bounce,
             nodes,
             inlet_corners: _,
+            wall_layer: _,
             bulk: _,
             rheology,
             clamps,
@@ -3754,6 +3851,10 @@ impl crate::backend::Backend for Flow {
 
     fn empty_obstacles(&self) -> &[String] {
         &self.empty_obstacles
+    }
+
+    fn wall_layer(&self) -> Option<crate::wall_layer::WallLayerReport> {
+        self.nodes.as_ref().filter(|n| n.distance() != 1.0).map(|_| self.wall_layer)
     }
 
     fn conducting(&self) -> &[Vec<u32>] {

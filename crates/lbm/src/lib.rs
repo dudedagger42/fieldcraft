@@ -94,6 +94,7 @@ pub mod validity;
 pub mod voxel;
 pub mod vreman;
 pub mod wall;
+pub mod wall_layer;
 
 pub use backend::{Backend, Choice, Fields, device_available, register_backend};
 pub use flow::{Flow, Group, Link, OpenCell, Rule, Target, ThermalState, ZoneSample};

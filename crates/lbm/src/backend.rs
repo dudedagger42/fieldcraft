@@ -115,6 +115,11 @@ pub trait Backend {
     fn conducting(&self) -> &[Vec<u32>];
     /// Obstacles that cover no cell centre.
     fn empty_obstacles(&self) -> &[String];
+
+    /// What the half-way wall made of the obstacles' walls, when the run uses it.
+    fn wall_layer(&self) -> Option<crate::wall_layer::WallLayerReport> {
+        None
+    }
 }
 
 /// Makes a device backend from a prepared flow (its initial state included) and its setup.

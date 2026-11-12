@@ -1100,6 +1100,11 @@ impl GpuFlow {
         let mut node_sides: Vec<f32> = Vec::new();
         let mut node_slots = 0u32;
         if let Some(nodes) = flow.wall_nodes() {
+            if nodes.distance() != 1.0 {
+                return Err(Error::Invalid(
+                    "not supported yet: the half-way wall (`spalding_bounce_surface`, `spalart_allmaras_bounce_surface`) on the GPU; solve on the CPU (`backend: \"cpu\"`)".into(),
+                ));
+            }
             let links = flow.links();
             for w in nodes.nodes() {
                 let (cell, axis) = (w.cell as usize, usize::from(w.axis).min(2));
