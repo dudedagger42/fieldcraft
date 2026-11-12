@@ -1660,6 +1660,8 @@ impl Flow {
             }
         };
         open.shrink_to_fit();
+        // The cells that collide, for the half-way wall's second-cell sampling.
+        let open_cells: Vec<bool> = if surface_model { if bulk.is_empty() { fluid.clone() } else { bulk.clone() } } else { Vec::new() };
         let mut flow = Flow {
             grid,
             n,
@@ -1681,7 +1683,33 @@ impl Flow {
             walls,
             wall_model: setup.wall_model == Some(WallModel::Musker),
             wall_bounce: setup.wall_model == Some(WallModel::SpaldingBounceHalfway),
-            nodes: on_node.then(|| WallNodes::new(node_list, nu, node_law).with_distance(if surface_model { 0.5 } else { 1.0 })),
+            nodes: on_node.then(|| {
+                let mut node_list = node_list;
+                if surface_model {
+                    // The half-way wall's law reads the second open cell off the wall (y = 1½), clear of the
+                    // buffer layer; a node without one (a passage two cells wide, a corner) reads the first.
+                    let open = &open_cells;
+                    for w in node_list.iter_mut() {
+                        let axis = usize::from(w.axis).min(2);
+                        let p = grid.coords(w.interior as usize);
+                        let next = p[axis] as i64 + i64::from(w.inward).signum();
+                        let periodic_axis = periodic.get(axis).copied().unwrap_or(false);
+                        let n = grid.cells[axis] as i64;
+                        let next = if periodic_axis { next.rem_euclid(n) } else { next };
+                        if (0..n).contains(&next) {
+                            let mut q = p;
+                            q[axis] = next as usize;
+                            let cell = grid.index(q);
+                            if open.get(cell).copied().unwrap_or(false) {
+                                w.sample_cell = cell as u32;
+                            }
+                        }
+                    }
+                    WallNodes::new(node_list, nu, node_law).with_distance(0.5).with_second_cell()
+                } else {
+                    WallNodes::new(node_list, nu, node_law)
+                }
+            }),
             inlet_corners,
             wall_layer,
             bulk,
@@ -2787,6 +2815,26 @@ impl Flow {
             return Ok(());
         }
         let wall = self.wall_friction();
+        // The half-way wall's nodes that read the law at their second open cell impose ν̃ there too,
+        // at its own distance, with the u_τ the law gave.
+        let extra: Vec<(usize, f64, f64)> = self
+            .nodes
+            .as_ref()
+            .filter(|nodes| nodes.second_cell())
+            .map(|nodes| {
+                nodes
+                    .nodes()
+                    .iter()
+                    .filter(|w| w.sampled() && w.sample_cell != w.interior)
+                    .filter_map(|w| {
+                        let tau = w.wanted.iter().map(|s| s * s).sum::<f64>().sqrt();
+                        let rho = self.moments(w.sample_cell as usize)?.0;
+                        let ut = (tau / rho).sqrt();
+                        ut.is_finite().then_some((w.sample_cell as usize, nodes.law_distance(w), ut))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         let Some(sa) = &mut self.sa else { return Ok(()) };
         let (grid, periodic, block, steps) = (self.grid, self.periodic, self.block, self.steps_done);
         let fluid = populated_mask(&self.fluid, &self.bulk, self.surface.as_ref());
@@ -2838,7 +2886,7 @@ impl Flow {
         // transport so the collision reads it.
         if let Some(law) = sa.law {
             let mut fixed = Vec::with_capacity(wall.len());
-            for &(c, y, ut) in &wall {
+            for &(c, y, ut) in wall.iter().chain(&extra) {
                 // The model's own layer has ν̃ = κ u_τ y exactly; another law's ν̃ is the inverse
                 // of ν̃ f_v1 at its eddy viscosity.
                 if law == crate::sa::WallLaw::SpalartAllmaras {
