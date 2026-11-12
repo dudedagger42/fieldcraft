@@ -18,6 +18,9 @@ use fieldcraft_model::{
     AbsorbingLayer, Collision, FaceCondition, HrrSigma, Outflow, Procedure, Profile, RadialInflow, RadialScale, Turbulence, WallModel,
 };
 
+/// The hybrid collision's σ.
+const SIGMA: f64 = 0.95;
+
 fn var(name: &str, default: f64) -> f64 {
     std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
 }
@@ -51,7 +54,7 @@ fn jet(n: f64, re: f64, h: f64, layer: bool) -> (fieldcraft_model::Model, Vec<Ob
         time_step: Some(dt),
         frames: 2,
         magic: None,
-        sigma: Some(HrrSigma::Value(0.95)),
+        sigma: Some(HrrSigma::Value(SIGMA)),
         collision: Some(Collision::Hrr),
         turbulence: Some(Turbulence::SpalartAllmaras { prandtl: 0.9, wall_model: Some(WallModel::SpaldingBounce), inflow_ratio: 3.0, ddes: None }),
         steady: None,
@@ -87,28 +90,80 @@ fn smoke() {
     }
     let quarter = std::f64::consts::PI * 0.25 / 4.0 * n * n; // cells
     println!("inflow: {fed} cells fed, {:.4} of the true quarter bore area, flux {:.4} of U·πR²/4", fed as f64 / quarter, sum / (u * quarter));
-    let report = (setup.steps / 20).max(1);
+    let layer_cells = m
+        .fluid_domain("Flow")
+        .and_then(|d| d.absorbing.as_ref().map(|a| a.thickness.map_or(fieldcraft_model::fluids::DEFAULT_ABSORBING_CELLS as f64, |t| t * n)));
+    println!(
+        "header: σ {SIGMA} (hybrid collision); absorbing layer {layer_cells:?} cells (None: no layer); τ − ½ from the warning above; D = {n} cells"
+    );
+    // Where a cell sits in the face plane (D = 1, the axis at y = z = 0, the bore's rim at r = 0.5).
+    let place = |cell: usize| {
+        let [x, y, z] = grid.centre(cell);
+        let r = y.hypot(z);
+        let label = if r < 0.15 {
+            "axis"
+        } else if (r - 0.5).abs() < 0.1 {
+            "rim"
+        } else if y.min(z) < 3.0 / n {
+            "symmetry edge"
+        } else if r < 0.5 {
+            "bore"
+        } else {
+            "outside the bore"
+        };
+        format!("x {x:.3} y {y:.3} z {z:.3} r {r:.3} ({label})")
+    };
+    let report = var("FIELDCRAFT_JET_REPORT", 1000.0) as u64;
+    let clock = std::time::Instant::now();
     for s in 1..=setup.steps {
         flow.step().unwrap();
         if s % report == 0 || s == setup.steps {
             let [nx, ny, nz] = grid.cells;
-            let (mut inlet, mut fastest) = (0.0f64, 0.0f64);
+            // The inlet columns 0–3: the face mean of ρ − 1 (physics: the pipe's pressure offset)
+            // and the largest deviation from it (the mode that should decay).
+            let (mut sum, mut count) = (0.0, 0usize);
+            let (mut fastest, mut fastest_cell) = (0.0f64, 0usize);
             for k in 0..nz {
                 for j in 0..ny {
                     for i in 0..4.min(nx) {
                         if let Some((r, _)) = flow.moments(grid.index([i, j, k])) {
-                            inlet = inlet.max((r - 1.0).abs());
+                            sum += r - 1.0;
+                            count += 1;
                         }
                     }
                     for i in 0..nx {
-                        if let Some((_, v)) = flow.moments(grid.index([i, j, k])) {
-                            fastest = fastest.max(v.iter().map(|c| c * c).sum::<f64>().sqrt());
+                        let cell = grid.index([i, j, k]);
+                        if let Some((_, v)) = flow.moments(cell) {
+                            let speed = v.iter().map(|c| c * c).sum::<f64>().sqrt();
+                            if speed > fastest {
+                                (fastest, fastest_cell) = (speed, cell);
+                            }
                         }
                     }
                 }
             }
-            println!("step {s}: inlet columns 0–3 max |ρ − 1| {inlet:.3e}; fastest cell {fastest:.4} lattice");
-            assert!(inlet.is_finite() && fastest.is_finite(), "the flow blew up at step {s}");
+            let mean = sum / count.max(1) as f64;
+            let (mut deviation, mut deviation_cell) = (0.0f64, 0usize);
+            for k in 0..nz {
+                for j in 0..ny {
+                    for i in 0..4.min(nx) {
+                        let cell = grid.index([i, j, k]);
+                        if let Some((r, _)) = flow.moments(cell) {
+                            let d = (r - 1.0 - mean).abs();
+                            if d > deviation {
+                                (deviation, deviation_cell) = (d, cell);
+                            }
+                        }
+                    }
+                }
+            }
+            println!(
+                "step {s}: inlet columns 0–3 mean ρ − 1 {mean:+.3e}, max deviation from the mean {deviation:.3e} at {}; fastest cell {fastest:.4} lattice at {}; {:.0} s",
+                place(deviation_cell),
+                place(fastest_cell),
+                clock.elapsed().as_secs_f64()
+            );
+            assert!(mean.is_finite() && deviation.is_finite() && fastest.is_finite(), "the flow blew up at step {s}");
         }
     }
 }
