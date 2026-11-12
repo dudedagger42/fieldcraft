@@ -1,5 +1,6 @@
 //! Local harness (not for the gate): a slotted channel on a uniform fine grid, run on the device in chunks and
 //! compared with the CPU, to see how the hybrid collision (σ 0.95) and the f32 device hold at a very low τ.
+//! Fields are in lattice units (velocity and density as the solver holds them), so peak u and U_in are comparable.
 //! The plate across the channel has a slot `SLOT_CELLS` cells wide (0.2 m, so dx = 0.2 / SLOT_CELLS); the box faces
 //! y min/max and z min are walls with the named wall law (`LAW`: spalding or sa), z max is slip.
 //! Environment: SLOT_CELLS (4), LAW (spalding), LAYER (1: the default absorbing layer), STEPS (20000), CHUNK (500), TAU (2.4e-4), ULAT (inlet mean lattice
@@ -161,10 +162,10 @@ fn slotted_channel_stability() {
             sum / k0.max(1) as f64
         };
         let area = (ny * nz) as f64;
-        let fl = |i: usize| plane(i, &|c| f.density[c] * f.velocity[c][0]) * area / scale;
+        let fl = |i: usize| plane(i, &|c| f.density[c] * f.velocity[c][0]) * area;
         let at = |i: usize| 0.5 * (plane(i - 1, &|c| f.density[c]) + plane(i, &|c| f.density[c]));
         let dp = (at(i_up) - at(i_dn)) / 3.0;
-        Some((step, um / scale, rmin, rmax, rsum / cnt as f64, fl(i_in), fl(i_out), dp))
+        Some((step, um, rmin, rmax, rsum / cnt as f64, fl(i_in), fl(i_out), dp))
     };
     let (mut sc, mut sg): (Vec<S>, Vec<S>) = (vec![], vec![]);
     let mut rho_diff: Vec<(u64, f64)> = vec![];
@@ -205,7 +206,7 @@ fn slotted_channel_stability() {
                             if !fluid[c] {
                                 continue;
                             }
-                            let v = f.velocity[c].iter().map(|v| v * v).sum::<f64>().sqrt() / scale;
+                            let v = f.velocity[c].iter().map(|v| v * v).sum::<f64>().sqrt();
                             if v > um {
                                 um = v;
                                 im = [i, j, k];
@@ -245,7 +246,7 @@ fn slotted_channel_stability() {
             let (mut du, mut dr) = (0.0f64, 0.0f64);
             for c in 0..n {
                 if fluid[c] {
-                    let e = (0..3).map(|k| ((fa.velocity[c][k] - fb.velocity[c][k]) / scale).powi(2)).sum::<f64>().sqrt();
+                    let e = (0..3).map(|k| (fa.velocity[c][k] - fb.velocity[c][k]).powi(2)).sum::<f64>().sqrt();
                     du = du.max(e);
                     dr = dr.max((fa.density[c] - fb.density[c]).abs());
                 }
@@ -324,6 +325,129 @@ fn slotted_channel_stability() {
             worst.1,
             worst.0
         );
+    }
+    if env("DIAG4", 0.0) > 0.5 && cpu_ok {
+        let nu_lat = setup.tau_plus - 0.5;
+        let nu_lat = nu_lat / 3.0;
+        if let (Ok(fl), Ok(Some(nt))) = (Backend::fields(&mut cpu), Backend::nu_tilde(&mut cpu)) {
+            let sec = |i: usize| -> (usize, f64, f64, f64, f64) {
+                // open cells, total, mean density, mean u_x over open cells (lattice), max |u| (lattice)
+                let (mut open, mut rho, mut ux, mut um) = (0usize, 0.0, 0.0, 0.0f64);
+                for k in 0..nz {
+                    for j in 0..ny {
+                        let c = grid.index([i, j, k]);
+                        if fluid[c] {
+                            open += 1;
+                            rho += fl.density[c];
+                            ux += fl.velocity[c][0];
+                            um = um.max(fl.velocity[c].iter().map(|v| v * v).sum::<f64>().sqrt());
+                        }
+                    }
+                }
+                (open, (ny * nz) as f64, rho / open.max(1) as f64, ux / open.max(1) as f64, um)
+            };
+            println!(
+                "DIAG4 (a) plate plane: the plate occupies x 0.6..0.8 m, slot z 0.4..0.6 m; sections are the mean over fluid cells of the whole section"
+            );
+            for x in [0.55, 0.65, 0.7, 0.75] {
+                let i = at(x);
+                let (open, tot, _, ux, um) = sec(i);
+                let frac = open as f64 / tot;
+                let flux = ux * open as f64 / tot;
+                println!(
+                    "DIAG4 (a) x {x:.2} (layer {i}): open {open}/{tot} = {frac:.4}; mean u_x over open cells {ux:.5}; section flux/area {flux:.5} lattice; max|u| in section {um:.5}; U_in/fraction (nominal inlet mean {u_in}) {:.5}; measured inlet mean (plane x 0.3) {:.5} -> /fraction {:.5}",
+                    u_in / frac,
+                    sec(i_in).3,
+                    sec(i_in).3 / frac
+                );
+            }
+            let (mut gm, mut gi) = (0.0f64, [0usize; 3]);
+            for k in 0..nz {
+                for j in 0..ny {
+                    for i in 0..nx {
+                        let c = grid.index([i, j, k]);
+                        if fluid[c] {
+                            let v = fl.velocity[c].iter().map(|v| v * v).sum::<f64>().sqrt();
+                            if v > gm {
+                                gm = v;
+                                gi = [i, j, k];
+                            }
+                        }
+                    }
+                }
+            }
+            println!("DIAG4 (a) global max|u| {gm:.5} lattice at cell {gi:?} (x {:.3} m)", dx * (gi[0] as f64 + 0.5) - ext_up);
+            println!(
+                "DIAG4 (b) section-mean density by station (x m, layer, rho-1, jet heads of that drop = 3 drop / u_ref^2 uses u_ref in the line above):"
+            );
+            let stations = [
+                ("inlet face", 0usize),
+                ("end of inlet layer (x 0)", at(0.0)),
+                ("one slot width upstream (x 0.4)", at(0.4)),
+                ("plate plane (x 0.7)", at(0.7)),
+                ("one slot width downstream (x 1.0)", at(1.0)),
+                ("start of outlet layer (x 2.0)", at(2.0)),
+                ("outlet face", nx - 1),
+            ];
+            for (name, i) in stations {
+                let (_, _, rho, _, _) = sec(i);
+                println!(
+                    "DIAG4 (b) {name:34} layer {i:4} x {:7.4} m  rho-1 {:+.5e}  p-p_out {:+.5e} lattice",
+                    dx * (i as f64 + 0.5) - ext_up,
+                    rho - 1.0,
+                    (rho - sec(nx - 1).2) / 3.0
+                );
+            }
+            for i in [0usize, 1, 2, 5, 10, at(0.0) + 3, at(0.3)] {
+                let (open, tot, rho, ux, _) = sec(i);
+                println!(
+                    "DIAG4 (b) inlet check layer {i}: open {open}/{tot}, mean u_x over open cells {ux:.5}, flux/area {:.5}, rho-1 {:+.4e}",
+                    ux * open as f64 / tot,
+                    rho - 1.0
+                );
+            }
+            for i in [0usize, 5] {
+                let row: Vec<String> = (0..nz).map(|k| format!("{:.4}", fl.velocity[grid.index([i, 0, k])][0])).collect();
+                println!("DIAG4 (b) u_x(z) at j=0, layer {i}: {}", row.join(" "));
+            }
+            for t in 0..=10 {
+                let i = at(-0.5 + 0.3 * t as f64).min(nx - 1);
+                println!("DIAG4 (b) profile x {:6.3} rho-1 {:+.5e}", dx * (i as f64 + 0.5) - ext_up, sec(i).2 - 1.0);
+            }
+            let (mut rmax, mut ri) = (0.0f64, [0usize; 3]);
+            let (mut jmax, mut ji) = (0.0f64, [0usize; 3]);
+            for k in 0..nz {
+                for j in 0..ny {
+                    for i in 0..nx {
+                        let c = grid.index([i, j, k]);
+                        if !fluid[c] {
+                            continue;
+                        }
+                        let chi = nt[c] / nu_lat;
+                        let fv1 = chi.powi(3) / (chi.powi(3) + 7.1f64.powi(3));
+                        let r = chi * fv1;
+                        if r > rmax {
+                            rmax = r;
+                            ri = [i, j, k];
+                        }
+                        // in the jet: cells downstream of the plate, 0.8 to 1.2 m
+                        let x = dx * (i as f64 + 0.5) - ext_up;
+                        if (0.8..1.2).contains(&x) && r > jmax {
+                            jmax = r;
+                            ji = [i, j, k];
+                        }
+                    }
+                }
+            }
+            let slot_w = cells; // cells
+            println!(
+                "DIAG4 (c) nu_lat {nu_lat:.3e}; backend eddy_viscosity_ratio (max nu_t/nu, last step) {:.3}; from nu_tilde: max nu_t/nu {rmax:.3} at {ri:?} (x {:.3} m); in the jet region x 0.8..1.2: max {jmax:.3} at {ji:?}; nu_t/(U_in * slot width) there = {:.4e} (U_in {u_in}, slot {slot_w} cells), molecular nu/(U_in * slot width) = {:.4e}",
+                Backend::eddy_viscosity_ratio(&cpu),
+                dx * (ri[0] as f64 + 0.5) - ext_up,
+                jmax * nu_lat / (u_in * slot_w),
+                nu_lat / (u_in * slot_w)
+            );
+        }
     }
     println!(
         "RESULT wall law {law}, layer {}, slot {cells} cells, {n} cells, inlet mean {u_in}: reached step {done} of {steps}; GPU {} CPU {}; worst max|du| {worst_u:.3e} lattice, worst max|drho| {worst_r:.3e}; GPU wall time {t_gpu:.1} s ({:.0} M cell updates/s); CPU wall time {t_cpu:.1} s ({:.1} M cell updates/s)",
