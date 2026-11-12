@@ -100,7 +100,12 @@ fn slotted_channel_stability() {
         steady: None,
     };
     let m = model(1.0, nu, d, p);
-    let setup = match Setup::new(&m, None, &obstacles, &Limits::default()) {
+    // MAX_UPDATES raises the work cap (cell updates) for the long fine-grid runs; the production default stays 1e12.
+    let mut limits = Limits::default();
+    if let Some(u) = std::env::var("MAX_UPDATES").ok().and_then(|v| v.parse::<f64>().ok()) {
+        limits.max_cell_updates = u as u64;
+    }
+    let setup = match Setup::new(&m, None, &obstacles, &limits) {
         Ok(s) => s,
         Err(e) => {
             panic!("setup refused: {e}");
