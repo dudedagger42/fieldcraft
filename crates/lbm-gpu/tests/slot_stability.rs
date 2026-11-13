@@ -79,7 +79,13 @@ fn slotted_channel_stability() {
     let half_way = env("SURFACE", 0.0) > 1.5;
     // PLATE_T (m, default 0.2): the plate's thickness in x for SURFACE=2, so L/w = PLATE_T / 0.2 (0.1 is half a slot width).
     let plate_t = env("PLATE_T", 0.2);
-    let (z_hi, x_hi) = if half_way {
+    // The half-way wall (LAW=sa_surface / spalding_surface) and the wall-free runs (LAW=none: plain bounce-back) put the walls on
+    // the cell faces, so the plate is built exactly: the slot z 0.4..0.6 m, the plate x 0.6..0.6+PLATE_T; setup prints the open
+    // cells of the slot in every plate layer and stops unless the slot is exactly SLOT_CELLS cells (0.2000 m) wall to wall.
+    let exact = slabs || law == "none";
+    let (z_hi, x_hi) = if exact {
+        (0.6, 0.6 + plate_t)
+    } else if half_way {
         (0.6 + 2.0 * dx, 0.6 + plate_t)
     } else if surface {
         (0.6 + dx, 0.6 + (cells - 1.0) * dx)
@@ -154,6 +160,32 @@ fn slotted_channel_stability() {
             .collect();
         println!("SURFACE z column through the plate (k=0..{nz}; f fluid, S solid or wall node): {col}");
         println!("SURFACE x row through the plate at z {:.3} m, x 0.5 m to 1.0 m (f fluid, S solid or wall node): {row}", (kc as f64 + 0.5) * dx);
+    }
+    if exact {
+        let g = *cpu.grid();
+        let (j, layers) = (ny / 2, (plate_t / dx).round() as usize);
+        let first = ((0.6 + ext_up) / dx).round() as usize;
+        let mut counts = Vec::new();
+        for i in first..first + layers {
+            let open = (0..nz)
+                .filter(|&k| {
+                    let z = lo + (k as f64 + 0.5) * dx;
+                    (0.3..0.7).contains(&z) && Backend::is_fluid(&cpu, g.index([i, j, k]))
+                })
+                .count();
+            counts.push(open);
+        }
+        // The two face layers may carry one more open (bulk, diagonal-to-solid) cell on each slot edge under the node rule of the
+        // half-way wall; they are printed, the interior layers must be exact.
+        let interior = if counts.len() > 2 { &counts[1..counts.len() - 1] } else { &counts[..] };
+        let width = interior.first().map_or(0.0, |&c| c as f64 * dx);
+        println!(
+            "SLOT wall-to-wall {width:.4} m; open cells across the slot in each of the {layers} plate layers (face layers first and last): {counts:?}"
+        );
+        assert!(
+            !interior.is_empty() && interior.iter().all(|&c| c as f64 == cells),
+            "the slot is not {cells} cells wall to wall in every interior plate layer: {counts:?}"
+        );
     }
     let mut gpu = if use_gpu {
         match GpuFlow::with_options(&cpu, Policy::from_env().unwrap(), Options::default()) {
