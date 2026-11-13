@@ -347,12 +347,14 @@ fn slotted_channel_stability() {
         let m = |g: &dyn Fn(&S) -> f64| w.iter().map(|s| g(s)).sum::<f64>() / w.len() as f64;
         let (um, fi, fo, dp) = (m(&|s| s.1), m(&|s| s.5), m(&|s| s.6), m(&|s| s.7));
         let rms = (w.iter().map(|s| (s.1 - um).powi(2)).sum::<f64>() / w.len() as f64).sqrt();
+        let dp_rms = (w.iter().map(|s| (s.7 - dp).powi(2)).sum::<f64>() / w.len() as f64).sqrt();
         let (r0, r1) = (w.iter().map(|s| s.2).fold(f64::INFINITY, f64::min), w.iter().map(|s| s.3).fold(0.0, f64::max));
         Some(format!(
-            "steps {lo}..{hi} ({} samples): mean out/in {:.5}, plate dp {:.5e} (lattice), K = dp/(0.5 U_in^2) {:.3}, peak u mean {um:.5} rms {rms:.5}, peak/U_in {:.4}, rho {r0:.4}..{r1:.4}",
+            "steps {lo}..{hi} ({} samples): mean out/in {:.5}, plate dp {:.5e} (lattice) rms {:.3e}, K = dp/(0.5 U_in^2) {:.3}, peak u mean {um:.5} rms {rms:.5}, peak/U_in {:.4}, rho {r0:.4}..{r1:.4}",
             w.len(),
             fo / fi,
             dp,
+            dp_rms,
             dp / (0.5 * u_in * u_in),
             um / u_in
         ))
@@ -433,6 +435,24 @@ fn slotted_channel_stability() {
                     u_in / frac,
                     sec(i_in).3,
                     sec(i_in).3 / frac
+                );
+            }
+            // DIAG5: the open cells of every x layer from x 0.5 to 1.0 m (the slot is 0.2 m = SLOT_CELLS cells across, times the
+            // span), with max u_x over mean u_x there; the open fraction must read 0.2000 in every plate layer.
+            for i in at(0.5)..=at(1.0) {
+                let (open, tot, _, ux, _) = sec(i);
+                let umax = (0..nz)
+                    .flat_map(|k| (0..ny).map(move |j| (j, k)))
+                    .filter_map(|(j, k)| {
+                        let c = grid.index([i, j, k]);
+                        fluid[c].then(|| fl.velocity[c][0])
+                    })
+                    .fold(f64::MIN, f64::max);
+                println!(
+                    "DIAG5 layer {i} x {:.4}: open {open}/{tot} = {:.4}; max u_x / mean u_x {:.3}",
+                    dx * (i as f64 + 0.5) - ext_up,
+                    open as f64 / tot,
+                    if ux.abs() > 1e-12 { umax / ux } else { 0.0 }
                 );
             }
             let (mut gm, mut gi) = (0.0f64, [0usize; 3]);
