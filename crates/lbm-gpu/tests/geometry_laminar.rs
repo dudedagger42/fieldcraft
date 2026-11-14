@@ -18,7 +18,8 @@
 //! PRINT (the sample interval in steps, 2000), NU (0.05), COLLISION (trt, the same as the half-way channel test; hrr runs sigma
 //! 0.95), TURB (smag, the half-way channel test's Smagorinsky 0.1; none), WALL (none: plain half-way bounce-back; spalding or sa:
 //! the half-way wall law of that name, with SA as the turbulence), CPU (1), GPU (1: a refused device is reported and the run
-//! goes on with the CPU).
+//! goes on with the CPU), WIDTH (CELLS: the channel's width in cells, fractions allowed, rotated channel only; the grid stays CELLS cells per metre), INTERP (0: 1 turns the obstacle walls to linearly interpolated bounce-back, CPU only; every sample then
+//! also prints the mean density of the fluid cells, and the result the drift per 10 000 steps).
 // A local harness: index loops over the grid and nested ifs read better than iterator chains here.
 #![allow(clippy::needless_range_loop, clippy::collapsible_if)]
 #[path = "../../lbm/tests/common/mod.rs"]
@@ -124,7 +125,8 @@ fn errors(p: &Probe, f: &Fields) -> Option<[f64; 5]> {
 fn drive(name: &str, cpu: fieldcraft_lbm::Flow, probe: &Probe, steps: u64, extra: &str) {
     let chunk = env("CHUNK", 500.0) as u64;
     let print_every = env("PRINT", 2000.0) as u64;
-    let (use_cpu, use_gpu) = (env("CPU", 1.0) > 0.5, env("GPU", 1.0) > 0.5);
+    let interp = env("INTERP", 0.0) > 0.5;
+    let (use_cpu, use_gpu) = (env("CPU", 1.0) > 0.5, env("GPU", 1.0) > 0.5 && !interp);
     let mut cpu = cpu;
     let mut gpu = if use_gpu {
         match Policy::from_env()
@@ -144,6 +146,12 @@ fn drive(name: &str, cpu: fieldcraft_lbm::Flow, probe: &Probe, steps: u64, extra
         None
     };
     println!("CASE {name}; {extra}; exact mean speed 0.02 lattice, peak {:.5}; steps {steps}, chunk {chunk}", probe.peak);
+    let mean_rho = |f: &Fields| {
+        let (sum, n) = f.density.iter().zip(&probe.fluid).filter(|(_, fl)| **fl).fold((0.0f64, 0usize), |(s, n), (r, _)| (s + r, n + 1));
+        sum / n.max(1) as f64
+    };
+    let rho_start = if use_cpu { Backend::fields(&mut cpu).ok().map(|f| mean_rho(&f)) } else { None };
+    let mut rho_last = rho_start;
     let (mut done, mut last_print) = (0u64, 0u64);
     let (mut last_cpu, mut last_gpu): (Option<[f64; 5]>, Option<[f64; 5]>) = (None, None);
     let (mut cpu_ok, mut gpu_ok) = (use_cpu, gpu.is_some());
@@ -166,7 +174,14 @@ fn drive(name: &str, cpu: fieldcraft_lbm::Flow, probe: &Probe, steps: u64, extra
         done += c;
         if done - last_print >= print_every || done >= steps {
             last_print = done;
-            let a = if cpu_ok { Backend::fields(&mut cpu).ok().and_then(|f| errors(probe, &f)) } else { None };
+            let a = if cpu_ok {
+                Backend::fields(&mut cpu).ok().and_then(|f| {
+                    rho_last = Some(mean_rho(&f));
+                    errors(probe, &f)
+                })
+            } else {
+                None
+            };
             let b = if gpu_ok { gpu.as_mut().and_then(|g| Backend::fields(g).ok()).and_then(|f| errors(probe, &f)) } else { None };
             last_cpu = a.or(last_cpu);
             last_gpu = b.or(last_gpu);
@@ -176,8 +191,12 @@ fn drive(name: &str, cpu: fieldcraft_lbm::Flow, probe: &Probe, steps: u64, extra
                 }
                 None => format!("{who} -"),
             };
-            println!("step {done}: {}; {}", show("cpu", a), show("gpu", b));
+            let rho = rho_last.map_or(String::new(), |r| format!("; mean rho {r:.9}"));
+            println!("step {done}: {}; {}{rho}", show("cpu", a), show("gpu", b));
         }
+    }
+    if let (Some(a), Some(b)) = (rho_start, rho_last) {
+        println!("DRIFT {name}: mean density {a:.9} -> {b:.9}, {:+.3e} per 10000 steps", (b - a) / done.max(1) as f64 * 1e4);
     }
     for (who, e) in [("cpu", last_cpu), ("gpu", last_gpu)] {
         if let Some(e) = e {
@@ -228,7 +247,15 @@ impl Build {
         }
         let m = model(1.0, 1.0, d, p);
         let setup = Setup::new(&m, None, obstacles, &Limits::default()).unwrap_or_else(|e| panic!("setup refused: {e}"));
-        let flow = fieldcraft_lbm::Flow::new(&setup, obstacles).unwrap_or_else(|e| panic!("flow refused: {e}"));
+        let mut flow = fieldcraft_lbm::Flow::new(&setup, obstacles).unwrap_or_else(|e| panic!("flow refused: {e}"));
+        let mut label = label;
+        if env("INTERP", 0.0) > 0.5 {
+            let r = flow.interpolate_walls(&setup, obstacles).unwrap_or_else(|e| panic!("interpolated walls refused: {e}"));
+            label = format!(
+                "{label}; interpolated walls: {} links, {} interpolated, {} half way, {} without a second node, {} without a surface",
+                r.links, r.interpolated, r.half_way, r.no_second_node, r.no_surface
+            );
+        }
         (setup, flow, label)
     }
 }
@@ -240,23 +267,23 @@ fn rotated_channel_laminar() {
     let (a, b) = (env("DIR_A", 2.0) as usize, env("DIR_B", 1.0) as usize);
     let phase = env("PHASE", 0.0);
     let wall_min = env("WALL_MIN", 4.0);
+    // The channel's width in cells; CELLS fixes the grid (the cell is 1/CELLS of a metre), WIDTH the walls' distance.
+    let width = env("WIDTH", h as f64);
     let steps = env("STEPS", 40.0 * (h * h) as f64) as u64;
     let g = Build::new(h);
     // The box in cells, the pitch of the wall family (the distance between neighbouring copies of a wall) and the direction.
     let (nx, ny, pitch, dir) = if b == 0 {
-        let ny = (h as f64 + wall_min).ceil() as usize;
+        let ny = (width + wall_min).ceil() as usize;
         (8usize, ny, ny as f64, [1.0, 0.0])
     } else {
         let len = ((a * a + b * b) as f64).sqrt();
         let mut m = 1usize;
-        while ((a * b * m) as f64 / len) < h as f64 + wall_min {
+        while ((a * b * m) as f64 / len) < width + wall_min {
             m += 1;
         }
         (a * m, b * m, (a * b * m) as f64 / len, [a as f64 / len, b as f64 / len])
     };
     let nz = 4usize;
-    // WIDTH (cells, default CELLS): the channel's width, which may lie between whole cells; the grid stays CELLS.
-    let width = env("WIDTH", h as f64);
     let (dx, ho) = (g.dx, width * g.dx);
     let n = [-dir[1], dir[0]];
     let (lx, ly, lz) = (nx as f64 * dx, ny as f64 * dx, nz as f64 * dx);
@@ -316,7 +343,7 @@ fn rotated_channel_laminar() {
     };
     let angle = dir[1].atan2(dir[0]).to_degrees();
     let extra = format!(
-        "rotated channel {h} cells wide at {angle:.2} degrees (direction {a}:{b}); box {nx}x{ny}x{nz} cells; wall pitch {pitch:.3} cells, wall thickness {:.3} cells; {} wall copies; phase {phase}; {} fluid cells, their distance from the plane's start {:.3} to {:.3} cells; {label}; setup steps {}",
+        "rotated channel {width} cells wide at {angle:.2} degrees (direction {a}:{b}); box {nx}x{ny}x{nz} cells; wall pitch {pitch:.3} cells, wall thickness {:.3} cells; {} wall copies; phase {phase}; {} fluid cells, their distance from the plane's start {:.3} to {:.3} cells; {label}; setup steps {}",
         pitch - hh,
         obstacles.len(),
         spans.2,
