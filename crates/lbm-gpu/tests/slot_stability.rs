@@ -526,6 +526,32 @@ fn slotted_channel_stability() {
                 dp_end / (0.5 * gm * gm),
                 sec(at(0.7)).0 as f64 / sec(at(0.7)).1
             );
+            // DIAG4 (g): the loss metric for every arm: the area-mean total pressure p + rho |u|^2 / 2 (lattice, p = (rho - 1) / 3,
+            // mean over the fluid cells of the section) at x 0.4, less the same at the downstream plane, over 0.5 u_nom^2.
+            {
+                let p_tot = |i: usize| -> f64 {
+                    let (mut n, mut s) = (0usize, 0.0);
+                    for k in 0..nz {
+                        for j in 0..ny {
+                            let c = grid.index([i, j, k]);
+                            if fluid[c] {
+                                let v2: f64 = fl.velocity[c].iter().map(|v| v * v).sum();
+                                s += (fl.density[c] - 1.0) / 3.0 + 0.5 * fl.density[c] * v2;
+                                n += 1;
+                            }
+                        }
+                    }
+                    s / n.max(1) as f64
+                };
+                let up = p_tot(at(0.4));
+                for x in [1.0, 1.5, 2.0] {
+                    let dn = p_tot(at(x));
+                    println!(
+                        "DIAG4 (g) K_pt = (area-mean total pressure x 0.4 - x {x:.1}) / (0.5 u_nom^2) = {:.3} (p_t up {up:.5e}, down {dn:.5e} lattice, u_nom {u_nom:.5})",
+                        (up - dn) / (0.5 * u_nom * u_nom)
+                    );
+                }
+            }
             {
                 let i = at(0.7);
                 let (open, tot, _, _, _) = sec(i);
