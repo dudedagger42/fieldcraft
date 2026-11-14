@@ -702,6 +702,8 @@ struct SaState {
 #[derive(Debug, Clone)]
 struct DdesState {
     c_des: f64,
+    /// The cells DDES acts in ([`crate::ddes::zone_mask`]); none: every cell. Outside it d̃ = d.
+    zone: Option<Vec<bool>>,
     length: Vec<f64>,
     stats: crate::ddes::DdesStats,
 }
@@ -1670,7 +1672,13 @@ impl Flow {
                 let law = if on_node { Some(node_law) } else { (setup.wall_model == Some(WallModel::Musker)).then_some(crate::sa::WallLaw::Musker) };
 
                 let ddes = match sa.c_des {
-                    Some(c_des) => Some(DdesState { c_des, length: filled(n, 0.0, "DDES lengths")?, stats: crate::ddes::DdesStats::default() }),
+                    Some(c_des) => {
+                        let zone = match sa.zone {
+                            Some((min, max)) => Some(crate::ddes::zone_mask(&grid, min, max)?),
+                            None => None,
+                        };
+                        Some(DdesState { c_des, zone, length: filled(n, 0.0, "DDES lengths")?, stats: crate::ddes::DdesStats::default() })
+                    }
                     None => None,
                 };
                 Some(SaState { field, distance, vorticity: filled(n, 0.0, "vorticities")?, law, wall: Vec::new(), ddes, substeps: None, model: true })
@@ -2869,7 +2877,10 @@ impl Flow {
         let c_des = sa.ddes.as_ref().map(|d| d.c_des);
         // Per block: its vorticities, its lengths (empty without DDES), its fluid and LES cell
         // counts and its largest f_d.
-        let lengths: &mut [f64] = sa.ddes.as_mut().map_or(&mut [], |d| d.length.as_mut_slice());
+        let (zone, lengths): (Option<&[bool]>, &mut [f64]) = match sa.ddes.as_mut() {
+            Some(d) => (d.zone.as_deref(), d.length.as_mut_slice()),
+            None => (None, &mut []),
+        };
         let mut length_blocks = lengths.chunks_mut(block);
         let mut parts: Vec<(&mut [f64], &mut [f64], [usize; 2], f64)> =
             sa.vorticity.chunks_mut(block).map(|w| (w, length_blocks.next().unwrap_or(&mut []), [0; 2], 0.0)).collect();
@@ -2887,7 +2898,9 @@ impl Flow {
                 *w = crate::sa::vorticity(&g);
                 if let (Some(c_des), Some(l)) = (c_des, length.get_mut(i)) {
                     let d = distance.get(cell).copied().unwrap_or(0.0);
-                    let (dt, f) = crate::ddes::cell(nu + field.nu_t(cell, nu), &g, d, 1.0, c_des);
+                    // Outside the zone: RANS exactly, d̃ = d.
+                    let in_zone = zone.is_none_or(|z| z.get(cell).copied().unwrap_or(false));
+                    let (dt, f) = if in_zone { crate::ddes::cell(nu + field.nu_t(cell, nu), &g, d, 1.0, c_des) } else { (d, 0.0) };
                     *l = dt;
                     counts[0] += 1;
                     counts[1] += usize::from(f > 0.5);

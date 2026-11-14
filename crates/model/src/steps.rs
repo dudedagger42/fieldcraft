@@ -290,6 +290,19 @@ pub struct Ddes {
     /// C_DES, 0.65 by default (the paper's value for homogeneous turbulence).
     #[serde(default = "default_c_des")]
     pub c_des: f64,
+    /// Where DDES acts: the box (in the domain's own coordinates, metres) inside which the length
+    /// is `d̃`; everywhere else, and with a box that holds no cell centre, the model is RANS
+    /// exactly (`d̃ = d`). None (the default): the whole domain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zone: Option<DdesZone>,
+}
+
+/// The box of the domain where [`Ddes`] may switch to its subgrid length.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DdesZone {
+    pub min: [f64; 3],
+    pub max: [f64; 3],
 }
 
 impl Turbulence {

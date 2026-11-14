@@ -19,7 +19,7 @@ use fieldcraft_model::{Collision, Ddes, FaceCondition, Procedure, Turbulence};
 
 /// Spalart–Allmaras at inflow ν̃/ν 3, with DDES at `c_des` or without it.
 fn sa(c_des: Option<f64>) -> Turbulence {
-    Turbulence::SpalartAllmaras { prandtl: 0.9, wall_model: None, inflow_ratio: 3.0, ddes: c_des.map(|c_des| Ddes { c_des }) }
+    Turbulence::SpalartAllmaras { prandtl: 0.9, wall_model: None, inflow_ratio: 3.0, ddes: c_des.map(|c_des| Ddes { c_des, zone: None }) }
 }
 
 /// `p` with turbulence model `t`.
@@ -113,6 +113,69 @@ fn ddes_lengths_stay_between_the_les_and_the_rans_length_in_a_forced_channel() {
         );
         assert!(ratio > 0.0 && ratio.is_finite(), "{ratio}");
         assert!((0.0..=1.0).contains(&stats.les_fraction) && (0.0..=1.0).contains(&stats.max_f_d), "{stats:?}");
+    }
+}
+
+/// Spalart–Allmaras with DDES at C_DES 0.65 acting only in the box `zone` (none: everywhere).
+fn sa_zone(zone: Option<([f64; 3], [f64; 3])>) -> Turbulence {
+    let zone = zone.map(|(min, max)| fieldcraft_model::DdesZone { min, max });
+    Turbulence::SpalartAllmaras { prandtl: 0.9, wall_model: None, inflow_ratio: 3.0, ddes: Some(Ddes { c_des: 0.65, zone }) }
+}
+
+/// ν̃ and every cell's density and velocity, as bits.
+fn bits(f: &fieldcraft_lbm::Flow) -> (Vec<u64>, Vec<Option<(u64, [u64; 3])>>) {
+    let nu = f.spalart_allmaras().unwrap().nu_tilde().iter().map(|v| v.to_bits()).collect();
+    let state = (0..f.grid().len()).map(|c| f.moments(c).map(|(r, u)| (r.to_bits(), u.map(f64::to_bits)))).collect();
+    (nu, state)
+}
+
+/// A DDES zone that holds no cell centre (a box thinner than a cell, or outside the domain) leaves
+/// the Reynolds-averaged model exactly: the same ν̃, densities and velocities bit for bit as
+/// without DDES, in a forced channel where the unzoned DDES does shorten lengths; a zone that
+/// covers the domain is the unzoned DDES bit for bit; and outside a partial zone d̃ = d.
+#[test]
+fn an_empty_ddes_zone_is_the_rans_model_bit_for_bit_and_a_full_zone_is_plain_ddes() {
+    let run = |t: Turbulence| {
+        let (setup, mut flow) = prepare(&forced_channel(Collision::Trt, t), &[]);
+        run_all(&setup, &mut flow);
+        flow
+    };
+    let rans = run(sa(None));
+    let plain = run(sa_zone(None));
+    let d = plain.sa_wall_distance().unwrap();
+    let shortened = plain.ddes_length().unwrap().iter().zip(d).filter(|(l, d)| l < d).count();
+    println!("forced channel: plain DDES shortens {shortened} cells");
+    assert!(shortened > 0, "the case must exercise DDES");
+    assert_ne!(bits(&rans), bits(&plain), "unzoned DDES must differ from RANS here");
+    // Empty: a box between two cell centres, and one far outside the domain.
+    for zone in [([0.0, 0.01, 0.0], [1.0, 0.02, 1.0]), ([10.0; 3], [11.0; 3])] {
+        let empty = run(sa_zone(Some(zone)));
+        assert_eq!(bits(&rans), bits(&empty), "empty zone {zone:?}");
+        let stats = empty.ddes().unwrap();
+        assert_eq!(stats.les_fraction, 0.0);
+        assert_eq!(stats.max_f_d, 0.0);
+    }
+    // Everything.
+    let full = run(sa_zone(Some(([-1.0; 3], [10.0; 3]))));
+    assert_eq!(bits(&plain), bits(&full), "zone over the domain");
+    // The upper half: d̃ = d in the lower half.
+    let half = run(sa_zone(Some(([-1.0, 1.0, -1.0], [10.0, 3.0, 10.0]))));
+    let (d, length) = (half.sa_wall_distance().unwrap(), half.ddes_length().unwrap());
+    let h = half.grid();
+    for c in 0..h.len() {
+        if half.moments(c).is_some() && h.coords(c)[1] < 6 {
+            assert_eq!(length[c].to_bits(), d[c].to_bits(), "cell {c} below the zone");
+        }
+    }
+}
+
+/// A zone with a not-finite corner, or a corner above its opposite, is refused.
+#[test]
+fn a_ddes_zone_with_bad_corners_is_refused() {
+    for zone in [([f64::NAN, 0.0, 0.0], [1.0; 3]), ([0.0; 3], [f64::INFINITY, 1.0, 1.0]), ([1.0, 0.0, 0.0], [0.0, 1.0, 1.0])] {
+        let m = forced_channel(Collision::Trt, sa_zone(Some(zone)));
+        let e = fieldcraft_lbm::Setup::new(&m, None, &[], &Limits::default());
+        assert!(e.is_err(), "{zone:?}");
     }
 }
 

@@ -2000,7 +2000,7 @@ pub(crate) mod tests {
             prandtl,
             wall_model: None,
             inflow_ratio,
-            ddes: c_des.map(|c_des| Ddes { c_des }),
+            ddes: c_des.map(|c_des| Ddes { c_des, zone: None }),
         };
         let mut cases = Vec::new();
         for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0, 0.0, 1e300] {

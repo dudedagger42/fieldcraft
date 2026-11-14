@@ -110,6 +110,30 @@ pub fn cell(nu_total: f64, gradient: &[[f64; 3]; 3], d: f64, delta: f64, c_des: 
     (length(d, delta, f, c_des), f)
 }
 
+/// The cells DDES acts in: those whose centres lie in the box `[min, max]` (metres), by the same
+/// rule as a porous zone's cells; a box with no cell centre gives no cell, and DDES is then RANS
+/// everywhere. Refused for a grid with more cells than can be addressed.
+pub fn zone_mask(grid: &Grid, min: [f64; 3], max: [f64; 3]) -> Result<Vec<bool>> {
+    let [nx, ny, nz] = grid.cells;
+    let n =
+        nx.checked_mul(ny).and_then(|v| v.checked_mul(nz)).ok_or_else(|| Error::Limit(format!("{nx} × {ny} × {nz} cells cannot be addressed")))?;
+    let mut mask = Vec::new();
+    mask.try_reserve_exact(n).map_err(|_| Error::Limit(format!("no memory for {n} DDES zone flags")))?;
+    mask.resize(n, false);
+    if let Some((lo, hi)) = crate::setup::cell_range(grid, min, max) {
+        for z in lo[2]..=hi[2] {
+            for y in lo[1]..=hi[1] {
+                for x in lo[0]..=hi[0] {
+                    if let Some(m) = mask.get_mut(x + nx * (y + ny * z)) {
+                        *m = true;
+                    }
+                }
+            }
+        }
+    }
+    Ok(mask)
+}
+
 /// The cells of one parallel task of [`length_field`]: fixed, so the result does not depend on the
 /// number of threads.
 const BLOCK: usize = 4096;

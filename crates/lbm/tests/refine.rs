@@ -468,8 +468,12 @@ fn sa_model(d: FluidDomain, ddes: Option<f64>) -> Model {
     let dx: f64 = 0.05;
     let dt: f64 = 0.05 * dx / 0.1;
     let nu = 0.1 / 3.0 * dx * dx / dt;
-    let sa =
-        Turbulence::SpalartAllmaras { prandtl: 0.9, wall_model: None, inflow_ratio: 3.0, ddes: ddes.map(|c_des| fieldcraft_model::Ddes { c_des }) };
+    let sa = Turbulence::SpalartAllmaras {
+        prandtl: 0.9,
+        wall_model: None,
+        inflow_ratio: 3.0,
+        ddes: ddes.map(|c_des| fieldcraft_model::Ddes { c_des, zone: None }),
+    };
     model(1.0, nu, d, procedure(Collision::Hrr, Some(sa)))
 }
 

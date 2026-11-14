@@ -52,7 +52,8 @@ const WALL_DISTANCE: u64 = F64 + 4;
 /// ν̃, faces, mask and scratch), wall distance and vorticity, and the distance transform's working
 /// memory (three passes of f64, counted throughout to stay on the safe side).
 const SPALART_ALLMARAS: u64 = crate::sa::BYTES_PER_CELL + 2 * F64 + 3 * F64;
-/// Per cell with DDES on the Spalart–Allmaras model: its length d̃ ([`crate::ddes`]).
+/// Per cell with DDES on the Spalart–Allmaras model: its length d̃ ([`crate::ddes`]). A zone adds one byte
+/// per cell, which the estimate leaves out (it is below its rounding).
 const DDES: u64 = F64;
 /// Per absorbing-layer cell ([`crate::absorbing`]): its index, strength, filtered density and
 /// momentum, and its damped populations before they are stored.

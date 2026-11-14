@@ -432,6 +432,9 @@ pub struct SaSetup {
     pub inflow_ratio: f64,
     /// With DDES ([`crate::ddes`]): its C_DES; the destruction term then reads each cell's d̃.
     pub c_des: Option<f64>,
+    /// With DDES: the box (metres, the grid's frame) it acts in; `None`: everywhere. Cells outside
+    /// it, or every cell when the box holds no cell centre, keep the wall distance (RANS exactly).
+    pub zone: Option<([f64; 3], [f64; 3])>,
 }
 
 /// What a zone of the domain does, in lattice units.
@@ -468,7 +471,7 @@ impl ZoneSetup {
 }
 
 /// The cells whose centres lie in `[min, max]`, per axis `lo..=hi`, or `None` when there are none.
-fn cell_range(grid: &Grid, min: [f64; 3], max: [f64; 3]) -> Option<([usize; 3], [usize; 3])> {
+pub(crate) fn cell_range(grid: &Grid, min: [f64; 3], max: [f64; 3]) -> Option<([usize; 3], [usize; 3])> {
     const TOL: f64 = 1e-9; // unit-factors: a fraction of a cell
     let (mut lo, mut hi) = ([0usize; 3], [0usize; 3]);
     for a in 0..3 {
@@ -739,7 +742,17 @@ impl Setup {
                                 C_DES.end()
                             )));
                         }
-                        (0.0, 0.0, Some(SaSetup { inflow_ratio, c_des: ddes.map(|d| d.c_des) }), prandtl, None, t.wall_model())
+                        let zone = ddes.and_then(|d| d.zone);
+                        if let Some(z) =
+                            zone.filter(|z| !(z.min.iter().chain(&z.max).all(|v| v.is_finite()) && z.min.iter().zip(&z.max).all(|(a, b)| a <= b)))
+                        {
+                            return Err(Error::Invalid(format!(
+                                "DDES's zone {:?} to {:?} must have finite corners with min ≤ max on every axis",
+                                z.min, z.max
+                            )));
+                        }
+                        let zone = zone.map(|z| (z.min, z.max));
+                        (0.0, 0.0, Some(SaSetup { inflow_ratio, c_des: ddes.map(|d| d.c_des), zone }), prandtl, None, t.wall_model())
                     }
                 }
             }

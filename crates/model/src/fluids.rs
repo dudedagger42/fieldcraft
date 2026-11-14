@@ -1725,7 +1725,7 @@ mod tests {
                 prandtl: 0.9,
                 wall_model: Some(crate::WallModel::Musker),
                 inflow_ratio: 5.0,
-                ddes: Some(crate::Ddes { c_des: 0.65 })
+                ddes: Some(crate::Ddes { c_des: 0.65, zone: None })
             }
         );
         for t in [sa, ddes] {

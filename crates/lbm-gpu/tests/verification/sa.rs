@@ -19,7 +19,7 @@ fn sa(ratio: f64, wall_model: Option<WallModel>) -> Turbulence {
 
 /// The model with DDES (C_DES 0.65) and inflow ν̃/ν 3.
 fn ddes() -> Turbulence {
-    Turbulence::SpalartAllmaras { prandtl: 0.9, wall_model: None, inflow_ratio: 3.0, ddes: Some(fieldcraft_model::Ddes { c_des: 0.65 }) }
+    Turbulence::SpalartAllmaras { prandtl: 0.9, wall_model: None, inflow_ratio: 3.0, ddes: Some(fieldcraft_model::Ddes { c_des: 0.65, zone: None }) }
 }
 
 /// `p` with turbulence model `t`.

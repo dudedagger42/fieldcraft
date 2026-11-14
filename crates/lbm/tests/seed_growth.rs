@@ -52,7 +52,7 @@ fn setup_of(ulat: f64, tau_half: f64, steps: u64) -> Option<(Setup, Vec<fieldcra
     ];
     let inflow_ratio = word("STUDY_INFLOW", "3").parse().unwrap_or(3.0);
     let sa = match word("STUDY_MODEL", "sa").as_str() {
-        "sa_ddes" => Turbulence::SpalartAllmaras { prandtl: 0.9, wall_model: None, inflow_ratio, ddes: Some(Ddes { c_des: 0.65 }) },
+        "sa_ddes" => Turbulence::SpalartAllmaras { prandtl: 0.9, wall_model: None, inflow_ratio, ddes: Some(Ddes { c_des: 0.65, zone: None }) },
         "vreman" => Turbulence::Vreman { constant: 0.18, prandtl: 0.9, wall_model: None },
         // A model the setup accepts at τ − ½ below 5e-3 (it refuses a plain flow there) that adds no viscosity worth the name: ν_t/ν about 1e-7.
         "off" => Turbulence::Smagorinsky { constant: 1e-4, prandtl: 0.9, van_driest: None, wall_model: None },
