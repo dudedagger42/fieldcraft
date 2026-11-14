@@ -31,7 +31,10 @@ fn var(name: &str, default: f64) -> f64 {
 /// the domain's edge (y = z = 0, symmetry faces), pressure outlets at 4 D radius.
 fn jet(n: f64, re: f64, h: f64, layer: bool) -> (fieldcraft_model::Model, Vec<Obstacle>) {
     let (pipe_len, width, wall) = (2.0, 4.0, 0.05);
-    let mut d = domain([0.0; 3], [pipe_len + h, width, width], 1.0 / n);
+    // The half-way wall laws take obstacle walls only: the plate is then a slab two cells thick past the plate's plane (the wall
+    // stays at x = pipe_len + h, as the box face puts it for the on-node laws) and the box ends inside the slab.
+    let slab = if study_wall_law().1.ends_with("_surface") { 2.0 / n } else { 0.0 };
+    let mut d = domain([0.0; 3], [pipe_len + h + slab, width, width], 1.0 / n);
     d.faces.x_min = FaceCondition::Velocity { velocity: [1.0, 0.0, 0.0], profile: Profile::Radial };
     d.faces.x_max = FaceCondition::Wall {};
     d.faces.y_min = FaceCondition::Slip {};
@@ -47,6 +50,11 @@ fn jet(n: f64, re: f64, h: f64, layer: bool) -> (fieldcraft_model::Model, Vec<Ob
     let flange = obstacle("Flange", tube(0.0, 2.0 / n, [0.0, 0.0], 0.5, 8.0, 128), &["inner", "outer", "start", "end"]);
     let pipe = obstacle("Pipe", tube(0.0, pipe_len, [0.0, 0.0], 0.5, 0.5 + wall, 128), &["inner", "outer", "start", "end"]);
     d.obstacles = vec!["Flange".into(), "Pipe".into()];
+    let mut obstacles = vec![flange, pipe];
+    if slab > 0.0 {
+        d.obstacles.push("Plate".into());
+        obstacles.push(obstacle("Plate", cuboid([pipe_len + h, -1.0, -1.0], [pipe_len + h + slab + 1.0, width + 1.0, width + 1.0]), &CUBOID_FACES));
+    }
     let dt = 0.08 / n; // the bulk velocity is 0.08 lattice units
     let steps = var("FIELDCRAFT_JET_STEPS", 20000.0);
     let p = Procedure::Fluid {
@@ -61,7 +69,7 @@ fn jet(n: f64, re: f64, h: f64, layer: bool) -> (fieldcraft_model::Model, Vec<Ob
         turbulence: Some(Turbulence::SpalartAllmaras { prandtl: 0.9, wall_model: Some(study_wall_law().0), inflow_ratio: 3.0, ddes: None }),
         steady: None,
     };
-    (model(1.0, 1.0 / re, d, p), vec![flange, pipe])
+    (model(1.0, 1.0 / re, d, p), obstacles)
 }
 
 #[test]
@@ -255,7 +263,9 @@ fn wall_jet_peaks(flow: &fieldcraft_lbm::Flow, n: f64, bulk: f64) -> Vec<(f64, f
             }
         }
     }
-    let length = grid.centre(grid.index([nx.saturating_sub(1), 0, 0]))[0] + 0.5 / n;
+    // The plate's plane: the box's end, or the start of the two-cell slab the half-way laws put there.
+    let slab = if study_wall_law().1.ends_with("_surface") { 2.0 / n } else { 0.0 };
+    let length = grid.centre(grid.index([nx.saturating_sub(1), 0, 0]))[0] + 0.5 / n - slab;
     acc.iter()
         .map(|layers| {
             layers
