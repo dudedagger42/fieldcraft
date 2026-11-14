@@ -255,7 +255,9 @@ fn rotated_channel_laminar() {
         (a * m, b * m, (a * b * m) as f64 / len, [a as f64 / len, b as f64 / len])
     };
     let nz = 4usize;
-    let (dx, ho) = (g.dx, h as f64 * g.dx);
+    // WIDTH (cells, default CELLS): the channel's width, which may lie between whole cells; the grid stays CELLS.
+    let width = env("WIDTH", h as f64);
+    let (dx, ho) = (g.dx, width * g.dx);
     let n = [-dir[1], dir[0]];
     let (lx, ly, lz) = (nx as f64 * dx, ny as f64 * dx, nz as f64 * dx);
     let p = pitch * dx;
@@ -285,7 +287,7 @@ fn rotated_channel_laminar() {
     // The channel's length in the box: one diagonal for a turned channel, the box length for the control.
     let along_cells = if b == 0 { nx as f64 } else { ((nx * nx + ny * ny) as f64).sqrt() };
     // The exact velocity at each fluid cell from its distance to the wall plane (s in cells, measured from the plane's start).
-    let hh = h as f64;
+    let hh = width;
     let g_lat = 12.0 * g.nu_lat * 0.02 / (hh * hh);
     let mut exact = vec![0.0; gx * gy * gz];
     let mut spans = (f64::INFINITY, f64::NEG_INFINITY, 0usize);
