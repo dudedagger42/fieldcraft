@@ -83,8 +83,12 @@ fn slotted_channel_stability() {
     // the cell faces, so the plate is built exactly: the slot z 0.4..0.6 m, the plate x 0.6..0.6+PLATE_T; setup prints the open
     // cells of the slot in every plate layer and stops unless the slot is exactly SLOT_CELLS cells (0.2000 m) wall to wall.
     let exact = slabs || law == "none";
+    // SLOT_W (cells, default SLOT_CELLS): the slot's width between whole cells, the grid staying SLOT_CELLS: the lower plate keeps
+    // z 0.4 and the upper one starts at 0.4 + SLOT_W dx. The open-cell count is then printed, not asserted.
+    let slot_w = env("SLOT_W", cells);
+    let swept = std::env::var("SLOT_W").is_ok();
     let (z_hi, x_hi) = if exact {
-        (0.6, 0.6 + plate_t)
+        (0.4 + slot_w * dx, 0.6 + plate_t)
     } else if half_way {
         (0.6 + 2.0 * dx, 0.6 + plate_t)
     } else if surface {
@@ -183,7 +187,7 @@ fn slotted_channel_stability() {
             "SLOT wall-to-wall {width:.4} m; open cells across the slot in each of the {layers} plate layers (face layers first and last): {counts:?}"
         );
         assert!(
-            !interior.is_empty() && interior.iter().all(|&c| c as f64 == cells),
+            swept || (!interior.is_empty() && interior.iter().all(|&c| c as f64 == cells)),
             "the slot is not {cells} cells wall to wall in every interior plate layer: {counts:?}"
         );
     }
@@ -549,6 +553,16 @@ fn slotted_channel_stability() {
                     println!(
                         "DIAG4 (g) K_pt = (area-mean total pressure x 0.4 - x {x:.1}) / (0.5 u_nom^2) = {:.3} (p_t up {up:.5e}, down {dn:.5e} lattice, u_nom {u_nom:.5})",
                         (up - dn) / (0.5 * u_nom * u_nom)
+                    );
+                }
+                if swept {
+                    // K_pt on the slot's geometric width SLOT_W dx (not the nominal 0.2 m): the sub-cell design-change test.
+                    let u_w = flow_per_area / (slot_w * dx);
+                    let dn = p_tot(at(2.0));
+                    println!(
+                        "DIAG4 (h) SLOT_W {slot_w} cells: K_pt(x 2.0) on the geometric width {:.3}; K_slot on it {:.3}; u_w {u_w:.5}",
+                        (up - dn) / (0.5 * u_w * u_w),
+                        dp_end / (0.5 * u_w * u_w)
                     );
                 }
             }
