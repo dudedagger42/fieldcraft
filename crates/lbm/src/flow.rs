@@ -672,6 +672,8 @@ pub struct Flow {
     absorbing: crate::absorbing::Layer,
     /// The free surface: which fluid cells hold liquid, with a free surface.
     pub(crate) surface: Option<Surface>,
+    /// Linearly interpolated bounce-back on obstacle walls ([`crate::interpolated`]).
+    interpolated: Option<crate::interpolated::Interpolated>,
 }
 
 pub(crate) const NONE: u32 = u32::MAX;
@@ -1779,6 +1781,7 @@ impl Flow {
             open_scratch: Vec::new(),
             absorbing,
             surface,
+            interpolated: None,
         };
         flow.outlets = Outlets::new(&flow.open, &View { flow: &flow, f: &flow.f });
         if let Some(s) = &mut flow.surface {
@@ -2036,6 +2039,105 @@ impl Flow {
             }
         }
         Ok(bytes)
+    }
+
+    /// Switch the obstacle walls at rest to linearly interpolated bounce-back ([`crate::interpolated`]):
+    /// each bounce-back link into an obstacle takes the fraction `q` of the link at which the
+    /// obstacle's surface cuts it. Call once, on a fresh flow, with the setup and obstacles it was
+    /// built from. Refused with a wall model, heat, a free surface or a moving obstacle wall.
+    pub fn interpolate_walls(&mut self, setup: &Setup, obstacles: &[Obstacle]) -> Result<crate::interpolated::InterpolationReport> {
+        use crate::interpolated::{Entry, Interpolated, InterpolationReport};
+        if self.interpolated.is_some() {
+            return Err(Error::Invalid("the walls are already interpolated".into()));
+        }
+        if self.nodes.is_some() || self.wall_model || self.wall_bounce || self.thermal.is_some() || self.surface.is_some() {
+            return Err(Error::Invalid(
+                "not supported yet: interpolated walls with a wall model, heat transfer or a free surface; use the plain half-way wall".into(),
+            ));
+        }
+        // The first force group of each obstacle (the six box faces come first).
+        let mut bases = Vec::with_capacity(setup.obstacles.len());
+        let mut next = BoxFace::ALL.len() as u32;
+        for faces in &setup.obstacles {
+            bases.push((next, faces.names.len() as u32, faces.index));
+            next += faces.names.len() as u32;
+        }
+        let mut trees: Vec<Option<TriangleTree>> = bases.iter().map(|_| None).collect();
+        let (h, dims) = (self.grid.spacing, self.grid.cells.map(|v| v as i64));
+        let mut report = InterpolationReport::default();
+        let mut entries = Vec::new();
+        for (index, link) in self.links.iter().enumerate() {
+            let Rule::Bounce { group, du } = link.rule else { continue };
+            let Some(k) = bases.iter().position(|(first, len, _)| group >= *first && group < first + len) else { continue };
+            if du != 0.0 {
+                return Err(Error::Invalid("not supported yet: interpolated walls on a moving obstacle face".into()));
+            }
+            report.links += 1;
+            let (cell, q) = (link.cell as usize, usize::from(link.q));
+            let Some(&(_, _, body)) = bases.get(k) else { continue };
+            let Some(o) = obstacles.get(body) else { continue };
+            let tree = match trees.get_mut(k) {
+                Some(slot) => slot.get_or_insert_with(|| TriangleTree::new(&o.surface)),
+                None => continue,
+            };
+            // From the fluid cell's centre to the solid one it pulls from, `c_q` reversed.
+            let (p0, cq) = (self.grid.centre(cell), c(q));
+            let mut p1 = [0, 1, 2].map(|a| p0[a] - cq[a] * h);
+            // A solid cell across a periodic face: the surface lies on its own side, so the whole
+            // segment is shifted by a box length to put the solid end inside the box.
+            let mut p0 = p0;
+            for a in 0..3 {
+                let length = self.grid.cells[a] as f64 * h;
+                let shift = if p1[a] < self.grid.origin[a] {
+                    length
+                } else if p1[a] > self.grid.origin[a] + length {
+                    -length
+                } else {
+                    0.0
+                };
+                if self.periodic[a] && shift != 0.0 {
+                    p0[a] += shift;
+                    p1[a] += shift;
+                }
+            }
+            let Some(t) = tree.first_hit(p0, p1) else {
+                report.no_surface += 1;
+                continue;
+            };
+            if (t - 0.5).abs() < 1e-9 {
+                report.half_way += 1;
+                continue;
+            }
+            let mut behind = u32::MAX;
+            if t < 0.5 {
+                let ijk = self.grid.coords(cell);
+                let mut at = [0i64; 3];
+                let mut ok = true;
+                for a in 0..3 {
+                    let mut v = ijk[a] as i64 + i64::from(C[q][a]);
+                    if v < 0 || v >= dims[a] {
+                        if self.periodic[a] {
+                            v = v.rem_euclid(dims[a]);
+                        } else {
+                            ok = false;
+                        }
+                    }
+                    at[a] = v;
+                }
+                let idx = ok.then(|| self.grid.index([at[0] as usize, at[1] as usize, at[2] as usize]));
+                match idx {
+                    Some(b) if self.fluid.get(b).copied().unwrap_or(false) => behind = b as u32,
+                    _ => {
+                        report.no_second_node += 1;
+                        continue;
+                    }
+                }
+            }
+            report.interpolated += 1;
+            entries.push(Entry { link: index as u32, cell: link.cell, dir: link.q, wall: t, behind });
+        }
+        self.interpolated = Some(Interpolated { entries, report });
+        Ok(report)
     }
 
     pub fn grid(&self) -> &Grid {
@@ -3319,6 +3421,16 @@ impl Flow {
                 }
             }
         });
+        // Interpolated links: the populations from the wall replace the half-way ones.
+        if let Some(ip) = &self.interpolated {
+            for e in ip.entries() {
+                if let Some(v) = crate::interpolated::Interpolated::incoming(e, &self.f, s)
+                    && let Some(x) = self.g.get_mut(usize::from(e.dir) * s + e.cell as usize)
+                {
+                    *x = v;
+                }
+            }
+        }
         self.forces.fill([0.0; 3]);
         for link in &self.links {
             let (cell, q) = (link.cell as usize, link.q as usize);
@@ -3345,6 +3457,21 @@ impl Flow {
                     }
                 }
                 Rule::Pull { .. } | Rule::Open => {}
+            }
+        }
+        // An interpolated link returns another population than the half-way one counted above.
+        if let Some(ip) = &self.interpolated {
+            for e in ip.entries() {
+                let (cell, q) = (e.cell as usize, usize::from(e.dir));
+                if let (Some(v), Some(link)) = (crate::interpolated::Interpolated::incoming(e, &self.f, s), self.links.get(e.link as usize))
+                    && let Rule::Bounce { group, .. } = link.rule
+                    && let Some(force) = self.forces.get_mut(group as usize)
+                {
+                    let (cq, out) = (c(q), self.f[opposite(q) * s + cell]);
+                    for a in 0..3 {
+                        force[a] -= cq[a] * (v - out);
+                    }
+                }
             }
         }
         // The on-node wall-function bounce's share: the momentum each boundary node took from the
@@ -3581,6 +3708,9 @@ fn thermal_rule(g: &[f64], s: usize, groups: &[ThermalCondition], cell: usize, q
 
 impl crate::backend::Backend for Flow {
     fn checkpoint(&mut self, a: &mut dyn crate::checkpoint::Archive) -> Result<()> {
+        if self.interpolated.is_some() {
+            return Err(Error::Invalid("not supported yet: checkpoint of a flow with interpolated walls".into()));
+        }
         use crate::checkpoint::{boolean, doubles, f64, fixed, u64, vectors};
         // Streaming targets are allocated once, not cloned into a separate snapshot.
         self.targets()?;
@@ -3644,6 +3774,7 @@ impl crate::backend::Backend for Flow {
             open_scratch: _,
             absorbing,
             surface,
+            interpolated: _,
         } = self;
         let n = *n;
         fixed(a, n as u64)?;

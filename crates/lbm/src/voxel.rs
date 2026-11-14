@@ -236,6 +236,10 @@ fn sub(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
     [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
 }
 
+fn cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
+}
+
 fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
@@ -334,6 +338,77 @@ impl TriangleTree {
         TriangleTree { triangles, order, nodes }
     }
 
+    /// Where the segment from `a` to `b` first meets the surface: the fraction `t` in `[0, 1]` of its
+    /// length (`None`: it meets nothing). Triangles are tested double-sided with the
+    /// Moller-Trumbore ray test (Moller and Trumbore, "Fast, minimum storage ray-triangle
+    /// intersection", J. Graphics Tools 2(1), 1997), a hair of tolerance on the edges so that
+    /// the seam between two triangles does not let a segment through; a segment lying in a
+    /// triangle's plane meets nothing there.
+    pub fn first_hit(&self, a: [f64; 3], b: [f64; 3]) -> Option<f64> {
+        const EDGE: f64 = 1e-12;
+        let d = sub(b, a);
+        let mut best: Option<f64> = None;
+        let mut stack = vec![0u32];
+        // Every node is pushed at most once.
+        while let Some(i) = stack.pop() {
+            let Some(node) = self.nodes.get(i as usize) else { continue };
+            let reach = best.unwrap_or(1.0);
+            let (mut t0, mut t1) = (-1e-9f64, reach + 1e-9);
+            let mut inside = true;
+            for k in 0..3 {
+                let (lo, hi) = (node.lo[k] - 1e-9, node.hi[k] + 1e-9);
+                if d[k].abs() < 1e-300 {
+                    if a[k] < lo || a[k] > hi {
+                        inside = false;
+                        break;
+                    }
+                } else {
+                    let (u, v) = ((lo - a[k]) / d[k], (hi - a[k]) / d[k]);
+                    t0 = t0.max(u.min(v));
+                    t1 = t1.min(u.max(v));
+                }
+            }
+            if !inside || t0 > t1 {
+                continue;
+            }
+            if node.count > 0 {
+                let range = node.first as usize..(node.first + node.count) as usize;
+                for &t in self.order.get(range).unwrap_or_default() {
+                    let Some([v0, v1, v2]) = self.triangles.get(t as usize).copied() else { continue };
+                    let (e1, e2) = (sub(v1, v0), sub(v2, v0));
+                    let p = cross(d, e2);
+                    let det = dot(e1, p);
+                    if det == 0.0 || !det.is_finite() {
+                        continue;
+                    }
+                    let inv = 1.0 / det;
+                    let tv = sub(a, v0);
+                    let u = dot(tv, p) * inv;
+                    if !(-EDGE..=1.0 + EDGE).contains(&u) {
+                        continue;
+                    }
+                    let qv = cross(tv, e1);
+                    let v = dot(d, qv) * inv;
+                    if v < -EDGE || u + v > 1.0 + EDGE {
+                        continue;
+                    }
+                    let hit = dot(e2, qv) * inv;
+                    // A surface through an end of the segment (a wall through a cell centre) counts, with
+                    // rounding to spare.
+                    if (-1e-9..=1.0 + 1e-9).contains(&hit) {
+                        let hit = hit.clamp(0.0, 1.0);
+                        if best.is_none_or(|b| hit < b) {
+                            best = Some(hit);
+                        }
+                    }
+                }
+            } else {
+                stack.extend([node.first, node.first + 1]);
+            }
+        }
+        best
+    }
+
     /// The triangle nearest `p` (the lowest index among equally near ones).
     pub fn nearest(&self, p: [f64; 3]) -> Option<u32> {
         let mut best: Option<(f64, u32)> = None;
@@ -389,6 +464,24 @@ mod tests {
             tags.extend([k as u32; 2]);
         }
         BoundarySurface::new(&positions, &triangles, &tags, &SurfaceOptions::default()).unwrap()
+    }
+
+    #[test]
+    fn a_segment_finds_where_it_first_meets_the_surface() {
+        let tree = TriangleTree::new(&cube([2.0, 2.0, 2.0], [4.0, 4.0, 4.0]));
+        // Straight in through the x = 2 face: a quarter of the way along 0..8 is x = 2.
+        assert!((tree.first_hit([0.0, 3.0, 3.0], [8.0, 3.0, 3.0]).unwrap() - 0.25).abs() < 1e-12);
+        // From the other side it meets the x = 4 face first.
+        assert!((tree.first_hit([8.0, 3.0, 3.0], [0.0, 3.0, 3.0]).unwrap() - 0.5).abs() < 1e-12);
+        // Missing the cube, stopping short of it, and a hit exactly at the end of the segment.
+        assert!(tree.first_hit([0.0, 5.0, 3.0], [8.0, 5.0, 3.0]).is_none());
+        assert!(tree.first_hit([0.0, 3.0, 3.0], [1.9, 3.0, 3.0]).is_none());
+        assert_eq!(tree.first_hit([0.0, 3.0, 3.0], [2.0, 3.0, 3.0]), Some(1.0));
+        // Through the seam of two triangles (the diagonal of the x = 2 face) it does not slip by.
+        assert!(tree.first_hit([0.0, 2.5, 2.5], [8.0, 2.5, 2.5]).is_some());
+        // A segment of no length, or a non-finite one, does not panic.
+        let _ = tree.first_hit([3.0, 3.0, 3.0], [3.0, 3.0, 3.0]);
+        let _ = tree.first_hit([f64::NAN; 3], [1.0; 3]);
     }
 
     #[test]
