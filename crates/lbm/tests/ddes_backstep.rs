@@ -65,6 +65,8 @@ struct Step {
     expansion_ratio: f64,
     /// The span in H; 0 for one cell.
     span: f64,
+    /// The short domain of the phase-3 runs (an outlet from 20 H instead of 30 H).
+    short: bool,
     collision: Collision,
     /// The hybrid collision's fixed σ (HRR only).
     sigma: Option<f64>,
@@ -251,8 +253,9 @@ impl Step {
         if !(self.upstream.is_finite() && self.upstream >= 4.0 + 2.0 * self.spacing() && self.on_faces(self.upstream)) {
             why.push(format!("an inflow of {} H must reach past x = −4 H by two cells and be whole cells", self.upstream));
         }
-        if !(self.downstream.is_finite() && self.downstream >= 30.0 && self.on_faces(self.downstream)) {
-            why.push(format!("an outlet {} H downstream must be at least 30 H and whole cells", self.downstream));
+        let shortest = if self.short { 20.0 } else { 30.0 };
+        if !(self.downstream.is_finite() && self.downstream >= shortest && self.on_faces(self.downstream)) {
+            why.push(format!("an outlet {} H downstream must be at least {shortest} H and whole cells", self.downstream));
         }
         if !(self.span.is_finite() && self.span >= 0.0) {
             why.push(format!("span {}: must be ≥ 0", self.span));
@@ -395,7 +398,11 @@ impl Step {
             steady: None,
         };
         let m = model(1.0, 1.0 / self.re_h, d, p);
-        let limits = Limits { max_cell_updates: u64::MAX, max_steps: u64::MAX, ..Limits::default() };
+        let mut limits = Limits { max_cell_updates: u64::MAX, max_steps: u64::MAX, ..Limits::default() };
+        // `FIELDCRAFT_STEP_MAX_CELLS`: the cell cap (the solver's default when unset), for a spanwise run.
+        if let Some(cap) = std::env::var("FIELDCRAFT_STEP_MAX_CELLS").ok().and_then(|v| v.parse().ok()) {
+            limits.max_cells = cap;
+        }
         let setup = fieldcraft_lbm::Setup::new(&m, None, &obstacles, &limits).unwrap();
         let flow = Flow::new(&setup, &obstacles).unwrap();
         let built = self.geometry(&flow, &strips).unwrap_or_else(|e| panic!("the step model: {e}"));
@@ -426,7 +433,16 @@ impl Step {
     /// The run; an error, with the step and the numbers, when the flow stops stepping or a wall
     /// shear sample is not finite.
     fn try_run(&self) -> Result<Run, String> {
+        self.try_run_from(None)
+    }
+
+    /// [`Step::try_run`] starting from the field `init` sets (a settled field from another
+    /// grid, [`transfer`]) instead of the uniform one; a restart file still takes precedence.
+    fn try_run_from(&self, init: Option<&dyn Fn(&mut Flow) -> Result<(), String>>) -> Result<Run, String> {
         let (mut flow, strips, _) = self.build();
+        if let Some(init) = init {
+            init(&mut flow)?;
+        }
         let grid = *flow.grid();
         let h = self.spacing();
         let [nx, ny, nz] = grid.cells;
@@ -596,6 +612,11 @@ impl Step {
         }
         if let Some(x_r) = wall_reading(&flow, self) {
             println!("x_r from the flow field, rows 2-4: {x_r:.3} H");
+        }
+        // `FIELDCRAFT_STEP_PROFILE=<file>`: the incoming layer at x = −4 H, for a shorter domain.
+        if let Some(path) = std::env::var_os("FIELDCRAFT_STEP_PROFILE") {
+            write_profile(std::path::Path::new(&path), &flow, self)?;
+            println!("inlet profile at x = −4 H written to {}", std::path::Path::new(&path).display());
         }
         // The mean profiles, formed with U_ref and ρ at the reference station.
         let (rho_ref, u_ref) = reference(&flow);
@@ -969,6 +990,7 @@ impl Step {
             downstream: 30.0,
             expansion_ratio: 1.125,
             span,
+            short: false,
             collision: Collision::Hrr,
             sigma: Some(0.99),
             turbulence: None,
@@ -1012,11 +1034,23 @@ fn driver_seegmiller(step: &Step) -> (Run, Score) {
 /// (H, a whole number of cells; 0 by default) lengthens the inflow to raise the Re_θ at x = −4 H:
 /// ΔL/H ≈ 1270 / (0.00155 Re_H), about 22 H at the case's Re_H 37 349 (Re_θ 5000 from about 3900).
 fn sa_step(sa: Turbulence) -> Step {
-    let cells_per_h = std::env::var("FIELDCRAFT_STEP_CELLS_PER_H").ok().and_then(|v| v.parse().ok()).unwrap_or(16);
-    let extra: f64 = std::env::var("FIELDCRAFT_STEP_EXTRA_UPSTREAM").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0);
+    let short = std::env::var("FIELDCRAFT_STEP_SHORT").is_ok_and(|v| v == "1");
     // `FIELDCRAFT_STEP_SPAN`: the periodic span in H (0, the default, is one cell: the 2D run).
     let span: f64 = std::env::var("FIELDCRAFT_STEP_SPAN").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0);
+    sa_step_in(sa, short, span)
+}
+
+/// [`sa_step`] with the domain and the span given. `short`: the phase-3 domain, from 4 H and two
+/// cells upstream of the step (the reference station x = −4 H is the second cell of the inflow) to
+/// `FIELDCRAFT_STEP_DOWNSTREAM` H downstream (20 by default).
+fn sa_step_in(sa: Turbulence, short: bool, span: f64) -> Step {
+    let cells_per_h = std::env::var("FIELDCRAFT_STEP_CELLS_PER_H").ok().and_then(|v| v.parse().ok()).unwrap_or(16);
+    let extra: f64 = std::env::var("FIELDCRAFT_STEP_EXTRA_UPSTREAM").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0);
     let case = Step::driver_seegmiller(sa, span);
+    if short {
+        let downstream = std::env::var("FIELDCRAFT_STEP_DOWNSTREAM").ok().and_then(|v| v.parse().ok()).unwrap_or(20.0);
+        return Step { cells_per_h, upstream: 4.0 + 2.0 / cells_per_h as f64, downstream, short: true, ..case };
+    }
     Step { cells_per_h, upstream: case.upstream + extra, ..case }
 }
 
@@ -1075,6 +1109,59 @@ fn peak_memory() -> String {
         .ok()
         .and_then(|s| s.lines().find_map(|l| l.strip_prefix("VmHWM:").map(|v| v.trim().to_string())))
         .unwrap_or_else(|| "n/a".to_string())
+}
+
+/// A settled field from `from` (built from `from_step`) set in `to`: every fluid cell of `to` takes
+/// the density, velocity and ν̃ of the cell of `from` at the same x and z (the span: the source cell
+/// at the same index along y modulo its own, so a 2D field is extruded). The two grids share H, the
+/// step's position and the floor; their x and z offsets are whole cells. Equilibrium populations
+/// at that state, so the non-equilibrium part is rebuilt in a few steps. Cells of `to` outside
+/// `from` (a longer outlet) take the nearest column. Refused for a ν̃ the source does not have.
+fn transfer(from: &Flow, to: &mut Flow) -> Result<(), String> {
+    let (gf, gt) = (*from.grid(), *to.grid());
+    if (gf.spacing - gt.spacing).abs() > LENGTH_TOLERANCE * gf.spacing {
+        return Err(format!("the grids' spacings differ: {} and {}", gf.spacing, gt.spacing));
+    }
+    let cells = |a: f64, b: f64| ((a - b) / gf.spacing).round() as i64;
+    let (dx, dz) = (cells(gt.origin[0], gf.origin[0]), cells(gt.origin[2], gf.origin[2]));
+    let nu = from.spalart_allmaras().map(|f| f.nu_tilde().to_vec()).ok_or("the source flow has no Spalart–Allmaras field")?;
+    let source = |c: usize| -> Option<usize> {
+        let [i, j, k] = gt.coords(c);
+        let (i, k) = (i as i64 + dx, k as i64 + dz);
+        let clamp = |v: i64, n: usize| v.clamp(0, n as i64 - 1) as usize;
+        Some(gf.index([clamp(i, gf.cells[0]), j % gf.cells[1], clamp(k, gf.cells[2])]))
+    };
+    let state = |c: usize| source(c).and_then(|s| from.moments(s)).unwrap_or((1.0, [0.0; 3]));
+    to.set_equilibrium(state);
+    let values: Vec<f64> = (0..gt.len()).map(|c| source(c).and_then(|s| nu.get(s).copied()).unwrap_or(0.0)).collect();
+    to.set_sa_nu_tilde(&values).map_err(|e| format!("setting ν̃: {e}"))
+}
+
+/// The incoming boundary layer at x = −4 H as a table, one line per row from the first fluid row
+/// above the step's top to mid-channel: `z/H  u/U_ref  ν̃/ν` (span means; ν̃ in units of ν). It is the
+/// inlet profile of a shorter domain, which the solver cannot impose yet (no tabulated inflow
+/// profile on a velocity face): written so the profile is a file, not a number in a log.
+fn write_profile(path: &std::path::Path, flow: &Flow, step: &Step) -> Result<(), String> {
+    let g = *flow.grid();
+    let [_, ny, nz] = g.cells;
+    let h = step.spacing();
+    let i = ((step.upstream - 4.0) / h).floor().clamp(0.0, g.cells[0] as f64 - 1.0) as usize;
+    let nu = flow.spalart_allmaras().map(|f| f.nu_tilde().to_vec()).ok_or("the flow has no Spalart–Allmaras field")?;
+    let nu_lat = step.lattice_velocity * h * step.re_h.recip() / h / h;
+    let mut text = String::from("# z/H  u/U_ref  nu_tilde/nu
+");
+    let k0 = ((1.0 + h) / h).floor() as usize;
+    let middle = ((0.5 * (1.0 + step.roof()) + 1.0) / h).floor().clamp(0.0, nz as f64 - 1.0) as usize;
+    let mean = |k: usize, f: &dyn Fn(usize) -> f64| (0..ny).map(|j| f(g.index([i, j, k]))).sum::<f64>() / ny as f64;
+    let u_ref = mean(middle, &|c| flow.moments(c).map_or(f64::NAN, |m| m.1[0]));
+    for k in k0..=middle {
+        let u = mean(k, &|c| flow.moments(c).map_or(f64::NAN, |m| m.1[0]));
+        let t = mean(k, &|c| nu.get(c).copied().unwrap_or(f64::NAN));
+        let z = g.origin[2] + (k as f64 + 0.5) * g.spacing;
+        text.push_str(&format!("{z:.6} {:.8} {:.6}
+", u / u_ref, t / nu_lat));
+    }
+    std::fs::write(path, text).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 /// The gate reading from the flow field: x_r is the wall (y = 0) value of the least-squares line
@@ -1284,4 +1371,96 @@ fn the_settle_point_is_the_first_block_within_half_a_percent_of_a_fifth_earlier(
     // Step 1300 is the first whose fifth-earlier block (step 1000, running mean 6.0) agrees.
     assert_eq!(settle_point(&settling).map(|p| p.0), Some(1300));
     assert_eq!(settle_point(&[]), None);
+}
+
+/// The gated x_r of a finished run's restart file: the stored samples replayed into the strips'
+/// block means, as the run reads them.
+fn restart_x_r(step: &Step, file: &std::path::Path) -> Result<f64, String> {
+    let (mut flow, strips, _) = step.build();
+    let (_, samples) = load(file, &mut flow);
+    let mut shear = Shear::new(strips.len(), step.block);
+    samples.iter().for_each(|s| {
+        shear.push(s);
+    });
+    let mean = shear.mean();
+    let x: Vec<f64> = strips.iter().filter(|s| s.floor).map(|s| 0.5 * (s.x.0 + s.x.1)).collect();
+    let floor: Vec<f64> = strips.iter().zip(&mean).filter(|(s, _)| s.floor).map(|(_, &t)| t).collect();
+    reattachment(&x, &floor).map_err(|e| format!("{}: {e:?}", file.display()))
+}
+
+/// T1s: the short domain (4 H upstream to 20 H downstream, 2D), started from T1's settled field,
+/// run to the steady rule; x_r against T1's (the gate: within 0.5 %). The inlet is the uniform
+/// velocity: the solver has no tabulated inflow profile, so until it has one the short domain's
+/// boundary layer at x = −4 H is not T1's and this run only checks the plumbing. `FIELDCRAFT_STEP_RESTART` is T1's
+/// restart file (a copy), `FIELDCRAFT_STEP_CELLS_PER_H` its grid, `FIELDCRAFT_STEP_CHECKPOINT` T1s's own:
+/// `FIELDCRAFT_STEP_RESTART=<copy> FIELDCRAFT_STEP_CELLS_PER_H=24 cargo test --release -p fieldcraft-lbm --test ddes_backstep t1s -- --ignored --nocapture`.
+#[test]
+#[ignore = "hours: the short step from T1's field, FIELDCRAFT_STEP_RESTART"]
+fn t1s_the_short_step_from_t1s_field_reattaches_with_t1() {
+    let file = std::path::PathBuf::from(std::env::var("FIELDCRAFT_STEP_RESTART").expect("FIELDCRAFT_STEP_RESTART"));
+    let sa = sa_rans();
+    let t1 = sa_step_in(sa, false, 0.0);
+    let (mut full, _, _) = t1.build();
+    load(&file, &mut full);
+    let x_t1 = restart_x_r(&t1, &file).unwrap_or(f64::NAN);
+    let checkpoint = std::env::var_os("FIELDCRAFT_STEP_CHECKPOINT").map(std::path::PathBuf::from);
+    let steps = std::env::var("FIELDCRAFT_STEP_MAX_STEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(400_000);
+    let short = Step { max_steps: steps, checkpoint, startup: 0.5, ..sa_step_in(sa, true, 0.0) };
+    let run = short.try_run_from(Some(&|flow: &mut Flow| transfer(&full, flow))).unwrap_or_else(|e| panic!("T1s: {e}"));
+    let x_s = run.x_r.as_ref().map_or(f64::NAN, |x| *x);
+    println!(
+        "T1s x_r {x_s:.4} H against T1 {x_t1:.4} H: {:+.2} % (gate 0.5 %: {}); settled {}",
+        100.0 * (x_s - x_t1) / x_t1,
+        if ((x_s - x_t1) / x_t1).abs() <= 0.005 { "pass" } else { "fail" },
+        run.settled
+    );
+}
+
+/// T2: T1s's field extruded across a periodic span (`FIELDCRAFT_STEP_SPAN` H, RANS, 20 H/U steps),
+/// timed: cells, peak memory, seconds per step and x_r from the flow field (rows 2-4) against T1s's
+/// (the gate: within 0.5 %). `FIELDCRAFT_STEP_RESTART` is T1s's restart file (a copy). One block is
+/// 1000 steps, so the gated shear x_r is read from the last whole blocks as well.
+/// `FIELDCRAFT_STEP_RESTART=<copy> FIELDCRAFT_STEP_CELLS_PER_H=24 FIELDCRAFT_STEP_SPAN=4 cargo test --release -p fieldcraft-lbm --test ddes_backstep t2 -- --ignored --nocapture`.
+#[test]
+#[ignore = "hours: the extruded short step from T1s's field, FIELDCRAFT_STEP_RESTART"]
+fn t2_the_extruded_short_step_keeps_t1s_reattachment() {
+    let file = std::path::PathBuf::from(std::env::var("FIELDCRAFT_STEP_RESTART").expect("FIELDCRAFT_STEP_RESTART"));
+    let span: f64 = std::env::var("FIELDCRAFT_STEP_SPAN").ok().and_then(|v| v.parse().ok()).unwrap_or(4.0);
+    let sa = sa_rans();
+    let t1s = sa_step_in(sa, true, 0.0);
+    let (mut flat, _, _) = t1s.build();
+    load(&file, &mut flat);
+    let x_flat = wall_reading(&flat, &t1s);
+    let h_over_u = (t1s.cells_per_h as f64 / t1s.lattice_velocity).round() as u64;
+    let t2 = Step { max_steps: 20 * h_over_u, sample: 100, block: 10, startup: 0.0, ..sa_step_in(sa, true, span) };
+    let run = t2.try_run_from(Some(&|flow: &mut Flow| transfer(&flat, flow))).unwrap_or_else(|e| panic!("T2: {e}"));
+    println!("T2 (span {span} H, {} steps = 20 H/U): x_r (gated shear) {:?}; T1s from its field {x_flat:?}", run.steps, run.x_r);
+}
+
+/// The short domain's check, and a field carried from the full domain to a spanwise one: the
+/// target's cells hold the source's density at the same x and z, the span extruded.
+#[test]
+fn a_field_carries_from_the_full_step_to_the_short_extruded_one() {
+    let sa = Turbulence::SpalartAllmaras { prandtl: 0.9, wall_model: None, inflow_ratio: 3.0, ddes: None };
+    let base = Step { turbulence: Some(sa), ..laminar(100) };
+    let short = Step { upstream: 4.5, downstream: 20.0, short: true, span: 1.0, ..base.clone() };
+    assert_eq!(short.check(), Ok(()));
+    assert!(Step { short: false, ..short.clone() }.check().is_err(), "20 H downstream is the short domain's alone");
+    let (mut full, _, _) = base.build();
+    full.set_equilibrium(|c| (1.0 + 1e-3 * (c % 7) as f64, [0.02, 0.0, 0.0]));
+    let (mut to, _, _) = short.build();
+    transfer(&full, &mut to).unwrap();
+    let (gf, gt) = (*full.grid(), *to.grid());
+    let (dx, dz) = (((gt.origin[0] - gf.origin[0]) / gf.spacing).round() as usize, ((gt.origin[2] - gf.origin[2]) / gf.spacing).round() as usize);
+    let mut checked = 0;
+    for j in 0..gt.cells[1] {
+        for (i, k) in [(3, 5), (20, 9), (40, 12)] {
+            let (a, b) = (gt.index([i, j, k]), gf.index([i + dx, 0, k + dz]));
+            if let (Some(t), Some(f)) = (to.moments(a), full.moments(b)) {
+                assert!((t.0 - f.0).abs() < 1e-12 && (t.1[0] - f.1[0]).abs() < 1e-12, "cell {i},{j},{k}: {t:?} against {f:?}");
+                checked += 1;
+            }
+        }
+    }
+    assert!(checked >= gt.cells[1], "{checked} cells compared");
 }
