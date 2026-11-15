@@ -369,6 +369,26 @@ mod tests {
         }
     }
 
+    /// The exchange `(v + sent) c_q` of a link is continuous across `q = 1/2` for both orders, and
+    /// a half-way link kept as a wall link (no second node) returns the plain bounce-back
+    /// population: it must be stored at exactly 1/2, since just below it the rule needs a second
+    /// node it does not have.
+    #[test]
+    fn the_exchange_is_continuous_across_one_half_and_a_kept_half_way_link_needs_no_second_node() {
+        let (f, q) = line([3.0, 5.0, 8.0], [7.0, 1.0, 2.0]);
+        let sent = 3.0;
+        for order in [1, 2] {
+            let below = Interpolated::incoming(&entry(q, 0.5 - 1e-9, order), &f, 4).unwrap_or(f64::NAN);
+            let above = Interpolated::incoming(&entry(q, 0.5 + 1e-9, order), &f, 4).unwrap_or(f64::NAN);
+            assert!(((below + sent) - (above + sent)).abs() < 1e-7, "order {order}: {below} {above}");
+            assert!((below - sent).abs() < 1e-7 && (above - sent).abs() < 1e-7);
+        }
+        let kept = Entry { behind: u32::MAX, behind2: u32::MAX, ..entry(q, 0.5, 1) };
+        assert_eq!(Interpolated::incoming(&kept, &f, 4), Some(sent));
+        let off = Entry { wall: 0.5 - 1e-10, ..kept };
+        assert_eq!(Interpolated::incoming(&off, &f, 4), None, "a second node is missing below 1/2");
+    }
+
     #[test]
     fn the_linear_forms_weigh_the_populations_by_the_wall_distance() {
         let (f, q) = line([3.0, 5.0, 8.0], [7.0, 1.0, 2.0]);
