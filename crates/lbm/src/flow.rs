@@ -2056,11 +2056,21 @@ impl Flow {
         obstacles: &[Obstacle],
         order: crate::interpolated::WallOrder,
     ) -> Result<crate::interpolated::InterpolationReport> {
+        self.interpolate_walls_impl(setup, obstacles, order, false)
+    }
+
+    fn interpolate_walls_impl(
+        &mut self,
+        setup: &Setup,
+        obstacles: &[Obstacle],
+        order: crate::interpolated::WallOrder,
+        with_model: bool,
+    ) -> Result<crate::interpolated::InterpolationReport> {
         use crate::interpolated::{Entry, Interpolated, InterpolationReport, WallOrder};
         if self.interpolated.is_some() {
             return Err(Error::Invalid("the walls are already interpolated".into()));
         }
-        if self.nodes.is_some() || self.wall_model || self.wall_bounce || self.thermal.is_some() || self.surface.is_some() {
+        if self.nodes.is_some() || (self.wall_model && !with_model) || self.wall_bounce || self.thermal.is_some() || self.surface.is_some() {
             return Err(Error::Invalid(
                 "not supported yet: interpolated walls with a wall model, heat transfer or a free surface; use the plain half-way wall".into(),
             ));
@@ -2193,6 +2203,90 @@ impl Flow {
         });
         self.interpolated = Some(ip);
         Ok(report)
+    }
+
+    /// [`Flow::interpolate_walls_with`] under the wall model (`wall_model: musker`, Malaspinas and
+    /// Sagaut's law of [`crate::wall`]) with the surface's true geometry: each wall cell's distance
+    /// `y1` and normal come from the nearest point of the surface, its second cell is the fluid cell
+    /// one link along the direction nearest the normal, at its own true distance `y2`, and the
+    /// Spalart–Allmaras layer's wall distance next to the surface is the true one. The linear rule
+    /// is used, since the model rebuilds the cells that touch the wall.
+    pub fn interpolate_walls_with_model(&mut self, setup: &Setup, obstacles: &[Obstacle]) -> Result<crate::interpolated::InterpolationReport> {
+        if !self.wall_model || self.walls.is_none() {
+            return Err(Error::Invalid("the link-based law on interpolated walls needs `wall_model: musker`".into()));
+        }
+        let report = self.interpolate_walls_impl(setup, obstacles, crate::interpolated::WallOrder::Linear, true)?;
+        let h = self.grid.spacing;
+        let trees: Vec<TriangleTree> = setup.obstacles.iter().filter_map(|f| obstacles.get(f.index)).map(|o| TriangleTree::new(&o.surface)).collect();
+        let dims = self.grid.cells.map(|v| v as i64);
+        let distance = |p: [f64; 3]| -> Option<(f64, [f64; 3])> {
+            let mut best: Option<(f64, [f64; 3])> = None;
+            for tree in &trees {
+                if let Some((d, n)) = tree.nearest_surface(p)
+                    && best.is_none_or(|(b, _)| d < b)
+                {
+                    best = Some((d, n));
+                }
+            }
+            best
+        };
+        let Some(mut walls) = self.walls.take() else { return Ok(report) };
+        let cells: Vec<usize> = walls.wall_cells().map(|w| w.0).collect();
+        for cell in cells {
+            let p = self.grid.centre(cell);
+            let Some((d1, normal)) = distance(p) else { continue };
+            let Some(link) = crate::wall::best_direction(normal) else { continue };
+            let ijk = self.grid.coords(cell);
+            let mut at = Some([0usize; 3]);
+            for a in 0..3 {
+                let mut v = ijk[a] as i64 + i64::from(C[link][a]);
+                if v < 0 || v >= dims[a] {
+                    if !self.periodic[a] {
+                        at = None;
+                        break;
+                    }
+                    v = v.rem_euclid(dims[a]);
+                }
+                if let Some(x) = at.as_mut() {
+                    x[a] = v as usize;
+                }
+            }
+            let second = at.map(|at| self.grid.index(at)).filter(|&s| self.fluid.get(s).copied().unwrap_or(false));
+            let far = [0, 1, 2].map(|a| p[a] + f64::from(C[link][a]) * h);
+            let y2 = distance(far).map_or(0.0, |(d, _)| d / h);
+            let second = second.filter(|_| y2 > d1 / h);
+            // The unit normal points into the fluid, the link towards the wall's reverse (Walls' own
+            // convention: the link points from the wall into the fluid).
+            walls.retarget(cell, d1 / h, normal, link, second, y2);
+        }
+        self.walls = Some(walls);
+        if let Some(sa) = &mut self.sa {
+            let grid = self.grid;
+            sa.distance.refine(8.0, |cell| distance(grid.centre(cell)).map(|(d, _)| d / h));
+        }
+        Ok(report)
+    }
+
+    /// The wall model's wall cells (cell indices), in cell order; none without a wall model.
+    pub fn wall_model_cells(&self) -> Vec<usize> {
+        self.walls.as_ref().map(|w| w.wall_cells().map(|c| c.0).collect()).unwrap_or_default()
+    }
+
+    /// How many of the wall model's wall cells have no second cell (they keep the plain wall rule).
+    pub fn wall_model_without_second(&self) -> usize {
+        self.walls.as_ref().map_or(0, |w| w.wall_cells().filter(|c| c.4.is_none()).count())
+    }
+
+    /// The wall model's free-slip diagnostic ([`crate::wall::Walls::set_free_slip`]); `false`
+    /// without a wall model.
+    pub fn set_wall_model_free_slip(&mut self, on: bool) -> bool {
+        match self.walls.as_mut() {
+            Some(w) => {
+                w.set_free_slip(on);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Choose how the interpolated walls' mass is taken back ([`crate::interpolated::MassFix`]; the

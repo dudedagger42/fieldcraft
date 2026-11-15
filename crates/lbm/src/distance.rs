@@ -213,6 +213,23 @@ impl WallDistance {
         self.d.get(cell).copied().filter(|d| *d > 0.0)
     }
 
+    /// Replaces the distance of every fluid cell within `reach` of a wall point by `true_distance(cell)`
+    /// when that gives a finite, positive value: the distance to the true surface where the wall
+    /// does not lie half-way along a link. Returns the number of cells replaced.
+    pub fn refine(&mut self, reach: f64, true_distance: impl Fn(usize) -> Option<f64>) -> usize {
+        let mut changed = 0;
+        for (cell, d) in self.d.iter_mut().enumerate() {
+            if *d > 0.0
+                && *d <= reach
+                && let Some(t) = true_distance(cell).filter(|t| t.is_finite() && *t > 0.0)
+            {
+                *d = t;
+                changed += 1;
+            }
+        }
+        changed
+    }
+
     /// Every cell's distance (lattice units), in cell order: 0 in cells that are not fluid.
     pub fn as_slice(&self) -> &[f64] {
         &self.d

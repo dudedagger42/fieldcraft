@@ -139,6 +139,9 @@ struct WallCell {
     /// The wall model's second cell off the wall, one link further along the normal (`NONE`
     /// when that is not a fluid cell inside the box).
     second: u32,
+    /// The second cell's distance from the wall along the normal (lattice units): three times
+    /// `distance` on a half-way wall, the surface's true distance on an interpolated one.
+    distance2: f64,
     /// The wall model's velocity and relaxation rate of this cell, from the last sample.
     boundary: [f64; 3],
     rate: f64,
@@ -172,6 +175,9 @@ pub struct Walls {
     /// With damping, per cell: the distance from its centre to its wall point (lattice units);
     /// empty without.
     distance: Vec<f64>,
+    /// A diagnostic: the wall model takes the second cell's velocity along the wall as the wall
+    /// cell's (a free-slip wall) instead of the law's.
+    free_slip: bool,
 }
 
 impl Walls {
@@ -224,13 +230,14 @@ impl Walls {
                 removed: [0.0; 3],
                 friction: 0.0,
                 second: second.map_or(NONE, |s| s as u32),
+                distance2: 3.0 * d,
                 boundary: velocity,
                 rate: 1.0 / (3.0 * nu + 0.5),
                 stress: [0.0; 3],
             });
         }
         let distance = if a_plus.is_some() { spread(grid, fluid, &found, &mut wall_of)? } else { Vec::new() };
-        Ok(Walls { a_plus, nu, walls: found, wall_of, distance })
+        Ok(Walls { a_plus, nu, walls: found, wall_of, distance, free_slip: false })
     }
 
     /// The wall cells of Han et al.'s on-node wall-function bounce, for Van Driest's damping: the
@@ -263,13 +270,14 @@ impl Walls {
                 removed: [0.0; 3],
                 friction: 0.0,
                 second: NONE,
+                distance2: 3.0,
                 boundary: [0.0; 3],
                 rate: 1.0 / (3.0 * nu + 0.5),
                 stress: [0.0; 3],
             });
         }
         let distance = if a_plus.is_some() { spread(grid, fluid, &found, &mut wall_of)? } else { Vec::new() };
-        Ok(Walls { a_plus, nu, walls: found, wall_of, distance })
+        Ok(Walls { a_plus, nu, walls: found, wall_of, distance, free_slip: false })
     }
 
     /// The restart state: every wall cell's friction velocity of the last refresh, which the
@@ -291,6 +299,7 @@ impl Walls {
                 removed: _,
                 friction,
                 second,
+                distance2: _,
                 boundary: _,
                 rate: _,
                 stress: _,
@@ -304,6 +313,26 @@ impl Walls {
             }
         }
         Ok(())
+    }
+
+    /// Put wall cell `cell` at the true wall of an interpolated surface: its distance `y1` and
+    /// unit `normal` into the fluid (lattice units), the link `link` nearest the normal, the cell
+    /// `second` one link along it (`None` when it is not fluid inside the box) at distance `y2`.
+    /// Returns whether `cell` is a wall cell.
+    pub fn retarget(&mut self, cell: usize, y1: f64, normal: [f64; 3], link: usize, second: Option<usize>, y2: f64) -> bool {
+        let Some(&w) = self.wall_of.get(cell) else { return false };
+        let Some(wall) = self.walls.get_mut(w as usize).filter(|wall| wall.cell as usize == cell) else { return false };
+        wall.link = link as u8;
+        wall.normal = normal;
+        wall.distance = y1;
+        wall.distance2 = y2;
+        wall.second = second.map_or(NONE, |s| s as u32);
+        true
+    }
+
+    /// Switch the free-slip diagnostic on or off ([`Walls::sample`]).
+    pub fn set_free_slip(&mut self, on: bool) {
+        self.free_slip = on;
     }
 
     /// The wall cells, in cell order: each one's cell, the direction of its nearest wall link,
@@ -369,7 +398,7 @@ impl Walls {
     /// each wall cell's second cell (lattice units, with the half force), every wall cell's
     /// velocity and relaxation rate ([`wall_law`]), in parallel: each wall cell's is its own.
     pub fn sample(&mut self, velocity: impl Fn(usize) -> [f64; 3] + Sync) {
-        let nu = self.nu;
+        let (nu, free_slip) = (self.nu, self.free_slip);
         parallel::for_each_mut(&mut self.walls, |_, w| {
             if w.second == NONE {
                 return;
@@ -379,7 +408,8 @@ impl Walls {
             let un = rel[0] * w.normal[0] + rel[1] * w.normal[1] + rel[2] * w.normal[2];
             let t = [0, 1, 2].map(|a| rel[a] - un * w.normal[a]);
             let speed = (t[0] * t[0] + t[1] * t[1] + t[2] * t[2]).sqrt();
-            let (u1, nu_t) = wall_law(speed, w.distance, 3.0 * w.distance, nu);
+            // Free slip (a diagnostic): the cell takes the second cell's velocity along the wall.
+            let (u1, nu_t) = if free_slip { (speed, 0.0) } else { wall_law(speed, w.distance, w.distance2, nu) };
             let scale = if speed > 0.0 && u1.is_finite() { u1 / speed } else { 0.0 };
             w.boundary = [0, 1, 2].map(|a| w.velocity[a] + scale * t[a]);
             w.rate = 1.0 / (3.0 * (nu + nu_t) + 0.5);
@@ -393,7 +423,7 @@ impl Walls {
     pub fn friction_velocities<'a>(&'a self, velocity: impl Fn(usize) -> [f64; 3] + 'a) -> impl Iterator<Item = (usize, f64, f64)> + 'a {
         self.walls.iter().filter(|w| w.second != NONE).map(move |w| {
             let speed = w.tangential_speed(velocity(w.second as usize));
-            (w.cell as usize, w.distance, musker_friction(speed, 3.0 * w.distance, self.nu))
+            (w.cell as usize, w.distance, musker_friction(speed, w.distance2, self.nu))
         })
     }
 
@@ -504,6 +534,20 @@ impl Walls {
 
 /// The six components of a symmetric tensor: xx, yy, zz, xy, xz, yz.
 const PAIRS: [(usize, usize); 6] = [(0, 0), (1, 1), (2, 2), (0, 1), (0, 2), (1, 2)];
+
+/// The lattice direction (rest excluded) best aligned with `n`; `None` when none points into the
+/// half-space of `n`.
+pub(crate) fn best_direction(n: [f64; 3]) -> Option<usize> {
+    let mut best: Option<(f64, usize)> = None;
+    for (k, c) in crate::lattice::C.iter().enumerate().take(Q).skip(1) {
+        let len = f64::from(c[0] * c[0] + c[1] * c[1] + c[2] * c[2]).sqrt();
+        let score = (f64::from(c[0]) * n[0] + f64::from(c[1]) * n[1] + f64::from(c[2]) * n[2]) / len;
+        if score > 1e-12 && best.is_none_or(|(s, _)| score > s + 1e-12) {
+            best = Some((score, k));
+        }
+    }
+    best.map(|(_, k)| k)
+}
 
 fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
