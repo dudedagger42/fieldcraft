@@ -76,7 +76,7 @@ fn interpolated_wall_open_channel() {
         let fix = match env("MASSFIX", 2.0) as u32 {
             0 => MassFix::Off,
             1 => MassFix::Local,
-            _ => MassFix::Global,
+            _ => MassFix::Spread,
         };
         cpu.set_wall_mass_correction(fix).unwrap_or_else(|e| panic!("{e}"));
         label = format!(

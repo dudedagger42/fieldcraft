@@ -1231,7 +1231,7 @@ impl GpuFlow {
         }
         let by_group: Vec<u32> = by_group.iter().map(|(_, l)| *l).collect();
         // The interpolated walls' correction: the fluid cells it spreads over, in a word after the links.
-        let wall_mass = flow.wall_mass_global() && !interpolated.is_empty();
+        let wall_mass = false;
         link_u.extend_from_slice(&[u32::try_from(flow.fluid_cells()).unwrap_or(u32::MAX), 0, 0, 0]);
         // Each group's thermal condition (held temperatures shifted by T₀).
         let mut group_t = reserved(4 * group_count, "thermal conditions")?;

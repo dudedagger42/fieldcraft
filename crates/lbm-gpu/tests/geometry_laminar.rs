@@ -295,7 +295,7 @@ impl Build {
             let fix = match env("MASSFIX", 2.0) as u32 {
                 0 => fieldcraft_lbm::interpolated::MassFix::Off,
                 1 => fieldcraft_lbm::interpolated::MassFix::Local,
-                _ => fieldcraft_lbm::interpolated::MassFix::Global,
+                _ => fieldcraft_lbm::interpolated::MassFix::Spread,
             };
             flow.set_wall_mass_correction(fix).unwrap_or_else(|e| panic!("{e}"));
             label = format!(

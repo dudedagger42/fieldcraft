@@ -2172,7 +2172,26 @@ impl Flow {
             report.quadratic += usize::from(entry.order == 2);
             entries.push(entry);
         }
-        self.interpolated = Some(Interpolated::new(entries, report));
+        let mut ip = Interpolated::new(entries, report);
+        // The spread kind's targets: a wall node's own cell and its fluid neighbours (wrapped across
+        // periodic faces), not the open cells.
+        ip.build_spread(|cell, i| {
+            let ijk = self.grid.coords(cell as usize);
+            let mut at = [0usize; 3];
+            for a in 0..3 {
+                let mut v = ijk[a] as i64 + i64::from(C[i][a]);
+                if v < 0 || v >= dims[a] {
+                    if !self.periodic[a] {
+                        return None;
+                    }
+                    v = v.rem_euclid(dims[a]);
+                }
+                at[a] = v as usize;
+            }
+            let idx = self.grid.index(at);
+            (self.fluid.get(idx).copied().unwrap_or(false) && !open.get(idx).copied().unwrap_or(false)).then_some(idx as u32)
+        });
+        self.interpolated = Some(ip);
         Ok(report)
     }
 
@@ -2190,15 +2209,24 @@ impl Flow {
         self.interpolated.as_ref().map(|i| i.links()).unwrap_or_default()
     }
 
-    /// The steps the interpolated walls' global mass correction ran and the mass the walls created
-    /// over them, in lattice units (density 1 per cell); `(0, 0)` without one.
+    /// The steps the interpolated walls' mass accounting ran and the mass the walls created over
+    /// them, in lattice units (density 1 per cell); `(0, 0)` without one.
     pub fn wall_mass_created(&self) -> (u64, f64) {
         self.interpolated.as_ref().map_or((0, 0.0), |i| i.mass_created())
     }
 
-    /// Whether the interpolated walls take their mass back with the global correction.
-    pub fn wall_mass_global(&self) -> bool {
-        self.interpolated.as_ref().is_some_and(|i| i.is_global())
+    /// The spread kind's wall nodes (cell, sum of the weights over the fluid targets) and the cells
+    /// that take mass back; `None` without interpolated walls or with another kind.
+    pub fn wall_spread(&self) -> Option<(Vec<(u32, f64)>, Vec<u32>)> {
+        let ip = self.interpolated.as_ref().filter(|i| i.is_spread())?;
+        Some((ip.spread_nodes(), ip.spread_receivers().to_vec()))
+    }
+
+    /// The mass the interpolated walls created at the last step that is not taken back yet (the
+    /// spread kind removes it one step late); it is in the box, so subtract it from the total mass
+    /// to read the conserved quantity. Zero without interpolated walls.
+    pub fn wall_mass_pending(&self) -> f64 {
+        self.interpolated.as_ref().map_or(0.0, |i| i.mass_pending())
     }
 
     pub fn grid(&self) -> &Grid {
@@ -3491,10 +3519,9 @@ impl Flow {
                     *x = v;
                 }
             }
-            ip.conserve_mass(&self.f, &mut self.g, s);
         }
         if let Some(ip) = &mut self.interpolated {
-            ip.conserve_mass_everywhere(&self.fluid, self.fluid_cells, &self.f, &mut self.g, s);
+            ip.conserve_mass(&self.f, &mut self.g, s);
         }
         self.forces.fill([0.0; 3]);
         for link in &self.links {

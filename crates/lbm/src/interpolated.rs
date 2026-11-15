@@ -40,12 +40,13 @@
 //! taken back every step from the walls alone, with the weights of the lattice (they sum to one and
 //! carry no momentum, so none is added):
 //!
-//! - `MassFix::Global` (the default): the sum over all interpolated links of (returned - sent) is
-//!   spread evenly over the fluid cells and removed. It does not depend on what the box does
-//!   elsewhere, so inlets and outlets are not fought. It needs one sum over the links, in link
-//!   order, in double precision.
-//! - `MassFix::Local`: each wall node removes the sum over its own links. No global sum, but it moved
-//!   the flow rate of slanted channels by 0.3 point at 16 cells, so it is not the default.
+//! - `MassFix::Spread` (the default): each wall node stores what its own links created (its delta)
+//!   and hands it to itself and its fluid neighbours with the lattice weights renormalised over the
+//!   fluid targets (fixed at setup; solid and open cells get nothing). Every fluid cell removes what
+//!   it received, spread over its populations by the lattice weights, one step late. The plus and
+//!   minus parts of neighbouring wall nodes cancel before anything is removed, and what remains is
+//!   taken back close to where it was made. The sum removed equals the sum created, exactly.
+//! - `MassFix::Local`: each wall node removes the sum over its own links at once.
 //!
 //! At `q = 1/2` the term is exactly zero. These are design choices of FieldCraft's, not published schemes.
 
@@ -68,9 +69,10 @@ pub enum MassFix {
     Off,
     /// Each wall node gives back what its own links created.
     Local,
-    /// Every step the mass the wall links created is spread over all fluid cells.
+    /// Each wall node hands what its links created to itself and its fluid neighbours, which take
+    /// it back one step later.
     #[default]
-    Global,
+    Spread,
 }
 
 /// How the links of a flow were treated.
@@ -128,7 +130,17 @@ pub struct Interpolated {
     /// The entry indices ordered by cell, and per wall node its cell with the range of `order`.
     order: Vec<u32>,
     nodes: Vec<(u32, u32, u32)>,
-    /// How the mass the wall links create is taken back (`Global` by default).
+    /// Per wall node the range of its shares, the shares (receiver index, weight) and the receiving
+    /// cells (the spread kind).
+    node_shares: Vec<(u32, u32)>,
+    shares: Vec<(u32, f64)>,
+    receivers: Vec<u32>,
+    /// Per wall node the sum `W` of the lattice weights over its fluid targets.
+    node_total: Vec<f64>,
+    /// Per wall node what its links created at the last step, and per receiver what it is handed.
+    delta: Vec<f64>,
+    received: Vec<f64>,
+    /// How the mass the wall links create is taken back (`Spread` by default).
     pub(crate) mass_fix: MassFix,
     /// The steps the global correction ran and the mass the walls created over them.
     steps: u64,
@@ -147,17 +159,110 @@ impl Interpolated {
                 _ => nodes.push((e.cell, at as u32, at as u32 + 1)),
             }
         }
-        Self { entries, report, order, nodes, mass_fix: MassFix::default(), steps: 0, created: 0.0 }
+        let delta = vec![0.0; nodes.len()];
+        Self {
+            entries,
+            report,
+            order,
+            nodes,
+            node_shares: Vec::new(),
+            shares: Vec::new(),
+            receivers: Vec::new(),
+            node_total: Vec::new(),
+            delta,
+            received: Vec::new(),
+            mass_fix: MassFix::default(),
+            steps: 0,
+            created: 0.0,
+        }
     }
 
-    /// Take from every wall node the mass its interpolated links created, spread over its
-    /// populations by the lattice weights. `f` are the post-collision populations, `g` the
-    /// streamed ones (already carrying the interpolated values).
-    pub(crate) fn conserve_mass(&self, f: &[f64], g: &mut [f64], stride: usize) {
-        if self.mass_fix != MassFix::Local {
+    /// Set up the spread kind: `target(cell, i)` is the cell `c_i` away from `cell` when it is a
+    /// fluid cell that takes mass back (`None` otherwise). Each wall node's share to a target is
+    /// `w_i / W`, `W` the sum of `w_i` over its targets.
+    pub(crate) fn build_spread(&mut self, target: impl Fn(u32, usize) -> Option<u32>) {
+        let mut raw: Vec<Vec<(u32, f64)>> = Vec::with_capacity(self.nodes.len());
+        let mut self_total: Vec<f64> = Vec::with_capacity(self.nodes.len());
+        let mut receivers: Vec<u32> = Vec::new();
+        for &(cell, _, _) in &self.nodes {
+            let mut list: Vec<(u32, f64)> = Vec::new();
+            let mut total = 0.0;
+            for (i, &w) in W.iter().enumerate() {
+                if let Some(t) = target(cell, i) {
+                    list.push((t, w));
+                    total += w;
+                }
+            }
+            self_total.push(total);
+            if total > 0.0 {
+                for share in &mut list {
+                    share.1 /= total;
+                }
+            }
+            receivers.extend(list.iter().map(|s| s.0));
+            raw.push(list);
+        }
+        receivers.sort_unstable();
+        receivers.dedup();
+        self.node_shares.clear();
+        self.shares.clear();
+        for list in &raw {
+            let start = self.shares.len() as u32;
+            for &(t, w) in list {
+                if let Ok(r) = receivers.binary_search(&t) {
+                    self.shares.push((r as u32, w));
+                }
+            }
+            self.node_shares.push((start, self.shares.len() as u32));
+        }
+        self.received = vec![0.0; receivers.len()];
+        self.receivers = receivers;
+        self.node_total = self_total;
+    }
+
+    /// The wall nodes' cells with the sum `W` of the lattice weights over their fluid targets
+    /// (the spread kind), in cell order.
+    pub fn spread_nodes(&self) -> Vec<(u32, f64)> {
+        self.nodes.iter().zip(&self.node_total).map(|(n, &w)| (n.0, w)).collect()
+    }
+
+    /// The cells that take mass back in the spread kind, in cell order.
+    pub fn spread_receivers(&self) -> &[u32] {
+        &self.receivers
+    }
+
+    /// Whether the mass fix is the spread kind.
+    pub fn is_spread(&self) -> bool {
+        self.mass_fix == MassFix::Spread
+    }
+
+    /// Take back the mass the interpolated links created. `f` are the post-collision populations,
+    /// `g` the streamed ones (already carrying the interpolated values).
+    pub(crate) fn conserve_mass(&mut self, f: &[f64], g: &mut [f64], stride: usize) {
+        if self.entries.is_empty() {
             return;
         }
-        for &(cell, start, end) in &self.nodes {
+        if self.mass_fix == MassFix::Spread && self.node_shares.len() == self.nodes.len() {
+            // What the last step's deltas hand out, removed by the receivers.
+            self.received.fill(0.0);
+            for (n, &d) in self.delta.iter().enumerate() {
+                let &(a, b) = self.node_shares.get(n).unwrap_or(&(0, 0));
+                for &(r, w) in self.shares.get(a as usize..b as usize).unwrap_or_default() {
+                    if let Some(x) = self.received.get_mut(r as usize) {
+                        *x += d * w;
+                    }
+                }
+            }
+            for (&cell, &got) in self.receivers.iter().zip(&self.received) {
+                for i in 0..Q {
+                    if let Some(x) = g.get_mut(i * stride + cell as usize) {
+                        *x -= got * W[i];
+                    }
+                }
+            }
+        }
+        let mut total = 0.0;
+        for (n, &(cell, start, end)) in self.nodes.iter().enumerate() {
             let mut delta = 0.0;
             for &k in self.order.get(start as usize..end as usize).unwrap_or_default() {
                 let Some(e) = self.entries.get(k as usize) else { continue };
@@ -166,53 +271,29 @@ impl Interpolated {
                 };
                 delta += v - sent;
             }
-            for i in 0..Q {
-                if let Some(x) = g.get_mut(i * stride + cell as usize) {
-                    *x -= delta * W[i];
-                }
+            total += delta;
+            if let Some(d) = self.delta.get_mut(n) {
+                *d = delta;
             }
-        }
-    }
-
-    /// The global kind: the mass the wall links created this step (the sum over all of them of
-    /// returned - sent, in link order, in double precision) is taken off evenly over the `cells`
-    /// fluid cells by the lattice weights, so no momentum is added. It is defined from the walls
-    /// alone, so an inlet or an outlet is not fought (a target of the initial total mass would be).
-    /// `f` are the post-collision populations, `g` the streamed ones.
-    pub(crate) fn conserve_mass_everywhere(&mut self, fluid: &[bool], cells: usize, f: &[f64], g: &mut [f64], stride: usize) {
-        if !matches!(self.mass_fix, MassFix::Global | MassFix::Off) || self.entries.is_empty() || cells == 0 {
-            return;
-        }
-        let mut delta = 0.0;
-        for e in &self.entries {
-            let (Some(v), Some(sent)) = (Self::incoming(e, f, stride), f.get(opposite(usize::from(e.dir)) * stride + e.cell as usize)) else {
-                continue;
-            };
-            delta += v - sent;
-        }
-        self.created += delta;
-        self.steps += 1;
-        if self.mass_fix == MassFix::Off {
-            return;
-        }
-        let each = -delta / cells as f64;
-        for (cell, &on) in fluid.iter().enumerate() {
-            if on {
+            if self.mass_fix == MassFix::Local {
                 for i in 0..Q {
-                    if let Some(x) = g.get_mut(i * stride + cell) {
-                        *x += each * W[i];
+                    if let Some(x) = g.get_mut(i * stride + cell as usize) {
+                        *x -= delta * W[i];
                     }
                 }
             }
         }
+        self.created += total;
+        self.steps += 1;
     }
 
-    /// Whether the correction is the global kind.
-    pub fn is_global(&self) -> bool {
-        self.mass_fix == MassFix::Global
+    /// The mass the walls created at the last step that the spread has not taken back yet (the
+    /// removal is one step late), in lattice units. Total mass less this is the conserved quantity.
+    pub fn mass_pending(&self) -> f64 {
+        if self.mass_fix == MassFix::Spread { self.delta.iter().sum() } else { 0.0 }
     }
 
-    /// What the global correction took off so far: the steps it ran and the mass the walls created
+    /// What the walls created so far: the steps it ran and the mass the walls created
     /// over them (lattice units, density 1 per cell).
     pub fn mass_created(&self) -> (u64, f64) {
         (self.steps, self.created)
@@ -319,5 +400,33 @@ mod tests {
             let v = Interpolated::incoming(&entry(q, wall, 2), &f, 4).unwrap_or(f64::NAN);
             assert!((v - para(0.0)).abs() < 1e-12, "{wall}: {v}");
         }
+    }
+
+    #[test]
+    fn the_spread_hands_out_exactly_what_the_walls_created_one_step_late() {
+        // Two wall nodes (cells 0 and 1) with a link each; the targets of a node are four cells
+        // reached by every direction, some twice.
+        let stride = 4;
+        let q = 2;
+        let mut f = vec![0.0; crate::lattice::Q * stride];
+        for (k, v) in [3.0, 5.0, 8.0, 1.0].into_iter().enumerate() {
+            f[opposite(q) * stride + k] = v;
+            f[q * stride + k] = 7.0 - v;
+        }
+        let entries = vec![
+            Entry { cell: 0, behind: 1, behind2: 2, ..entry(q, 0.25, 2) },
+            Entry { link: 1, cell: 1, behind: 2, behind2: 3, ..entry(q, 0.7, 1) },
+        ];
+        let mut ip = Interpolated::new(entries, InterpolationReport::default());
+        ip.build_spread(|cell, i| Some((cell + i as u32) % 4));
+        let mut g = vec![0.0; crate::lattice::Q * stride];
+        ip.conserve_mass(&f, &mut g, stride);
+        // The first step removes nothing: the deltas are handed out at the next one.
+        assert!(g.iter().all(|&x| x == 0.0));
+        let (_, created) = ip.mass_created();
+        assert!(created.abs() > 1e-6, "{created}");
+        ip.conserve_mass(&f, &mut g, stride);
+        let removed: f64 = g.iter().sum();
+        assert!((removed + created).abs() < 1e-12, "{removed} {created}");
     }
 }
