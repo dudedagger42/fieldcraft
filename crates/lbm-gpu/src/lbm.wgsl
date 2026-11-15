@@ -97,6 +97,10 @@
 // r⁶ and g⁶ by multiplication, pow only for the ^(1/6) of a positive argument.
 
 override AA_MODE: bool = true;
+// The interpolated walls' global mass correction: `wall_mass` sums what the wall links created
+// each step (stats[8] keeps the share per fluid cell, as f32 bits) and every read of the streamed
+// populations takes it off (population()).
+override WALL_MASS: bool = false;
 // The recursive regularised collision instead of the two-relaxation-time one
 // (fieldcraft_lbm::regularized).
 override REGULARIZED: bool = false;
@@ -431,8 +435,10 @@ fn population_index(q: u32, cell: u32, xyz: vec3<i32>, phase: u32) -> u32 {
 }
 
 fn population(q: u32, cell: u32, xyz: vec3<i32>) -> f32 {
-    if AA_MODE { return f[population_index(q, cell, xyz, params.phase.x)]; }
-    return f[q * params.n + cell];
+    var v: f32;
+    if AA_MODE { v = f[population_index(q, cell, xyz, params.phase.x)]; } else { v = f[q * params.n + cell]; }
+    if WALL_MASS { v = v + bitcast<f32>(atomicLoad(&stats[8])) * w_of(q); }
+    return v;
 }
 
 // Collision's output at its source cell, before the boundary rules.
@@ -2165,6 +2171,30 @@ fn stream_links_exchange(@builtin(local_invocation_index) lid: u32, @builtin(wor
     gather_link(cell_of(lid, wg), true);
 }
 
+// The population that comes back along a link of an interpolated wall (q2 is the order, 1 or 2;
+// `wall` the wall's fraction of the link): the cell's own and the ones behind it, away from the
+// wall, one and two links (fieldcraft_lbm::interpolated, from the same characteristic).
+fn interpolated_wall(q: u32, cell: u32, wall: f32, order: u32) -> f32 {
+    let into = post(opp(q), cell);
+    if wall < 0.5 {
+        let b = wrapped(coords(cell) + c_of(q));
+        let back = post(opp(q), b);
+        if order == 2u {
+            let back2 = post(opp(q), wrapped(coords(b) + c_of(q)));
+            return wall * (1.0 + 2.0 * wall) * into + (1.0 - 4.0 * wall * wall) * back - wall * (1.0 - 2.0 * wall) * back2;
+        }
+        let w = 2.0 * wall;
+        return w * into + (1.0 - w) * back;
+    }
+    let own = post(q, cell);
+    if order == 2u {
+        let own2 = post(q, wrapped(coords(cell) + c_of(q)));
+        return into / (wall * (2.0 * wall + 1.0)) + (2.0 * wall - 1.0) / wall * own - (2.0 * wall - 1.0) / (2.0 * wall + 1.0) * own2;
+    }
+    let w = 2.0 * wall;
+    return into / w + (w - 1.0) / w * own;
+}
+
 fn gather_link(l: u32, exchange: bool) {
     if l >= params.links { return; }
     let n = params.n;
@@ -2177,7 +2207,11 @@ fn gather_link(l: u32, exchange: bool) {
     if kind == KIND_PULL {
         v = post(q, lu.y);
     } else if kind == KIND_BOUNCE {
-        v = post(opp(q), cell) + link_f[l] * params.ramp.x;
+        if q2 != 0u {
+            v = interpolated_wall(q, cell, link_f[l], q2);
+        } else {
+            v = post(opp(q), cell) + link_f[l] * params.ramp.x;
+        }
     } else if kind == KIND_REFLECT {
         // The mirrored direction has the same weight, so h reflects like f.
         v = post(q2, lu.y);
@@ -2185,11 +2219,59 @@ fn gather_link(l: u32, exchange: bool) {
     } else {
         v = post(opp(q), cell);
     }
+    // What an interpolated wall link returned beyond what left along it (`wall_mass`).
+    var created = 0.0;
+    if WALL_MASS && kind == KIND_BOUNCE && q2 != 0u { created = v - post(opp(q), cell); }
     if AA_MODE {
         g[l] = v;
-        if exchange { contrib[l] = vec4<f32>(momentum_exchange(l, lu, q, kind, q2), 0.0); }
+        if exchange { contrib[l] = vec4<f32>(momentum_exchange(l, lu, q, kind, q2), created); }
+        else if WALL_MASS && kind == KIND_BOUNCE && q2 != 0u { contrib[l].w = created; }
     } else {
         g[q * n + cell] = v;
+        if WALL_MASS && kind == KIND_BOUNCE && q2 != 0u { contrib[l].w = created; }
+    }
+}
+
+// Error-free sum of two floats: the rounded sum and what the rounding lost.
+fn two_sum(a: f32, b: f32) -> vec2<f32> {
+    let s = a + b;
+    let bb = s - a;
+    return vec2<f32>(s, (a - (s - bb)) + (b - bb));
+}
+
+// A sum kept as an unevaluated pair (high, low), so the cancellation between the links' terms does
+// not eat the digits of the small net; fixed order, so the same on every run of a device.
+fn pair_add(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {
+    let s = two_sum(a.x, b.x);
+    let t = two_sum(s.x, s.y + a.y + b.y);
+    return vec2<f32>(t.x + t.y, t.y - ((t.x + t.y) - t.x));
+}
+
+// One workgroup: the sum over the interpolated links of the mass they created this step, taken
+// off every fluid cell next (stats[8] is each cell's share, with the weights, in `population`).
+// The link at index `links` of `link_u` carries the number of fluid cells.
+@compute @workgroup_size(256)
+fn wall_mass(@builtin(local_invocation_index) lid: u32) {
+    var acc = vec2<f32>(0.0);
+    for (var l = lid; l < params.links; l = l + WG) {
+        let lu = link_u[l];
+        if ((lu.x >> 8u) & 0xffu) == KIND_BOUNCE && ((lu.x >> 16u) & 0xffu) != 0u {
+            acc = pair_add(acc, vec2<f32>(contrib[l].w, 0.0));
+        }
+    }
+    red[lid] = vec4<f32>(acc, 0.0, 0.0);
+    workgroupBarrier();
+    for (var k = 128u; k > 0u; k = k >> 1u) {
+        if lid < k {
+            let p = pair_add(red[lid].xy, red[lid + k].xy);
+            red[lid] = vec4<f32>(p, 0.0, 0.0);
+        }
+        workgroupBarrier();
+    }
+    if lid == 0u {
+        let cells = f32(link_u[params.links].x);
+        let total = red[0].x + red[0].y;
+        atomicStore(&stats[8], bitcast<u32>(-total / max(cells, 1.0)));
     }
 }
 
@@ -2452,7 +2534,8 @@ fn momentum_exchange(l: u32, lu: vec4<u32>, q: u32, kind: u32, q2: u32) -> vec3<
     var v = vec3<f32>(0.0);
     if kind == KIND_BOUNCE {
         let out = post(opp(q), lu.w);
-        let back = out + link_f[l] * params.ramp.x;
+        var back = out + link_f[l] * params.ramp.x;
+        if q2 != 0u { back = interpolated_wall(q, lu.w, link_f[l], q2); }
         v = -vec3<f32>(c_of(q)) * (out + back);
     } else if kind == KIND_REFLECT {
         let out = post(q2, lu.y);

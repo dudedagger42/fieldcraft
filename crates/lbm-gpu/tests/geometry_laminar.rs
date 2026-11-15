@@ -131,8 +131,7 @@ fn errors(p: &Probe, f: &Fields) -> Option<[f64; 5]> {
 fn drive(name: &str, cpu: fieldcraft_lbm::Flow, probe: &Probe, steps: u64, extra: &str) {
     let chunk = env("CHUNK", 500.0) as u64;
     let print_every = env("PRINT", 2000.0) as u64;
-    let interp = env("INTERP", 0.0) > 0.5;
-    let (use_cpu, use_gpu) = (env("CPU", 1.0) > 0.5, env("GPU", 1.0) > 0.5 && !interp);
+    let (use_cpu, use_gpu) = (env("CPU", 1.0) > 0.5, env("GPU", 1.0) > 0.5);
     let mut cpu = cpu;
     let mut gpu = if use_gpu {
         match Policy::from_env()
@@ -164,6 +163,7 @@ fn drive(name: &str, cpu: fieldcraft_lbm::Flow, probe: &Probe, steps: u64, extra
     };
     let rho_start = if use_cpu { Backend::fields(&mut cpu).ok().map(|f| mean_rho(&f)) } else { None };
     let mut rho_last = rho_start;
+    let mut rho_gpu: Option<f64> = None;
     let (mut done, mut last_print) = (0u64, 0u64);
     let (mut last_cpu, mut last_gpu): (Option<[f64; 5]>, Option<[f64; 5]>) = (None, None);
     let (mut cpu_ok, mut gpu_ok) = (use_cpu, gpu.is_some());
@@ -186,15 +186,27 @@ fn drive(name: &str, cpu: fieldcraft_lbm::Flow, probe: &Probe, steps: u64, extra
         done += c;
         if done - last_print >= print_every || done >= steps {
             last_print = done;
-            let a = if cpu_ok {
-                Backend::fields(&mut cpu).ok().and_then(|f| {
-                    rho_last = Some(mean_rho(&f));
-                    errors(probe, &f)
-                })
-            } else {
-                None
-            };
-            let b = if gpu_ok { gpu.as_mut().and_then(|g| Backend::fields(g).ok()).and_then(|f| errors(probe, &f)) } else { None };
+            let fa = if cpu_ok { Backend::fields(&mut cpu).ok() } else { None };
+            let fb = if gpu_ok { gpu.as_mut().and_then(|g| Backend::fields(g).ok()) } else { None };
+            let a = fa.as_ref().and_then(|f| {
+                rho_last = Some(mean_rho(f));
+                errors(probe, f)
+            });
+            let b = fb.as_ref().and_then(|f| {
+                rho_gpu = Some(mean_rho(f));
+                errors(probe, f)
+            });
+            if let (Some(x), Some(y)) = (&fa, &fb) {
+                // The device against the CPU, cell by cell, in lattice units (the f32 solver's bar is 1e-5).
+                let (mut du, mut drho) = (0.0f64, 0.0f64);
+                for ((fl, (u, v)), (r, s)) in probe.fluid.iter().zip(x.velocity.iter().zip(&y.velocity)).zip(x.density.iter().zip(&y.density)) {
+                    if *fl {
+                        du = du.max((0..3).map(|k| (u[k] - v[k]).abs()).fold(0.0, f64::max));
+                        drho = drho.max((r - s).abs());
+                    }
+                }
+                println!("PARITY step {done}: largest |u cpu - u gpu| {du:.3e}, largest |rho cpu - rho gpu| {drho:.3e} (lattice units)");
+            }
             last_cpu = a.or(last_cpu);
             last_gpu = b.or(last_gpu);
             let show = |who: &str, e: Option<[f64; 5]>| match e {
@@ -209,6 +221,17 @@ fn drive(name: &str, cpu: fieldcraft_lbm::Flow, probe: &Probe, steps: u64, extra
     }
     if let (Some(a), Some(b)) = (rho_start, rho_last) {
         println!("DRIFT {name}: mean density {a:.9} -> {b:.9}, {:+.3e} per 10000 steps", (b - a) / done.max(1) as f64 * 1e4);
+    }
+    if let (Some(a), Some(b)) = (rho_start, rho_gpu) {
+        println!("DRIFT {name} gpu: mean density {a:.9} -> {b:.9}, {:+.3e} per 10000 steps", (b - a) / done.max(1) as f64 * 1e4);
+    }
+    let (mass_steps, created) = cpu.wall_mass_created();
+    if mass_steps > 0 {
+        let total = cpu.fluid_cells() as f64;
+        println!(
+            "WALLMASS {name}: the walls created {created:+.3e} over {mass_steps} steps (lattice units, {total} cells): {:+.3e} of the total mass per 10000 steps; the correction took it off",
+            created / total / mass_steps as f64 * 1e4
+        );
     }
     for (who, e) in [("cpu", last_cpu), ("gpu", last_gpu)] {
         if let Some(e) = e {

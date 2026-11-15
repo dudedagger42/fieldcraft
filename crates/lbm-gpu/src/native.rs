@@ -270,6 +270,8 @@ pub struct GpuFlow {
     n: usize,
     cells: (u32, u32),
     link_count: usize,
+    /// The interpolated walls' global mass correction runs after every step's links.
+    wall_mass: bool,
     links_groups: (u32, u32),
     /// The wall model's sample dispatch, when there are modelled wall cells, and its buffer.
     wall_groups: Option<(u32, u32)>,
@@ -618,7 +620,7 @@ fn solid_data(solid: &fieldcraft_lbm::conduction::SolidHeat, t0: f64) -> Result<
 }
 
 /// The entry points of `lbm.wgsl` a flow dispatches.
-const KERNELS: [&str; 40] = [
+const KERNELS: [&str; 41] = [
     "clear_eddy",
     "gradient_velocity",
     "fan_partials",
@@ -634,6 +636,7 @@ const KERNELS: [&str; 40] = [
     "stream_links",
     "stream_links_exchange",
     "scatter_links",
+    "wall_mass",
     "outlet_convect",
     "open_boundaries",
     "link_forces",
@@ -751,6 +754,8 @@ struct Variant {
     sa: bool,
     /// Its wall function is the model's own constant-stress law (`sa_law`), not Spalding's.
     sa_law: bool,
+    /// The interpolated walls' global mass correction (`wall_mass`).
+    wall_mass: bool,
 }
 
 /// A compiled kernel: its pipeline, its bind group's layout and the bindings in it.
@@ -804,6 +809,7 @@ fn compile(device: &wgpu::Device, variant: Variant) -> Result<Kernels> {
                     ("ZONES", if variant.zones { 1.0 } else { 0.0 }),
                     ("SA", if variant.sa { 1.0 } else { 0.0 }),
                     ("SA_LAW", if variant.sa_law { 1.0 } else { 0.0 }),
+                    ("WALL_MASS", if variant.wall_mass { 1.0 } else { 0.0 }),
                     ("MAX_SPEED", MAX_LATTICE_SPEED),
                 ],
                 ..Default::default()
@@ -1156,9 +1162,18 @@ impl GpuFlow {
         let mut weight_forces = filled(group_count, [0.0f64; 3], "force groups")?;
         let c = |q: u32| C.get(q as usize).copied().unwrap_or([0; 3]).map(f64::from);
         let w = |q: u32| W.get(q as usize).copied().unwrap_or(0.0);
+        // The interpolated walls: a bounce link with the order in q2 and the wall's fraction where
+        // the moving-wall term would be (a wall at rest has none).
+        let interpolated = flow.interpolated_links();
+        let mut next_interpolated = interpolated.iter().peekable();
         for (l, link) in links.iter().enumerate() {
+            let wall = next_interpolated.next_if(|e| e.link as usize == l).copied();
             let (kind, from, group, q2, du) = match link.rule {
                 Rule::Pull { from } => (KIND_PULL, from, 0, 0, 0.0),
+                Rule::Bounce { group, .. } if wall.is_some() => {
+                    let e = wall.unwrap_or_default();
+                    (KIND_BOUNCE, 0, group, u32::from(e.order), e.wall)
+                }
                 Rule::Bounce { group, du } => (KIND_BOUNCE, 0, group, 0, du),
                 Rule::Reflect { from, q, group } => (KIND_REFLECT, from, group, u32::from(q), 0.0),
                 Rule::Open => (KIND_OPEN, 0, 0, 0, 0.0),
@@ -1215,6 +1230,9 @@ impl GpuFlow {
             }
         }
         let by_group: Vec<u32> = by_group.iter().map(|(_, l)| *l).collect();
+        // The interpolated walls' correction: the fluid cells it spreads over, in a word after the links.
+        let wall_mass = flow.wall_mass_global() && !interpolated.is_empty();
+        link_u.extend_from_slice(&[u32::try_from(flow.fluid_cells()).unwrap_or(u32::MAX), 0, 0, 0]);
         // Each group's thermal condition (held temperatures shifted by T₀).
         let mut group_t = reserved(4 * group_count, "thermal conditions")?;
         for g in 0..group_count {
@@ -1499,7 +1517,8 @@ impl GpuFlow {
         // (three f32 per cell) for the finite-difference gradient.
         let gradients = hybrid.is_some() || flow.vreman() > 0.0 || sa_faces.is_some();
         let velocity = empty("lbm gradient velocities", if gradients { 12 * n as u64 } else { 16 });
-        let stats = storage("lbm stats", &bytes_u32(&[0; 8]));
+        // Words 0..8 are cleared every chunk; word 8 keeps the wall mass correction between steps.
+        let stats = storage("lbm stats", &bytes_u32(&[0; 16]));
         // The Spalart–Allmaras model: ν̃ (from the host's initial field), the sub-step rates, and
         // each cell's vorticity, wall distance, destruction length (the distance until the first
         // `sa_prepare`) and DDES's f_d, all as f32.
@@ -1522,7 +1541,8 @@ impl GpuFlow {
             _ => (empty("lbm sa nu_tilde", 16), empty("lbm sa rates", 16), empty("lbm sa cells", 16)),
         };
         // Each link's exchange, then each boundary node's own slot (`wall_forces`).
-        let contrib = empty("lbm link forces", 16 * (links.len() as u64 + u64::from(node_slots)));
+        // One slot after the links and the nodes' holds the wall mass correction.
+        let contrib = empty("lbm link forces", 16 * (links.len() as u64 + u64::from(node_slots) + 1));
         let by_group = storage("lbm links by group", &bytes_u32(&by_group));
         let group_start = storage("lbm group start", &bytes_u32(&group_start));
         let forces = empty("lbm forces", 16 * group_count as u64);
@@ -1560,6 +1580,7 @@ impl GpuFlow {
             zones: zones.zones > 0,
             sa: sa_faces.is_some(),
             sa_law,
+            wall_mass,
         })?;
         // Every binding's buffer in bind group k (the two differ in the phase and the A–B swap).
         let resource = |binding: u32, k: usize| -> Option<&wgpu::Buffer> {
@@ -1632,6 +1653,7 @@ impl GpuFlow {
             n,
             cells,
             link_count: links.len(),
+            wall_mass,
             links_groups,
             wall_groups: if wall_count > 0 { Some(groups(wall_count)?) } else { None },
             wall_bounce: bounce,
@@ -2085,6 +2107,9 @@ impl GpuFlow {
                 commands.push((self.current, if exchange { "stream_links_exchange" } else { "stream_links" }, self.links_groups));
                 if self.aa {
                     commands.push((self.current, "scatter_links", self.links_groups));
+                }
+                if self.wall_mass {
+                    commands.push((self.current, "wall_mass", (1, 1)));
                 }
             }
             if self.prepare_outlets {
