@@ -1158,18 +1158,29 @@ fn write_profile(path: &std::path::Path, flow: &Flow, step: &Step) -> Result<(),
     let i = ((step.upstream - 4.0) / h).floor().clamp(0.0, g.cells[0] as f64 - 1.0) as usize;
     let nu = flow.spalart_allmaras().map(|f| f.nu_tilde().to_vec()).ok_or("the flow has no Spalart–Allmaras field")?;
     let nu_lat = step.lattice_velocity * h * step.re_h.recip() / h / h;
-    let mut text = String::from("# z/H  u/U_ref  nu_tilde/nu
-");
+    let mut text = String::from(
+        "# z/H  u/U_ref  nu_tilde/nu
+",
+    );
     let k0 = ((1.0 + h) / h).floor() as usize;
     let middle = ((0.5 * (1.0 + step.roof()) + 1.0) / h).floor().clamp(0.0, nz as f64 - 1.0) as usize;
-    let mean = |k: usize, f: &dyn Fn(usize) -> f64| (0..ny).map(|j| f(g.index([i, j, k]))).sum::<f64>() / ny as f64;
-    let u_ref = mean(middle, &|c| flow.moments(c).map_or(f64::NAN, |m| m.1[0]));
+    // The span-mean of `f` over the fluid cells of row k (None when the row has none: an on-node wall's nodes are not fluid).
+    let mean = |k: usize, f: &dyn Fn(usize) -> Option<f64>| {
+        let v: Vec<f64> = (0..ny).filter_map(|j| f(g.index([i, j, k]))).collect();
+        (!v.is_empty()).then(|| v.iter().sum::<f64>() / v.len() as f64)
+    };
+    let u_of = |c: usize| flow.moments(c).map(|m| m.1[0]);
+    let u_ref = mean(middle, &u_of).ok_or("the middle row has no fluid cell")?;
+    // The profile starts at the first fluid row; rows without fluid (the wall nodes) are left out.
     for k in k0..=middle {
-        let u = mean(k, &|c| flow.moments(c).map_or(f64::NAN, |m| m.1[0]));
-        let t = mean(k, &|c| nu.get(c).copied().unwrap_or(f64::NAN));
+        let (Some(u), Some(t)) = (mean(k, &u_of), mean(k, &|c| nu.get(c).copied())) else { continue };
         let z = g.origin[2] + (k as f64 + 0.5) * g.spacing;
-        text.push_str(&format!("{z:.6} {:.8} {:.6}
-", u / u_ref, t / nu_lat));
+        text.push_str(&format!(
+            "{z:.6} {:.8} {:.6}
+",
+            u / u_ref,
+            t / nu_lat
+        ));
     }
     std::fs::write(path, text).map_err(|e| format!("{}: {e}", path.display()))
 }
@@ -1473,4 +1484,18 @@ fn a_field_carries_from_the_full_step_to_the_short_extruded_one() {
         }
     }
     assert!(checked >= gt.cells[1], "{checked} cells compared");
+}
+
+/// Writes the inlet profile (`FIELDCRAFT_STEP_PROFILE`) from a restart file (`FIELDCRAFT_STEP_RESTART`) without stepping, at the
+/// grid of `FIELDCRAFT_STEP_CELLS_PER_H` (the case's other knobs as for the run that wrote the restart).
+#[test]
+#[ignore = "local: re-extracts the profile from a restart, FIELDCRAFT_STEP_RESTART and FIELDCRAFT_STEP_PROFILE"]
+fn a_restart_writes_its_profile() {
+    let file = std::path::PathBuf::from(std::env::var("FIELDCRAFT_STEP_RESTART").expect("FIELDCRAFT_STEP_RESTART"));
+    let out = std::path::PathBuf::from(std::env::var("FIELDCRAFT_STEP_PROFILE").expect("FIELDCRAFT_STEP_PROFILE"));
+    let step = sa_step_in(sa_rans(), false, 0.0);
+    let (mut flow, _, _) = step.build();
+    load(&file, &mut flow);
+    write_profile(&out, &flow, &step).expect("profile written");
+    println!("profile written to {}", out.display());
 }
