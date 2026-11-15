@@ -22,22 +22,60 @@
 //! text could not be opened for this implementation; the two forms were derived and checked
 //! against that continuity and against the Poiseuille test below.)
 //!
+//! **Quadratic form** (`WallOrder::Quadratic`). The same characteristic read from three nodes in line
+//! (Lagrange interpolation, derived here the same way): for `q < 1/2`
+//! `f_-i(x) = q (1 + 2 q) f*_i(x) + (1 - 4 q^2) f*_i(x - c_i) - q (1 - 2 q) f*_i(x - 2 c_i)`, and for `q >= 1/2`
+//! `f_-i(x) = f*_i(x) / (q (2 q + 1)) + (2 q - 1) / q f*_-i(x) - (2 q - 1) / (2 q + 1) f*_-i(x - c_i)`. The
+//! coefficients sum to one and both reduce to plain bounce-back at `q = 1/2`. A link without the third
+//! node falls back to the linear rule, one without the second to the half-way wall; the report counts
+//! each.
+//!
 //! **Fallbacks.** A link whose cell behind is not a fluid cell (a thin passage) keeps the
 //! half-way rule when `q < 1/2`, as does one whose segment meets no surface; both are counted
 //! ([`InterpolationReport`]). A link with `|q - 1/2| < 1e-9` is plain bounce-back, so a wall that
 //! already sits half way (every grid-aligned one) is bit for bit what it was. Walls at rest only.
 //!
-//! The scheme does not conserve mass exactly; the drift is reported by the tests, not corrected.
+//! **Mass.** On a slanted wall the link rule returns another amount than left along the link, so
+//! the scheme leaks mass steadily (an aligned wall does not: `q = 1/2` returns what left). A local
+//! correction removes it: for each wall node, `delta` is the sum over its interpolated links of
+//! (returned - sent), and `delta w_i` is taken from each of the node's 19 populations. The lattice
+//! weights sum to one and carry no momentum, so the node loses exactly what the wall gave it, no
+//! momentum is added and nothing needs a global sum. At `q = 1/2` the term is exactly zero. This is
+//! a design choice of FieldCraft's, not a published scheme.
 
-use crate::lattice::opposite;
+use crate::lattice::{Q, W, opposite};
+
+/// The order of the interpolation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum WallOrder {
+    /// Two nodes (Bouzidi, Firdaouss and Lallemand's linear scheme).
+    #[default]
+    Linear,
+    /// Three nodes in line where the flow has them, linear elsewhere.
+    Quadratic,
+}
+
+/// How the mass the interpolated walls create is taken back.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MassFix {
+    /// Not at all (to measure the leak).
+    Off,
+    /// Each wall node gives back what its own links created.
+    Local,
+    /// Every step the mass lost or gained since the start is spread over all fluid cells.
+    #[default]
+    Global,
+}
 
 /// How the links of a flow were treated.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct InterpolationReport {
     /// Bounce-back links into obstacles at rest.
     pub links: usize,
-    /// Links with an interpolated rule.
+    /// Links with an interpolated rule (linear or quadratic).
     pub interpolated: usize,
+    /// Of those, the links with the quadratic rule (three nodes in line).
+    pub quadratic: usize,
     /// Links whose wall already lies half way (`|q - 1/2| < 1e-9`): plain bounce-back.
     pub half_way: usize,
     /// Links with `q < 1/2` whose cell behind is not a fluid cell: plain bounce-back.
@@ -56,8 +94,12 @@ pub(crate) struct Entry {
     pub dir: u8,
     /// The wall's fraction of the link.
     pub wall: f64,
-    /// The cell behind (`q < 1/2`), or `u32::MAX`.
+    /// The cell behind (away from the wall), or `u32::MAX` when the rule does not use it.
     pub behind: u32,
+    /// The cell two links behind, for the quadratic rule of `q < 1/2`, or `u32::MAX`.
+    pub behind2: u32,
+    /// 2 for the quadratic rule, 1 for the linear one.
+    pub order: u8,
 }
 
 /// The interpolated links of a flow, in link order.
@@ -65,21 +107,122 @@ pub(crate) struct Entry {
 pub struct Interpolated {
     pub(crate) entries: Vec<Entry>,
     pub report: InterpolationReport,
+    /// The entry indices ordered by cell, and per wall node its cell with the range of `order`.
+    order: Vec<u32>,
+    nodes: Vec<(u32, u32, u32)>,
+    /// How the mass the wall links create is taken back (`Global` by default).
+    pub(crate) mass_fix: MassFix,
+    /// The total mass of the fluid cells when the correction began (the global kind's target).
+    mass0: Option<f64>,
 }
 
 impl Interpolated {
+    pub(crate) fn new(entries: Vec<Entry>, report: InterpolationReport) -> Self {
+        let mut order: Vec<u32> = (0..entries.len() as u32).collect();
+        order.sort_by_key(|&k| (entries.get(k as usize).map_or(u32::MAX, |e| e.cell), k));
+        let mut nodes: Vec<(u32, u32, u32)> = Vec::new();
+        for (at, &k) in order.iter().enumerate() {
+            let Some(e) = entries.get(k as usize) else { continue };
+            match nodes.last_mut() {
+                Some(n) if n.0 == e.cell => n.2 = at as u32 + 1,
+                _ => nodes.push((e.cell, at as u32, at as u32 + 1)),
+            }
+        }
+        Self { entries, report, order, nodes, mass_fix: MassFix::default(), mass0: None }
+    }
+
+    /// Take from every wall node the mass its interpolated links created, spread over its
+    /// populations by the lattice weights. `f` are the post-collision populations, `g` the
+    /// streamed ones (already carrying the interpolated values).
+    pub(crate) fn conserve_mass(&self, f: &[f64], g: &mut [f64], stride: usize) {
+        if self.mass_fix != MassFix::Local {
+            return;
+        }
+        for &(cell, start, end) in &self.nodes {
+            let mut delta = 0.0;
+            for &k in self.order.get(start as usize..end as usize).unwrap_or_default() {
+                let Some(e) = self.entries.get(k as usize) else { continue };
+                let (Some(v), Some(sent)) = (Self::incoming(e, f, stride), f.get(opposite(usize::from(e.dir)) * stride + e.cell as usize)) else {
+                    continue;
+                };
+                delta += v - sent;
+            }
+            for i in 0..Q {
+                if let Some(x) = g.get_mut(i * stride + cell as usize) {
+                    *x -= delta * W[i];
+                }
+            }
+        }
+    }
+
+    /// The global kind: spread what the walls added to (or took from) the total mass of the fluid
+    /// cells since the first step evenly over them, by the lattice weights, so no momentum is added.
+    /// `f` are the post-collision populations (their total is the target the first time), `g` the
+    /// streamed ones. The sums run in cell order.
+    pub(crate) fn conserve_mass_everywhere(&mut self, fluid: &[bool], f: &[f64], g: &mut [f64], stride: usize) {
+        if self.mass_fix != MassFix::Global || self.entries.is_empty() {
+            return;
+        }
+        let total = |p: &[f64]| -> (f64, usize) {
+            let mut sum = 0.0;
+            let mut cells = 0;
+            for (cell, &on) in fluid.iter().enumerate() {
+                if on {
+                    cells += 1;
+                    for i in 0..Q {
+                        sum += p.get(i * stride + cell).copied().unwrap_or(0.0);
+                    }
+                }
+            }
+            (sum, cells)
+        };
+        let target = match self.mass0 {
+            Some(m) => m,
+            None => {
+                let m = total(f).0;
+                self.mass0 = Some(m);
+                m
+            }
+        };
+        let (now, cells) = total(g);
+        if cells == 0 {
+            return;
+        }
+        let each = (target - now) / cells as f64;
+        for (cell, &on) in fluid.iter().enumerate() {
+            if on {
+                for i in 0..Q {
+                    if let Some(x) = g.get_mut(i * stride + cell) {
+                        *x += each * W[i];
+                    }
+                }
+            }
+        }
+    }
+
     /// The population of `entry` after streaming, from the post-collision populations `f`
     /// (`stride` between directions); `None` when an index is out of range.
     pub(crate) fn incoming(entry: &Entry, f: &[f64], stride: usize) -> Option<f64> {
-        let (cell, q) = (entry.cell as usize, usize::from(entry.dir));
-        let into = f.get(opposite(q) * stride + cell).copied()?;
-        let w = 2.0 * entry.wall;
-        if entry.behind != u32::MAX {
-            let back = f.get(opposite(q) * stride + entry.behind as usize).copied()?;
-            Some(w * into + (1.0 - w) * back)
+        let into = f.get(opposite(usize::from(entry.dir)) * stride + entry.cell as usize).copied()?;
+        let q = entry.wall;
+        if q < 0.5 {
+            let back = f.get(opposite(usize::from(entry.dir)) * stride + entry.behind as usize).copied()?;
+            if entry.order == 2 {
+                let back2 = f.get(opposite(usize::from(entry.dir)) * stride + entry.behind2 as usize).copied()?;
+                Some(q * (1.0 + 2.0 * q) * into + (1.0 - 4.0 * q * q) * back - q * (1.0 - 2.0 * q) * back2)
+            } else {
+                let w = 2.0 * q;
+                Some(w * into + (1.0 - w) * back)
+            }
         } else {
-            let own = f.get(q * stride + cell).copied()?;
-            Some(into / w + (w - 1.0) / w * own)
+            let own = f.get(usize::from(entry.dir) * stride + entry.cell as usize).copied()?;
+            if entry.order == 2 {
+                let own2 = f.get(usize::from(entry.dir) * stride + entry.behind as usize).copied()?;
+                Some(into / (q * (2.0 * q + 1.0)) + (2.0 * q - 1.0) / q * own - (2.0 * q - 1.0) / (2.0 * q + 1.0) * own2)
+            } else {
+                let w = 2.0 * q;
+                Some(into / w + (w - 1.0) / w * own)
+            }
         }
     }
 
@@ -93,38 +236,65 @@ impl Interpolated {
 mod tests {
     use super::*;
 
-    /// Two directions of one cell and one behind it: stride 1, `f_i*(x) = 3` at index 0, `f_i*(x - c_i) = 5` at index 1 (direction 1
-    /// is the opposite of direction 2 in the lattice's order).
-    fn populations() -> (Vec<f64>, usize) {
-        let q = 2;
-        let i = opposite(q);
-        let mut f = vec![0.0; crate::lattice::Q * 2];
-        f[i * 2] = 3.0;
-        f[i * 2 + 1] = 5.0;
-        f[q * 2] = 7.0;
+    /// Populations of one direction `q = 2` and its opposite on four cells in a line, `cell`
+    /// first, then the one behind it and the one behind that: stride 4.
+    fn line(into: [f64; 3], own: [f64; 3]) -> (Vec<f64>, usize) {
+        let (q, stride) = (2, 4);
+        let mut f = vec![0.0; crate::lattice::Q * stride];
+        for k in 0..3 {
+            f[opposite(q) * stride + k] = into[k];
+            f[q * stride + k] = own[k];
+        }
         (f, q)
     }
 
+    fn entry(q: usize, wall: f64, order: u8) -> Entry {
+        Entry { link: 0, cell: 0, dir: q as u8, wall, behind: 1, behind2: 2, order }
+    }
+
     #[test]
-    fn both_forms_give_plain_bounce_back_at_the_half_way_wall_and_join_there() {
-        let (f, q) = populations();
-        let near = Entry { link: 0, cell: 0, dir: q as u8, wall: 0.5, behind: 1 };
-        let far = Entry { link: 0, cell: 0, dir: q as u8, wall: 0.5, behind: u32::MAX };
-        assert_eq!(Interpolated::incoming(&near, &f, 2), Some(3.0));
-        assert_eq!(Interpolated::incoming(&far, &f, 2), Some(3.0));
+    fn the_rules_give_plain_bounce_back_at_the_half_way_wall_and_join_there() {
+        let (f, q) = line([3.0, 5.0, 8.0], [7.0, 1.0, 2.0]);
+        for order in [1, 2] {
+            assert_eq!(Interpolated::incoming(&entry(q, 0.5, order), &f, 4), Some(3.0));
+        }
+        // From below, the near forms approach it.
+        for order in [1, 2] {
+            let v = Interpolated::incoming(&entry(q, 0.5 - 1e-12, order), &f, 4).unwrap_or(f64::NAN);
+            assert!((v - 3.0).abs() < 1e-9, "{v}");
+        }
     }
 
     #[test]
     fn the_linear_forms_weigh_the_populations_by_the_wall_distance() {
-        let (f, q) = populations();
+        let (f, q) = line([3.0, 5.0, 8.0], [7.0, 1.0, 2.0]);
         // q = 1/4: half of f_i*(x) and half of the one behind.
-        let near = Entry { link: 0, cell: 0, dir: q as u8, wall: 0.25, behind: 1 };
-        assert_eq!(Interpolated::incoming(&near, &f, 2), Some(4.0));
+        assert_eq!(Interpolated::incoming(&entry(q, 0.25, 1), &f, 4), Some(4.0));
         // q = 1: half of f_i*(x) and half of the population that left the wall's way.
-        let far = Entry { link: 0, cell: 0, dir: q as u8, wall: 1.0, behind: u32::MAX };
-        assert_eq!(Interpolated::incoming(&far, &f, 2), Some(5.0));
+        assert_eq!(Interpolated::incoming(&entry(q, 1.0, 1), &f, 4), Some(5.0));
         // An index out of range is no value, not a panic.
-        let bad = Entry { link: 0, cell: 99, dir: q as u8, wall: 0.25, behind: 1 };
-        assert_eq!(Interpolated::incoming(&bad, &f, 2), None);
+        let bad = Entry { cell: 99, ..entry(q, 0.25, 1) };
+        assert_eq!(Interpolated::incoming(&bad, &f, 4), None);
+    }
+
+    #[test]
+    fn the_quadratic_forms_follow_a_parabola_and_keep_a_constant() {
+        // q < 1/2: the populations of three cells in line lie on a parabola of the position s
+        // (0, -1, -2); the characteristic starts at s = 2 q - 1.
+        let para = |s: f64| 1.5 - 0.7 * s + 0.4 * s * s;
+        let (f, q) = line([para(0.0), para(-1.0), para(-2.0)], [0.0; 3]);
+        for wall in [0.05, 0.2, 0.37, 0.49] {
+            let v = Interpolated::incoming(&entry(q, wall, 2), &f, 4).unwrap_or(f64::NAN);
+            assert!((v - para(2.0 * wall - 1.0)).abs() < 1e-12, "{wall}: {v}");
+        }
+        // q >= 1/2: the nodes are 2 q - 1 (the population that left), -1 and -2 (the ones behind).
+        // The value of the three nodes on a parabola is read at 0.
+        for wall in [0.5, 0.6, 0.8, 1.0] {
+            let (a, b, c) = (2.0 * wall - 1.0, -1.0, -2.0);
+            let (f, q) = line([para(a), 0.0, 0.0], [para(b), para(c), 0.0]);
+            // `own` of the cell is node -1, the one of the cell behind is node -2.
+            let v = Interpolated::incoming(&entry(q, wall, 2), &f, 4).unwrap_or(f64::NAN);
+            assert!((v - para(0.0)).abs() < 1e-12, "{wall}: {v}");
+        }
     }
 }

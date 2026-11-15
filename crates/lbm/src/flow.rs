@@ -2046,7 +2046,17 @@ impl Flow {
     /// obstacle's surface cuts it. Call once, on a fresh flow, with the setup and obstacles it was
     /// built from. Refused with a wall model, heat, a free surface or a moving obstacle wall.
     pub fn interpolate_walls(&mut self, setup: &Setup, obstacles: &[Obstacle]) -> Result<crate::interpolated::InterpolationReport> {
-        use crate::interpolated::{Entry, Interpolated, InterpolationReport};
+        self.interpolate_walls_with(setup, obstacles, crate::interpolated::WallOrder::Linear)
+    }
+
+    /// [`Flow::interpolate_walls`] with the rule's order: linear, or quadratic where three fluid nodes lie in line.
+    pub fn interpolate_walls_with(
+        &mut self,
+        setup: &Setup,
+        obstacles: &[Obstacle],
+        order: crate::interpolated::WallOrder,
+    ) -> Result<crate::interpolated::InterpolationReport> {
+        use crate::interpolated::{Entry, Interpolated, InterpolationReport, WallOrder};
         if self.interpolated.is_some() {
             return Err(Error::Invalid("the walls are already interpolated".into()));
         }
@@ -2108,36 +2118,59 @@ impl Flow {
                 report.half_way += 1;
                 continue;
             }
-            let mut behind = u32::MAX;
-            if t < 0.5 {
-                let ijk = self.grid.coords(cell);
-                let mut at = [0i64; 3];
-                let mut ok = true;
+            // The cells behind the fluid cell, one and two links away from the wall (wrapped across
+            // periodic faces), when they are fluid.
+            let ijk = self.grid.coords(cell);
+            let fluid_behind = |steps: i64| -> Option<u32> {
+                let mut at = [0usize; 3];
                 for a in 0..3 {
-                    let mut v = ijk[a] as i64 + i64::from(C[q][a]);
+                    let mut v = ijk[a] as i64 + steps * i64::from(C[q][a]);
                     if v < 0 || v >= dims[a] {
-                        if self.periodic[a] {
-                            v = v.rem_euclid(dims[a]);
-                        } else {
-                            ok = false;
+                        if !self.periodic[a] {
+                            return None;
                         }
+                        v = v.rem_euclid(dims[a]);
                     }
-                    at[a] = v;
+                    at[a] = v as usize;
                 }
-                let idx = ok.then(|| self.grid.index([at[0] as usize, at[1] as usize, at[2] as usize]));
-                match idx {
-                    Some(b) if self.fluid.get(b).copied().unwrap_or(false) => behind = b as u32,
+                let idx = self.grid.index(at);
+                self.fluid.get(idx).copied().unwrap_or(false).then_some(idx as u32)
+            };
+            let (behind, behind2) = (fluid_behind(1), fluid_behind(2));
+            let quadratic = order == WallOrder::Quadratic;
+            let entry = if t < 0.5 {
+                match (behind, behind2) {
+                    (Some(b), Some(b2)) if quadratic => {
+                        Entry { link: index as u32, cell: link.cell, dir: link.q, wall: t, behind: b, behind2: b2, order: 2 }
+                    }
+                    (Some(b), _) => Entry { link: index as u32, cell: link.cell, dir: link.q, wall: t, behind: b, behind2: u32::MAX, order: 1 },
                     _ => {
                         report.no_second_node += 1;
                         continue;
                     }
                 }
-            }
+            } else {
+                match behind {
+                    Some(b) if quadratic => {
+                        Entry { link: index as u32, cell: link.cell, dir: link.q, wall: t, behind: b, behind2: u32::MAX, order: 2 }
+                    }
+                    _ => Entry { link: index as u32, cell: link.cell, dir: link.q, wall: t, behind: u32::MAX, behind2: u32::MAX, order: 1 },
+                }
+            };
             report.interpolated += 1;
-            entries.push(Entry { link: index as u32, cell: link.cell, dir: link.q, wall: t, behind });
+            report.quadratic += usize::from(entry.order == 2);
+            entries.push(entry);
         }
-        self.interpolated = Some(Interpolated { entries, report });
+        self.interpolated = Some(Interpolated::new(entries, report));
         Ok(report)
+    }
+
+    /// Choose how the interpolated walls' mass is taken back ([`crate::interpolated::MassFix`]; the
+    /// global kind is the default). Refused without interpolated walls.
+    pub fn set_wall_mass_correction(&mut self, fix: crate::interpolated::MassFix) -> Result<()> {
+        let ip = self.interpolated.as_mut().ok_or_else(|| Error::Invalid("this flow has no interpolated walls".into()))?;
+        ip.mass_fix = fix;
+        Ok(())
     }
 
     pub fn grid(&self) -> &Grid {
@@ -3430,6 +3463,10 @@ impl Flow {
                     *x = v;
                 }
             }
+            ip.conserve_mass(&self.f, &mut self.g, s);
+        }
+        if let Some(ip) = &mut self.interpolated {
+            ip.conserve_mass_everywhere(&self.fluid, &self.f, &mut self.g, s);
         }
         self.forces.fill([0.0; 3]);
         for link in &self.links {
