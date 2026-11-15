@@ -19,7 +19,8 @@
 //! 0.95), TURB (smag, the half-way channel test's Smagorinsky 0.1; none), WALL (none: plain half-way bounce-back; spalding or sa:
 //! the half-way wall law of that name, with SA as the turbulence), CPU (1), GPU (1: a refused device is reported and the run
 //! goes on with the CPU), WIDTH (CELLS: the channel's width in cells, fractions allowed, rotated channel only; the grid stays CELLS cells per metre), INTERP (0: 1 turns the obstacle walls to linearly interpolated bounce-back, CPU only; every sample then
-//! also prints the mean density of the fluid cells, and the result the drift per 10 000 steps).
+//! also prints the mean density of the fluid cells, and the result the drift per 10 000 steps), MASSFIX (2: the interpolated walls' mass correction, 0 off, 1 local to each wall
+//! node, 2 global), QUAD (0: 1 uses the quadratic rule), UMEAN (0.02: the exact mean speed in lattice units, the body force follows).
 // A local harness: index loops over the grid and nested ifs read better than iterator chains here.
 #![allow(clippy::needless_range_loop, clippy::collapsible_if)]
 #[path = "../../lbm/tests/common/mod.rs"]
@@ -35,6 +36,11 @@ use fieldcraft_model::{Collision, FaceCondition, HrrSigma, Procedure, Turbulence
 
 fn env(k: &str, d: f64) -> f64 {
     std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+}
+
+/// The exact mean speed in lattice units (`UMEAN`, 0.02).
+fn umean() -> f64 {
+    env("UMEAN", 0.02)
 }
 
 fn env_s(k: &str, d: &str) -> String {
@@ -118,7 +124,7 @@ fn errors(p: &Probe, f: &Fields) -> Option<[f64; 5]> {
         cross = cross.max(side.sqrt());
     }
     let q = sum / p.along;
-    Some([q / p.flow_reference - 1.0, top / top_exact - 1.0, worst / p.peak, cross / p.peak, q / (p.flow_reference / 0.02)])
+    Some([q / p.flow_reference - 1.0, top / top_exact - 1.0, worst / p.peak, cross / p.peak, q / (p.flow_reference / umean())])
 }
 
 /// Run `cpu` (and the device, when asked) for `steps` in `chunk`s and print the errors at every sample.
@@ -145,7 +151,13 @@ fn drive(name: &str, cpu: fieldcraft_lbm::Flow, probe: &Probe, steps: u64, extra
     } else {
         None
     };
-    println!("CASE {name}; {extra}; exact mean speed 0.02 lattice, peak {:.5}; steps {steps}, chunk {chunk}", probe.peak);
+    println!(
+        "CASE {name}; {extra}; exact mean speed {} lattice, peak {:.5}; viscosity {} (relaxation time {}); steps {steps}, chunk {chunk}",
+        umean(),
+        probe.peak,
+        env("NU", 0.05),
+        3.0 * env("NU", 0.05) + 0.5
+    );
     let mean_rho = |f: &Fields| {
         let (sum, n) = f.density.iter().zip(&probe.fluid).filter(|(_, fl)| **fl).fold((0.0f64, 0usize), |(s, n), (r, _)| (s + r, n + 1));
         sum / n.max(1) as f64
@@ -201,12 +213,13 @@ fn drive(name: &str, cpu: fieldcraft_lbm::Flow, probe: &Probe, steps: u64, extra
     for (who, e) in [("cpu", last_cpu), ("gpu", last_gpu)] {
         if let Some(e) = e {
             println!(
-                "RESULT {name} {who}: flow rate {:+.4} % of exact, peak {:+.4} % of exact, largest profile error {:.4} % of the exact peak, largest cross-flow {:.4} % of it; mean speed {:.6} lattice (exact 0.02)",
+                "RESULT {name} {who}: flow rate {:+.4} % of exact, peak {:+.4} % of exact, largest profile error {:.4} % of the exact peak, largest cross-flow {:.4} % of it; mean speed {:.6} lattice (exact {})",
                 100.0 * e[0],
                 100.0 * e[1],
                 100.0 * e[2],
                 100.0 * e[3],
-                e[4]
+                e[4],
+                umean()
             );
         }
     }
@@ -226,7 +239,7 @@ impl Build {
         let nu_lat = env("NU", 0.05);
         let dx = height / cells as f64;
         let dt = nu_lat * dx * dx / nu;
-        Build { dx, dt, nu_lat, u_mean_phys: 0.02 * dx / dt }
+        Build { dx, dt, nu_lat, u_mean_phys: umean() * dx / dt }
     }
 
     fn model(&self, lo: [f64; 3], hi: [f64; 3], obstacles: &[Obstacle], accel: [f64; 3], steps: u64) -> (Setup, fieldcraft_lbm::Flow, String) {
@@ -250,10 +263,21 @@ impl Build {
         let mut flow = fieldcraft_lbm::Flow::new(&setup, obstacles).unwrap_or_else(|e| panic!("flow refused: {e}"));
         let mut label = label;
         if env("INTERP", 0.0) > 0.5 {
-            let r = flow.interpolate_walls(&setup, obstacles).unwrap_or_else(|e| panic!("interpolated walls refused: {e}"));
+            let order = if env("QUAD", 0.0) > 0.5 {
+                fieldcraft_lbm::interpolated::WallOrder::Quadratic
+            } else {
+                fieldcraft_lbm::interpolated::WallOrder::Linear
+            };
+            let r = flow.interpolate_walls_with(&setup, obstacles, order).unwrap_or_else(|e| panic!("interpolated walls refused: {e}"));
+            let fix = match env("MASSFIX", 2.0) as u32 {
+                0 => fieldcraft_lbm::interpolated::MassFix::Off,
+                1 => fieldcraft_lbm::interpolated::MassFix::Local,
+                _ => fieldcraft_lbm::interpolated::MassFix::Global,
+            };
+            flow.set_wall_mass_correction(fix).unwrap_or_else(|e| panic!("{e}"));
             label = format!(
-                "{label}; interpolated walls: {} links, {} interpolated, {} half way, {} without a second node, {} without a surface",
-                r.links, r.interpolated, r.half_way, r.no_second_node, r.no_surface
+                "{label}; interpolated walls: {} links, {} interpolated ({} quadratic), {} half way, {} without a second node, {} without a surface",
+                r.links, r.interpolated, r.quadratic, r.half_way, r.no_second_node, r.no_surface
             );
         }
         (setup, flow, label)
@@ -315,7 +339,7 @@ fn rotated_channel_laminar() {
     let along_cells = if b == 0 { nx as f64 } else { ((nx * nx + ny * ny) as f64).sqrt() };
     // The exact velocity at each fluid cell from its distance to the wall plane (s in cells, measured from the plane's start).
     let hh = width;
-    let g_lat = 12.0 * g.nu_lat * 0.02 / (hh * hh);
+    let g_lat = 12.0 * g.nu_lat * umean() / (hh * hh);
     let mut exact = vec![0.0; gx * gy * gz];
     let mut spans = (f64::INFINITY, f64::NEG_INFINITY, 0usize);
     for k in 0..gz {
@@ -337,7 +361,7 @@ fn rotated_channel_laminar() {
         fluid,
         exact,
         direction: [dir[0], dir[1], 0.0],
-        flow_reference: 0.02 * hh,
+        flow_reference: umean() * hh,
         along: along_cells * gz as f64,
         peak: g_lat * hh * hh / (8.0 * g.nu_lat),
     };
@@ -399,7 +423,7 @@ fn square_duct_laminar() {
     // The body force gives the exact mean speed 0.02 lattice: U = c g H^2 / nu.
     let c = duct_flow_rate();
     let hh = h as f64;
-    let g_lat = 0.02 * g.nu_lat / (c * hh * hh);
+    let g_lat = umean() * g.nu_lat / (c * hh * hh);
     let gmag = g_lat * dx / (g.dt * g.dt);
     let (setup, flow, label) = g.model([0.0, lo, lo], [span, hi, hi], &obstacles, [gmag, 0.0, 0.0], steps);
     let grid = *flow.grid();
@@ -423,7 +447,7 @@ fn square_duct_laminar() {
     }
     // The peak at the centre: the series at 0, 0.
     let peak = duct_velocity(0.0, 0.0) * g_lat * hh * hh / g.nu_lat;
-    let probe = Probe { cells: [gx, gy, gz], fluid, exact, direction: [1.0, 0.0, 0.0], flow_reference: 0.02 * hh * hh, along: gx as f64, peak };
+    let probe = Probe { cells: [gx, gy, gz], fluid, exact, direction: [1.0, 0.0, 0.0], flow_reference: umean() * hh * hh, along: gx as f64, peak };
     let extra = format!(
         "square duct {h} x {h} cells; box {gx}x{gy}x{gz} cells; {open} fluid cells (the duct holds {} of them); exact flow rate coefficient {c:.6} (f Re Darcy {:.3}); {label}; setup steps {}",
         gx * h * h,
