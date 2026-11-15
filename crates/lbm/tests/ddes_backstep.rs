@@ -469,6 +469,9 @@ impl Step {
         // Every sample so far, kept for the restart file: a resumed run replays them into fresh
         // statistics, so it ends where an unbroken run would.
         let mut samples: Vec<Vec<f64>> = Vec::new();
+        // The running mean x_r at each completed block, with the step and the wall time, for the
+        // timing report's settle point ([`settle_point`]).
+        let mut history: Vec<(u64, f64, f64)> = Vec::new();
         // One sample into the statistics; the rule that settles the run, if one does. Each
         // completed block prints a line: its reattachment, the running mean and, when given, the
         // inlet's first four columns split into the face mean of ρ − 1 (the pressure level, whose
@@ -561,6 +564,9 @@ impl Step {
             let inlet = [face_mean, face_mean - last_face_mean, deviation];
             last_face_mean = face_mean;
             rule = take(&sample, steps, Some(inlet), &mut shear, &mut blocks, &mut missing, &mut recent);
+            if blocks.means().len() > history.len() {
+                history.push((steps, clock.elapsed().as_secs_f64(), blocks.mean()));
+            }
             samples.push(sample);
             // Sample boundaries carry no partial interval, so the file holds the whole state.
             if let Some(path) = self.checkpoint.as_ref().filter(|_| steps.is_multiple_of(CHECKPOINT_STEPS)) {
@@ -572,6 +578,25 @@ impl Step {
             flow.fluid_cells(),
             flow.fluid_cells() as f64 * steps as f64 / clock.elapsed().as_secs_f64() / 1e6
         );
+        println!(
+            "timing: grid {:?} = {} cells ({} fluid), {} cells per H, span {} H, wall time {:.0} s for {steps} steps, peak memory {}",
+            grid.cells,
+            grid.cells.iter().product::<usize>(),
+            flow.fluid_cells(),
+            self.cells_per_h,
+            self.span,
+            clock.elapsed().as_secs_f64(),
+            peak_memory()
+        );
+        match settle_point(&history) {
+            Some((at, secs, x_r, before)) => println!(
+                "settle point: running x_r {x_r:.3} H changes by under 0.5 % over the last fifth (a fifth earlier {before:.3} H) at step {at}, wall time {secs:.0} s"
+            ),
+            None => println!("settle point: the running x_r never changes by under 0.5 % over a fifth of the run"),
+        }
+        if let Some(x_r) = wall_reading(&flow, self) {
+            println!("x_r from the flow field, rows 2-4: {x_r:.3} H");
+        }
         // The mean profiles, formed with U_ref and ρ at the reference station.
         let (rho_ref, u_ref) = reference(&flow);
         let q = 0.5 * rho_ref * u_ref * u_ref;
@@ -989,7 +1014,9 @@ fn driver_seegmiller(step: &Step) -> (Run, Score) {
 fn sa_step(sa: Turbulence) -> Step {
     let cells_per_h = std::env::var("FIELDCRAFT_STEP_CELLS_PER_H").ok().and_then(|v| v.parse().ok()).unwrap_or(16);
     let extra: f64 = std::env::var("FIELDCRAFT_STEP_EXTRA_UPSTREAM").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0);
-    let case = Step::driver_seegmiller(sa, 0.0);
+    // `FIELDCRAFT_STEP_SPAN`: the periodic span in H (0, the default, is one cell: the 2D run).
+    let span: f64 = std::env::var("FIELDCRAFT_STEP_SPAN").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0);
+    let case = Step::driver_seegmiller(sa, span);
     Step { cells_per_h, upstream: case.upstream + extra, ..case }
 }
 
@@ -1031,6 +1058,51 @@ fn the_floor_crossing_of_a_restart_file() {
     println!("the floor shear's sign change over the next 500 steps: {:?}", reattachment(&x, &per_area));
 }
 
+/// The first completed block at which the running mean x_r differs by under 0.5 % from its value
+/// at the block a fifth of the steps earlier: `(step, wall seconds, x_r, x_r a fifth earlier)`.
+/// `history` holds `(step, wall seconds, running mean x_r)` per block.
+fn settle_point(history: &[(u64, f64, f64)]) -> Option<(u64, f64, f64, f64)> {
+    history.iter().find_map(|&(at, secs, x_r)| {
+        let earlier = history.iter().rev().find(|h| h.0 as f64 <= 0.8 * at as f64)?;
+        let change = ((x_r - earlier.2) / x_r).abs();
+        (x_r.is_finite() && earlier.2.is_finite() && change < 0.005).then_some((at, secs, x_r, earlier.2))
+    })
+}
+
+/// The process's peak resident memory, from `/proc/self/status` (Linux); "n/a" elsewhere.
+fn peak_memory() -> String {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| s.lines().find_map(|l| l.strip_prefix("VmHWM:").map(|v| v.trim().to_string())))
+        .unwrap_or_else(|| "n/a".to_string())
+}
+
+/// The gate reading from the flow field: x_r is the wall (y = 0) value of the least-squares line
+/// through the u = 0 crossings of rows 2, 3 and 4 (row 1, the wall-modelled row, reads long on
+/// every grid and is reported beside it). No variant is picked by its nearness to the experiment.
+/// Returns that x_r (H), if the rows cross.
+fn wall_reading(flow: &Flow, step: &Step) -> Option<f64> {
+    let first_row = if flow.on_node_bounce() { 2 } else { 1 };
+    let rows: Vec<Result<(f64, f64), String>> = (0..6).map(|n| crossing_at(flow, step, first_row + n)).collect();
+    for (n, r) in rows.iter().enumerate() {
+        match r {
+            Ok((y, x)) => println!("u = 0 crossing, row {} (y = {y:.4} H): x {x:.3} H", n + 1),
+            Err(why) => println!("u = 0 crossing, row {}: none ({why})", n + 1),
+        }
+    }
+    if let [Ok(r1), Ok(r2), Ok(r3), Ok(r4), ..] = rows.as_slice() {
+        let wall = intercept(&[*r2, *r3, *r4], 1);
+        println!(
+            "x_r at the wall (y = 0, rows 2-4 least squares): {wall:.3} H; row 1 beside it: {:.3} H; rows 2-3 only: {:.3} H (experiment 6.26 ± 0.10); wall law {}",
+            r1.1,
+            intercept(&[*r2, *r3], 1),
+            study_wall_law().1
+        );
+        return Some(wall);
+    }
+    None
+}
+
 /// What a finished SA run's restart file says without stepping: the gated x_r from the stored
 /// samples, the floor crossing read from rows shifted one cell each way, and the incoming layer at
 /// x = −4 H (Re_θ and δ₉₉ against the experiment's 5000 and about 1.5 H, and the inflow C_f the
@@ -1069,26 +1141,7 @@ fn a_restart_files_readings() {
             Err(why) => println!("wall reader shifted {shift:+} cells: none ({why})"),
         }
     }
-    // The gate reading: x_r is the wall (y = 0) value of the least-squares line through the u = 0
-    // crossings of rows 2, 3 and 4 (row 1, the wall-modelled row, reads long on every grid and is
-    // reported beside it). No variant is picked by its nearness to the experiment.
-    let first_row = if flow.on_node_bounce() { 2 } else { 1 };
-    let rows: Vec<Result<(f64, f64), String>> = (0..6).map(|n| crossing_at(&flow, &step, first_row + n)).collect();
-    for (n, r) in rows.iter().enumerate() {
-        match r {
-            Ok((y, x)) => println!("u = 0 crossing, row {} (y = {y:.4} H): x {x:.3} H", n + 1),
-            Err(why) => println!("u = 0 crossing, row {}: none ({why})", n + 1),
-        }
-    }
-    if let [Ok(r1), Ok(r2), Ok(r3), Ok(r4), ..] = rows.as_slice() {
-        let wall = intercept(&[*r2, *r3, *r4], 1);
-        println!(
-            "x_r at the wall (y = 0, rows 2-4 least squares): {wall:.3} H; row 1 beside it: {:.3} H; rows 2-3 only: {:.3} H (experiment 6.26 ± 0.10); wall law {}",
-            r1.1,
-            intercept(&[*r2, *r3], 1),
-            study_wall_law().1
-        );
-    }
+    wall_reading(&flow, &step);
     // The incoming layer at x = −4 H, up to mid-channel, as the run reads it, and with the wall
     // interval (the first node above the wall to the wall node) from the wall law.
     let g = *flow.grid();
@@ -1218,4 +1271,17 @@ fn the_steady_rule_needs_five_agreeing_blocks_in_x_r_and_every_floor_strip() {
     let settled_late: Vec<(f64, Vec<f64>)> = std::iter::once(block(5.0, 0.0)).chain(still).collect();
     assert_eq!(steady(&settled_late), Some((0.0, 0.0)));
     assert_eq!(spread(&[0.0, 0.0], 0.0), 0.0);
+}
+
+/// The settle point is the first block whose running mean is within 0.5 % of the one a fifth of
+/// the steps earlier, and none while it still drifts.
+#[test]
+fn the_settle_point_is_the_first_block_within_half_a_percent_of_a_fifth_earlier() {
+    let drifting: Vec<(u64, f64, f64)> = (1..=20).map(|n| (n * 100, n as f64, 5.0 + 0.1 * n as f64)).collect();
+    assert_eq!(settle_point(&drifting), None);
+    let mut settling = drifting.clone();
+    settling.iter_mut().skip(10).for_each(|h| h.2 = 6.0);
+    // Step 1300 is the first whose fifth-earlier block (step 1000, running mean 6.0) agrees.
+    assert_eq!(settle_point(&settling).map(|p| p.0), Some(1300));
+    assert_eq!(settle_point(&[]), None);
 }
