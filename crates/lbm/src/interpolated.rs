@@ -64,7 +64,7 @@ pub enum WallOrder {
 /// How the mass the interpolated walls create is taken back.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum MassFix {
-    /// Not at all (to measure the leak).
+    /// Not at all (to measure the leak: the mass the walls create is still counted).
     Off,
     /// Each wall node gives back what its own links created.
     Local,
@@ -180,7 +180,7 @@ impl Interpolated {
     /// alone, so an inlet or an outlet is not fought (a target of the initial total mass would be).
     /// `f` are the post-collision populations, `g` the streamed ones.
     pub(crate) fn conserve_mass_everywhere(&mut self, fluid: &[bool], cells: usize, f: &[f64], g: &mut [f64], stride: usize) {
-        if self.mass_fix != MassFix::Global || self.entries.is_empty() || cells == 0 {
+        if !matches!(self.mass_fix, MassFix::Global | MassFix::Off) || self.entries.is_empty() || cells == 0 {
             return;
         }
         let mut delta = 0.0;
@@ -192,6 +192,9 @@ impl Interpolated {
         }
         self.created += delta;
         self.steps += 1;
+        if self.mass_fix == MassFix::Off {
+            return;
+        }
         let each = -delta / cells as f64;
         for (cell, &on) in fluid.iter().enumerate() {
             if on {

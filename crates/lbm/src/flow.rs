@@ -2076,6 +2076,14 @@ impl Flow {
         let (h, dims) = (self.grid.spacing, self.grid.cells.map(|v| v as i64));
         let mut report = InterpolationReport::default();
         let mut entries = Vec::new();
+        // An inlet or outlet cell holds what its boundary rule sets, not a collided state: a stencil
+        // never reads one, and a wall link on one stays half-way.
+        let mut open = vec![false; self.fluid.len()];
+        for oc in &self.open {
+            if let Some(x) = open.get_mut(oc.cell as usize) {
+                *x = true;
+            }
+        }
         for (index, link) in self.links.iter().enumerate() {
             let Rule::Bounce { group, du } = link.rule else { continue };
             let Some(k) = bases.iter().position(|(first, len, _)| group >= *first && group < first + len) else { continue };
@@ -2084,6 +2092,9 @@ impl Flow {
             }
             report.links += 1;
             let (cell, q) = (link.cell as usize, usize::from(link.q));
+            if open.get(cell).copied().unwrap_or(false) {
+                continue;
+            }
             let Some(&(_, _, body)) = bases.get(k) else { continue };
             let Some(o) = obstacles.get(body) else { continue };
             let tree = match trees.get_mut(k) {
@@ -2134,7 +2145,7 @@ impl Flow {
                     at[a] = v as usize;
                 }
                 let idx = self.grid.index(at);
-                self.fluid.get(idx).copied().unwrap_or(false).then_some(idx as u32)
+                (self.fluid.get(idx).copied().unwrap_or(false) && !open.get(idx).copied().unwrap_or(false)).then_some(idx as u32)
             };
             let (behind, behind2) = (fluid_behind(1), fluid_behind(2));
             let quadratic = order == WallOrder::Quadratic;
