@@ -1054,6 +1054,16 @@ fn sa_step_in(sa: Turbulence, short: bool, span: f64) -> Step {
     Step { cells_per_h, upstream: case.upstream + extra, ..case }
 }
 
+/// The SA step as the environment describes it ([`sa_step`], with the wall law of
+/// `FIELDCRAFT_WALL_LAW`), built, and its configuration: what the GPU probe
+/// (`crates/lbm-gpu/tests/step_probe.rs`, which includes this file) runs.
+#[allow(dead_code)]
+pub(crate) fn built_sa_step() -> (Flow, String) {
+    let step = sa_step(sa_rans());
+    let (flow, _, _) = step.build();
+    (flow, format!("{step:?}"))
+}
+
 /// The SA run's model: on Han's on-node wall with the model's own law, or with Spalding's with
 /// `FIELDCRAFT_WALL_LAW=spalding` ([`study_wall_law`]; the law is printed).
 fn sa_rans() -> Turbulence {
