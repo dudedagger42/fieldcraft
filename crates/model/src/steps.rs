@@ -172,15 +172,28 @@ pub enum WallTreatment {
     /// curved walls second order in position. The box's own walls stay halfway (they lie
     /// halfway), and heat keeps its halfway walls.
     Interpolated,
+    /// [`WallTreatment::Interpolated`] with the quadratic form of the same scheme: the
+    /// characteristic is read from three nodes in line (Lagrange interpolation, as Bouzidi et al.
+    /// give for their quadratic variant) where the flow has them, from two elsewhere. A wall off
+    /// the grid carries a Poiseuille flow rate within half a percent where the linear form misses
+    /// by one to two (see `docs/manual/fluid/boundary-conditions.md`). Walls at rest only: a
+    /// link on a moving wall keeps the linear form.
+    InterpolatedQuadratic,
 }
 
 impl WallTreatment {
-    /// `halfway` or `interpolated`, as written in the model.
+    /// `halfway`, `interpolated` or `interpolated_quadratic`, as written in the model.
     pub fn name(self) -> &'static str {
         match self {
             WallTreatment::Halfway => "halfway",
             WallTreatment::Interpolated => "interpolated",
+            WallTreatment::InterpolatedQuadratic => "interpolated_quadratic",
         }
+    }
+
+    /// Whether links into obstacles bounce back where the surface crosses them, in either form.
+    pub fn is_interpolated(self) -> bool {
+        matches!(self, WallTreatment::Interpolated | WallTreatment::InterpolatedQuadratic)
     }
 
     pub fn is_halfway(&self) -> bool {
