@@ -441,9 +441,8 @@ fn population_index(q: u32, cell: u32, xyz: vec3<i32>, phase: u32) -> u32 {
 }
 
 fn population(q: u32, cell: u32, xyz: vec3<i32>) -> f32 {
-    var v: f32;
-    if AA_MODE { v = f[population_index(q, cell, xyz, params.phase.x)]; } else { v = f[q * params.n + cell]; }
-    return v;
+    if AA_MODE { return f[population_index(q, cell, xyz, params.phase.x)]; }
+    return f[q * params.n + cell];
 }
 
 // Collision's output at its source cell, before the boundary rules.
