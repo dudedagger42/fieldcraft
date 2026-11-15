@@ -2,11 +2,11 @@
 //! velocity inlet (uniform, the exact mean speed) and a pressure outlet, walls at rest as one obstacle slab whose face cuts the
 //! cells (`WIDTH` cells wide, 8.5 by default, on an 8-cell grid), periodic across y and z. Run on the CPU and, when asked, on the device.
 //! The global mass correction is defined from the walls alone, so it must not fight the inlet and the outlet; this prints what
-//! shows it: the outlet flux over the inlet flux (want 1 within 1e-3), the pressure gradient of the middle third of the channel
+//! shows it: the flux through the plane at two thirds of the length over the one at a third (want 1 within 1e-3; the inlet's developing region is excluded, its plane is printed as information), the pressure gradient of the middle third of the channel
 //! over the exact one (12 nu U / H^2 per cell, want 1 within 1 %), the mean density in every window (steady) and the size of the
 //! correction per 10 000 steps. Fields are in lattice units; the lattice viscosity is `NU` (0.05) and the mean speed `UMEAN` (0.02).
 //! Environment: CELLS (8), WIDTH (8.5), NX (64: the channel's length in cells), STEPS (20000), WINDOW (2500), NU, UMEAN, QUAD (1: the
-//! quadratic rule, 0 linear), MASSFIX (2: global; 0 off, 1 local), INTERP (1: 0 runs the plain half-way wall), CPU (1), GPU (1).
+//! quadratic rule, 0 linear), MASSFIX (2: spread; 0 off, 1 local), INTERP (1: 0 runs the plain half-way wall), CPU (1), GPU (1).
 // A local harness: index loops over the grid and nested ifs read better than iterator chains here.
 #![allow(clippy::needless_range_loop, clippy::collapsible_if)]
 #[path = "../../lbm/tests/common/mod.rs"]
@@ -31,7 +31,7 @@ struct Window {
     gradient_ratio: f64,
     /// The gradient over the exact one for the nominal mean speed and width.
     nominal_ratio: f64,
-    /// The flux through the plane 2 over the one through the middle.
+    /// The flux through the plane 2 (next to the inlet) over the one through the middle: information.
     inlet_share: f64,
 }
 
@@ -92,7 +92,10 @@ fn interpolated_wall_open_channel() {
         3.0 * nu_lat + 0.5
     );
     let mut gpu = if use_gpu {
-        match Policy::from_env().map_err(|e| e.to_string()).and_then(|p| GpuFlow::with_options(&cpu, p, Options::default()).map_err(|e| e.to_string())) {
+        match Policy::from_env()
+            .map_err(|e| e.to_string())
+            .and_then(|p| GpuFlow::with_options(&cpu, p, Options::default()).map_err(|e| e.to_string()))
+        {
             Ok(g) => {
                 println!("DEVICE {}", g.adapter_name());
                 Some(g)
@@ -151,7 +154,13 @@ fn interpolated_wall_open_channel() {
         // middle plane (so the inlet's own rows, which the wall at a fractional width does not match, do not enter).
         let carried = flux(gx / 2) / (gz as f64 * width);
         let exact_carried = -3.0 * 12.0 * nu_lat * carried / (width * width);
-        Window { mean_rho: sum / count.max(1) as f64, flux_ratio: flux(gx - 3) / flux(2), gradient_ratio: slope / exact_carried, nominal_ratio: slope / exact_gradient, inlet_share: flux(2) / flux(gx / 2) }
+        Window {
+            mean_rho: sum / count.max(1) as f64,
+            flux_ratio: flux(2 * gx / 3) / flux(gx / 3),
+            gradient_ratio: slope / exact_carried,
+            nominal_ratio: slope / exact_gradient,
+            inlet_share: flux(2) / flux(gx / 2),
+        }
     };
     let (mut done, mut last_created) = (0u64, 0.0);
     let (mut last_cpu, mut last_gpu): (Option<Window>, Option<Window>) = (None, None);
@@ -170,11 +179,14 @@ fn interpolated_wall_open_channel() {
         let per_10k = (created - last_created) / (c as f64) * 1e4;
         last_created = created;
         let show = |who: &str, w: &Option<Window>| match w {
-            Some(w) => format!("{who} mean rho {:.9}, outlet/inlet flux {:.5}, gradient/exact {:.4}", w.mean_rho, w.flux_ratio, w.gradient_ratio),
+            Some(w) => format!(
+                "{who} mean rho {:.9}, flux at 2/3 over 1/3 of the length {:.5}, gradient/exact {:.4}",
+                w.mean_rho, w.flux_ratio, w.gradient_ratio
+            ),
             None => format!("{who} -"),
         };
-        let a = fa.as_ref().map(&measure);
-        let b = fb.as_ref().map(&measure);
+        let a = fa.as_ref().map(measure);
+        let b = fb.as_ref().map(measure);
         let parity = match (&fa, &fb) {
             (Some(x), Some(y)) => {
                 let mut du = 0.0f64;
@@ -219,7 +231,7 @@ fn interpolated_wall_open_channel() {
     for (who, w) in [("cpu", &last_cpu), ("gpu", &last_gpu)] {
         if let Some(w) = w {
             println!(
-                "RESULT {who}: outlet/inlet flux {:.5} (bar 1 +- 1e-3: {}), mid-third pressure gradient {:+.3} % of exact for the flow carried (bar +- 1 %: {}; {:+.3} % of the nominal one), plane 2 flux {:.5} of the middle's, mean density {:.9}",
+                "RESULT {who}: flux through the plane at two thirds of the length over the one at a third {:.5} (bar 1 +- 1e-3: {}), mid-third pressure gradient {:+.3} % of exact for the flow carried (bar +- 1 %: {}; {:+.3} % of the nominal one), the inlet plane's (plane 2, information) flux {:.5} of the middle's, mean density {:.9}",
                 w.flux_ratio,
                 if (w.flux_ratio - 1.0).abs() <= 1e-3 { "met" } else { "NOT met" },
                 100.0 * (w.gradient_ratio - 1.0),

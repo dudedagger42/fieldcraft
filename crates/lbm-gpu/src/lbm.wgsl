@@ -97,9 +97,10 @@
 // r⁶ and g⁶ by multiplication, pow only for the ^(1/6) of a positive argument.
 
 override AA_MODE: bool = true;
-// The interpolated walls' global mass correction: `wall_mass` sums what the wall links created
-// each step (stats[8] keeps the share per fluid cell, as f32 bits) and every read of the streamed
-// populations takes it off (population()).
+// The interpolated walls' mass correction (the spread kind): the link gather records what each
+// link created in `contrib.w`, `wall_delta` sums it per wall node into `wallf.x` (divided by the
+// sum of the lattice weights over the node's fluid targets), and `wall_remove` next step has every
+// target cell take back the lattice-weighted share of what its neighbours handed out.
 override WALL_MASS: bool = false;
 // The recursive regularised collision instead of the two-relaxation-time one
 // (fieldcraft_lbm::regularized).
@@ -280,6 +281,11 @@ struct Params {
 @group(0) @binding(27) var<storage, read_write> nu_tilde: array<f32>;
 @group(0) @binding(28) var<storage, read_write> sa_rates: array<vec2<f32>>;
 @group(0) @binding(29) var<storage, read_write> sa_cell: array<vec4<f32>>;
+// Per cell: x the share a wall node hands to each target per unit of lattice weight (its delta
+// over W), y 1 where the cell takes mass back.
+@group(0) @binding(30) var<storage, read_write> wallf: array<vec2<f32>>;
+// Per wall node: its cell, the range of its cell's links (first, end) and 1/W as f32 bits.
+@group(0) @binding(31) var<storage, read> wallnode: array<vec4<u32>>;
 
 var<workgroup> red: array<vec4<f32>, 256>;
 // The largest squared speed of a workgroup's cells (collide): one atomic per workgroup, not
@@ -437,7 +443,6 @@ fn population_index(q: u32, cell: u32, xyz: vec3<i32>, phase: u32) -> u32 {
 fn population(q: u32, cell: u32, xyz: vec3<i32>) -> f32 {
     var v: f32;
     if AA_MODE { v = f[population_index(q, cell, xyz, params.phase.x)]; } else { v = f[q * params.n + cell]; }
-    if WALL_MASS { v = v + bitcast<f32>(atomicLoad(&stats[8])) * w_of(q); }
     return v;
 }
 
@@ -2232,47 +2237,45 @@ fn gather_link(l: u32, exchange: bool) {
     }
 }
 
-// Error-free sum of two floats: the rounded sum and what the rounding lost.
-fn two_sum(a: f32, b: f32) -> vec2<f32> {
-    let s = a + b;
-    let bb = s - a;
-    return vec2<f32>(s, (a - (s - bb)) + (b - bb));
-}
-
-// A sum kept as an unevaluated pair (high, low), so the cancellation between the links' terms does
-// not eat the digits of the small net; fixed order, so the same on every run of a device.
-fn pair_add(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {
-    let s = two_sum(a.x, b.x);
-    let t = two_sum(s.x, s.y + a.y + b.y);
-    return vec2<f32>(t.x + t.y, t.y - ((t.x + t.y) - t.x));
-}
-
-// One workgroup: the sum over the interpolated links of the mass they created this step, taken
-// off every fluid cell next (stats[8] is each cell's share, with the weights, in `population`).
-// The link at index `links` of `link_u` carries the number of fluid cells.
+// What the wall nodes handed out one step ago, taken back: each target cell removes, spread over
+// its populations by the lattice weights, the sum over its neighbours y of w_i * share(y) (the
+// weights renormalised over the fluid targets are in `share`). Run after the streamed populations
+// are complete, before `wall_delta` replaces the shares.
 @compute @workgroup_size(256)
-fn wall_mass(@builtin(local_invocation_index) lid: u32) {
-    var acc = vec2<f32>(0.0);
-    for (var l = lid; l < params.links; l = l + WG) {
+fn wall_remove(@builtin(local_invocation_index) lid: u32, @builtin(workgroup_id) wg: vec3<u32>) {
+    let cell = cell_of(lid, wg);
+    if cell >= params.n || wallf[cell].y == 0.0 { return; }
+    let xyz = coords(cell);
+    let size = vec3<i32>(i32(params.nx), i32(params.ny), i32(params.nz));
+    let periodic = params.periodic.xyz != vec3<u32>(0u);
+    var got = 0.0;
+    for (var i = 0u; i < 19u; i = i + 1u) {
+        let p = xyz - c_of(i);
+        if any(((p < vec3<i32>(0)) | (p >= size)) & !periodic) { continue; }
+        got = got + w_of(i) * wallf[wrapped(p)].x;
+    }
+    if got == 0.0 { return; }
+    let at = aa_coords(cell);
+    for (var q = 0u; q < 19u; q = q + 1u) {
+        store_streamed(q, cell, at, streamed(q, cell, at) - got * w_of(q));
+    }
+}
+
+// One thread per wall node: what its links created this step, over the sum of the weights of its
+// fluid targets, kept for the next step's `wall_remove`.
+@compute @workgroup_size(256)
+fn wall_delta(@builtin(local_invocation_index) lid: u32, @builtin(workgroup_id) wg: vec3<u32>) {
+    let k = cell_of(lid, wg);
+    if k >= arrayLength(&wallnode) { return; }
+    let node = wallnode[k];
+    var s = 0.0;
+    for (var l = node.y; l < node.z; l = l + 1u) {
         let lu = link_u[l];
         if ((lu.x >> 8u) & 0xffu) == KIND_BOUNCE && ((lu.x >> 16u) & 0xffu) != 0u {
-            acc = pair_add(acc, vec2<f32>(contrib[l].w, 0.0));
+            s = s + contrib[l].w;
         }
     }
-    red[lid] = vec4<f32>(acc, 0.0, 0.0);
-    workgroupBarrier();
-    for (var k = 128u; k > 0u; k = k >> 1u) {
-        if lid < k {
-            let p = pair_add(red[lid].xy, red[lid + k].xy);
-            red[lid] = vec4<f32>(p, 0.0, 0.0);
-        }
-        workgroupBarrier();
-    }
-    if lid == 0u {
-        let cells = f32(link_u[params.links].x);
-        let total = red[0].x + red[0].y;
-        atomicStore(&stats[8], bitcast<u32>(-total / max(cells, 1.0)));
-    }
+    wallf[node.x].x = s * bitcast<f32>(node.w);
 }
 
 // The gather above must complete before any AA boundary population is overwritten.

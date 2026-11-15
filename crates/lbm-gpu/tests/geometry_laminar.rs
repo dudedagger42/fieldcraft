@@ -219,11 +219,16 @@ fn drive(name: &str, cpu: fieldcraft_lbm::Flow, probe: &Probe, steps: u64, extra
             println!("step {done}: {}; {}{rho}", show("cpu", a), show("gpu", b));
         }
     }
+    // The mean density less the delta the walls made at the last step that the spread has not
+    // taken back yet (it is in the box but not yet removed): the conserved quantity.
+    let pending = cpu.wall_mass_pending() / cpu.fluid_cells().max(1) as f64;
     if let (Some(a), Some(b)) = (rho_start, rho_last) {
-        println!("DRIFT {name}: mean density {a:.9} -> {b:.9}, {:+.3e} per 10000 steps", (b - a) / done.max(1) as f64 * 1e4);
+        let b = b - pending;
+        println!("DRIFT {name}: mean density less pending {a:.9} -> {b:.9}, {:+.3e} per 10000 steps", (b - a) / done.max(1) as f64 * 1e4);
     }
     if let (Some(a), Some(b)) = (rho_start, rho_gpu) {
-        println!("DRIFT {name} gpu: mean density {a:.9} -> {b:.9}, {:+.3e} per 10000 steps", (b - a) / done.max(1) as f64 * 1e4);
+        let b = b - gpu.as_ref().and_then(|g| g.wall_mass_pending().ok()).unwrap_or(pending * 0.0) / cpu.fluid_cells().max(1) as f64;
+        println!("DRIFT {name} gpu: mean density less pending {a:.9} -> {b:.9}, {:+.3e} per 10000 steps", (b - a) / done.max(1) as f64 * 1e4);
     }
     let (mass_steps, created) = cpu.wall_mass_created();
     if mass_steps > 0 {
