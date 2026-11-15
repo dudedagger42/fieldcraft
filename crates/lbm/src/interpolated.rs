@@ -36,12 +36,18 @@
 //! already sits half way (every grid-aligned one) is bit for bit what it was. Walls at rest only.
 //!
 //! **Mass.** On a slanted wall the link rule returns another amount than left along the link, so
-//! the scheme leaks mass steadily (an aligned wall does not: `q = 1/2` returns what left). A local
-//! correction removes it: for each wall node, `delta` is the sum over its interpolated links of
-//! (returned - sent), and `delta w_i` is taken from each of the node's 19 populations. The lattice
-//! weights sum to one and carry no momentum, so the node loses exactly what the wall gave it, no
-//! momentum is added and nothing needs a global sum. At `q = 1/2` the term is exactly zero. This is
-//! a design choice of FieldCraft's, not a published scheme.
+//! the scheme leaks mass steadily (an aligned wall does not: `q = 1/2` returns what left). It is
+//! taken back every step from the walls alone, with the weights of the lattice (they sum to one and
+//! carry no momentum, so none is added):
+//!
+//! - `MassFix::Global` (the default): the sum over all interpolated links of (returned - sent) is
+//!   spread evenly over the fluid cells and removed. It does not depend on what the box does
+//!   elsewhere, so inlets and outlets are not fought. It needs one sum over the links, in link
+//!   order, in double precision.
+//! - `MassFix::Local`: each wall node removes the sum over its own links. No global sum, but it moved
+//!   the flow rate of slanted channels by 0.3 point at 16 cells, so it is not the default.
+//!
+//! At `q = 1/2` the term is exactly zero. These are design choices of FieldCraft's, not published schemes.
 
 use crate::lattice::{Q, W, opposite};
 
@@ -62,7 +68,7 @@ pub enum MassFix {
     Off,
     /// Each wall node gives back what its own links created.
     Local,
-    /// Every step the mass lost or gained since the start is spread over all fluid cells.
+    /// Every step the mass the wall links created is spread over all fluid cells.
     #[default]
     Global,
 }
@@ -82,6 +88,18 @@ pub struct InterpolationReport {
     pub no_second_node: usize,
     /// Links whose segment meets no surface: plain bounce-back.
     pub no_surface: usize,
+}
+
+/// What an interpolated link needs beyond the plain bounce: its wall fraction and the order of
+/// its rule, for the GPU solver (the cells behind it follow from its cell and direction).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct InterpolatedLink {
+    /// The link's index in the flow's link list.
+    pub link: u32,
+    /// The wall's fraction of the link.
+    pub wall: f64,
+    /// 2 for the quadratic rule, 1 for the linear one.
+    pub order: u8,
 }
 
 /// One interpolated link.
@@ -112,8 +130,9 @@ pub struct Interpolated {
     nodes: Vec<(u32, u32, u32)>,
     /// How the mass the wall links create is taken back (`Global` by default).
     pub(crate) mass_fix: MassFix,
-    /// The total mass of the fluid cells when the correction began (the global kind's target).
-    mass0: Option<f64>,
+    /// The steps the global correction ran and the mass the walls created over them.
+    steps: u64,
+    created: f64,
 }
 
 impl Interpolated {
@@ -128,7 +147,7 @@ impl Interpolated {
                 _ => nodes.push((e.cell, at as u32, at as u32 + 1)),
             }
         }
-        Self { entries, report, order, nodes, mass_fix: MassFix::default(), mass0: None }
+        Self { entries, report, order, nodes, mass_fix: MassFix::default(), steps: 0, created: 0.0 }
     }
 
     /// Take from every wall node the mass its interpolated links created, spread over its
@@ -155,40 +174,25 @@ impl Interpolated {
         }
     }
 
-    /// The global kind: spread what the walls added to (or took from) the total mass of the fluid
-    /// cells since the first step evenly over them, by the lattice weights, so no momentum is added.
-    /// `f` are the post-collision populations (their total is the target the first time), `g` the
-    /// streamed ones. The sums run in cell order.
-    pub(crate) fn conserve_mass_everywhere(&mut self, fluid: &[bool], f: &[f64], g: &mut [f64], stride: usize) {
-        if self.mass_fix != MassFix::Global || self.entries.is_empty() {
+    /// The global kind: the mass the wall links created this step (the sum over all of them of
+    /// returned - sent, in link order, in double precision) is taken off evenly over the `cells`
+    /// fluid cells by the lattice weights, so no momentum is added. It is defined from the walls
+    /// alone, so an inlet or an outlet is not fought (a target of the initial total mass would be).
+    /// `f` are the post-collision populations, `g` the streamed ones.
+    pub(crate) fn conserve_mass_everywhere(&mut self, fluid: &[bool], cells: usize, f: &[f64], g: &mut [f64], stride: usize) {
+        if self.mass_fix != MassFix::Global || self.entries.is_empty() || cells == 0 {
             return;
         }
-        let total = |p: &[f64]| -> (f64, usize) {
-            let mut sum = 0.0;
-            let mut cells = 0;
-            for (cell, &on) in fluid.iter().enumerate() {
-                if on {
-                    cells += 1;
-                    for i in 0..Q {
-                        sum += p.get(i * stride + cell).copied().unwrap_or(0.0);
-                    }
-                }
-            }
-            (sum, cells)
-        };
-        let target = match self.mass0 {
-            Some(m) => m,
-            None => {
-                let m = total(f).0;
-                self.mass0 = Some(m);
-                m
-            }
-        };
-        let (now, cells) = total(g);
-        if cells == 0 {
-            return;
+        let mut delta = 0.0;
+        for e in &self.entries {
+            let (Some(v), Some(sent)) = (Self::incoming(e, f, stride), f.get(opposite(usize::from(e.dir)) * stride + e.cell as usize)) else {
+                continue;
+            };
+            delta += v - sent;
         }
-        let each = (target - now) / cells as f64;
+        self.created += delta;
+        self.steps += 1;
+        let each = -delta / cells as f64;
         for (cell, &on) in fluid.iter().enumerate() {
             if on {
                 for i in 0..Q {
@@ -198,6 +202,17 @@ impl Interpolated {
                 }
             }
         }
+    }
+
+    /// Whether the correction is the global kind.
+    pub fn is_global(&self) -> bool {
+        self.mass_fix == MassFix::Global
+    }
+
+    /// What the global correction took off so far: the steps it ran and the mass the walls created
+    /// over them (lattice units, density 1 per cell).
+    pub fn mass_created(&self) -> (u64, f64) {
+        (self.steps, self.created)
     }
 
     /// The population of `entry` after streaming, from the post-collision populations `f`
@@ -224,6 +239,11 @@ impl Interpolated {
                 Some(into / w + (w - 1.0) / w * own)
             }
         }
+    }
+
+    /// The interpolated links in the order of the flow's link list.
+    pub fn links(&self) -> Vec<InterpolatedLink> {
+        self.entries.iter().map(|e| InterpolatedLink { link: e.link, wall: e.wall, order: e.order }).collect()
     }
 
     /// The links in the order of the flow's link list.

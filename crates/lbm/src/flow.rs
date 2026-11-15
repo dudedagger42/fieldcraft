@@ -2173,6 +2173,23 @@ impl Flow {
         Ok(())
     }
 
+    /// The links with an interpolated wall, in link order (none without
+    /// [`Flow::interpolate_walls`]).
+    pub fn interpolated_links(&self) -> Vec<crate::interpolated::InterpolatedLink> {
+        self.interpolated.as_ref().map(|i| i.links()).unwrap_or_default()
+    }
+
+    /// The steps the interpolated walls' global mass correction ran and the mass the walls created
+    /// over them, in lattice units (density 1 per cell); `(0, 0)` without one.
+    pub fn wall_mass_created(&self) -> (u64, f64) {
+        self.interpolated.as_ref().map_or((0, 0.0), |i| i.mass_created())
+    }
+
+    /// Whether the interpolated walls take their mass back with the global correction.
+    pub fn wall_mass_global(&self) -> bool {
+        self.interpolated.as_ref().is_some_and(|i| i.is_global())
+    }
+
     pub fn grid(&self) -> &Grid {
         &self.grid
     }
@@ -3466,7 +3483,7 @@ impl Flow {
             ip.conserve_mass(&self.f, &mut self.g, s);
         }
         if let Some(ip) = &mut self.interpolated {
-            ip.conserve_mass_everywhere(&self.fluid, &self.f, &mut self.g, s);
+            ip.conserve_mass_everywhere(&self.fluid, self.fluid_cells, &self.f, &mut self.g, s);
         }
         self.forces.fill([0.0; 3]);
         for link in &self.links {
