@@ -443,6 +443,97 @@ impl TriangleTree {
         }
         best.map(|(_, t)| t)
     }
+
+    /// The distance from `p` to the surface and the unit normal of the nearest triangle as wound
+    /// (outward from the body), `None` for an empty surface or a degenerate nearest triangle.
+    pub fn nearest_surface(&self, p: [f64; 3]) -> Option<(f64, [f64; 3])> {
+        let t = self.nearest(p)?;
+        let tri = self.triangles.get(t as usize)?;
+        let normal = unit_normal(tri)?;
+        Some((distance2(p, tri).sqrt(), normal))
+    }
+
+    /// The area of the surface inside the closed box `[lo, hi]`, with the sum of the pieces' areas
+    /// times their triangles' unit normals (its length is at most the area). A piece lying on a
+    /// face of the box counts: a wall half way between two cell centres is on the fluid cell's face.
+    pub fn area_in_box(&self, lo: [f64; 3], hi: [f64; 3]) -> (f64, [f64; 3]) {
+        let eps = 1e-9 * (0..3).map(|a| hi[a] - lo[a]).fold(0.0, f64::max).max(1e-300);
+        let overlaps = |n: &Node| (0..3).all(|a| n.lo[a] <= hi[a] + eps && n.hi[a] >= lo[a] - eps);
+        let (mut area, mut weighted) = (0.0, [0.0; 3]);
+        let mut stack = vec![0u32];
+        while let Some(i) = stack.pop() {
+            let Some(node) = self.nodes.get(i as usize) else { continue };
+            if !overlaps(node) {
+                continue;
+            }
+            if node.count == 0 {
+                stack.extend([node.first, node.first + 1]);
+                continue;
+            }
+            for &t in self.order.get(node.first as usize..(node.first + node.count) as usize).unwrap_or_default() {
+                let Some(tri) = self.triangles.get(t as usize) else { continue };
+                let Some(normal) = unit_normal(tri) else { continue };
+                let polygon = clip_to_box(tri, lo, hi, eps);
+                let a = polygon_area(&polygon);
+                area += a;
+                for k in 0..3 {
+                    weighted[k] += a * normal[k];
+                }
+            }
+        }
+        (area, weighted)
+    }
+}
+
+/// The unit normal of a triangle by its winding; `None` when it has no area.
+fn unit_normal(tri: &[[f64; 3]; 3]) -> Option<[f64; 3]> {
+    let n = cross(sub(tri[1], tri[0]), sub(tri[2], tri[0]));
+    let len = dot(n, n).sqrt();
+    (len > 0.0 && len.is_finite()).then(|| n.map(|v| v / len))
+}
+
+/// The triangle clipped to the box (Sutherland and Hodgman 1974, one plane at a time); a point
+/// within `eps` of a plane is inside it.
+fn clip_to_box(tri: &[[f64; 3]; 3], lo: [f64; 3], hi: [f64; 3], eps: f64) -> Vec<[f64; 3]> {
+    let mut poly: Vec<[f64; 3]> = tri.to_vec();
+    for axis in 0..3 {
+        for upper in [false, true] {
+            let bound = if upper { hi[axis] } else { lo[axis] };
+            // Signed distance inside the plane (positive inside).
+            let inside = |p: &[f64; 3]| if upper { bound - p[axis] } else { p[axis] - bound };
+            let mut next = Vec::with_capacity(poly.len() + 2);
+            for (k, a) in poly.iter().enumerate() {
+                let Some(b) = poly.get((k + 1) % poly.len()) else { continue };
+                let (da, db) = (inside(a), inside(b));
+                let (a_in, b_in) = (da >= -eps, db >= -eps);
+                if a_in {
+                    next.push(*a);
+                }
+                if a_in != b_in {
+                    let t = da / (da - db);
+                    next.push([0, 1, 2].map(|c| a[c] + t * (b[c] - a[c])));
+                }
+            }
+            poly = next;
+            if poly.len() < 3 {
+                return Vec::new();
+            }
+        }
+    }
+    poly
+}
+
+/// The area of a planar polygon.
+fn polygon_area(poly: &[[f64; 3]]) -> f64 {
+    let Some(&first) = poly.first() else { return 0.0 };
+    let mut sum = [0.0; 3];
+    for w in poly.windows(2) {
+        let c = cross(sub(w[0], first), sub(w[1], first));
+        for k in 0..3 {
+            sum[k] += c[k];
+        }
+    }
+    0.5 * dot(sum, sum).sqrt()
 }
 
 #[cfg(test)]
@@ -464,6 +555,30 @@ mod tests {
             tags.extend([k as u32; 2]);
         }
         BoundarySurface::new(&positions, &triangles, &tags, &SurfaceOptions::default()).unwrap()
+    }
+
+    #[test]
+    fn a_box_face_wall_counts_its_area_once_for_the_fluid_cell_and_a_slanted_wall_by_clipping() {
+        let c = cube([0.0; 3], [4.0; 3]);
+        let tree = TriangleTree::new(&c);
+        // The wall z = 4 passes over the cell [1,2]x[1,2]x[3,4]: its top face, area 1, normal +z.
+        let (a, n) = tree.area_in_box([1.0, 1.0, 3.0], [2.0, 2.0, 4.0]);
+        assert!((a - 1.0).abs() < 1e-12 && (n[2] - 1.0).abs() < 1e-12, "{a} {n:?}");
+        // A cell away from every face holds none.
+        assert_eq!(tree.area_in_box([1.0, 1.0, 1.0], [2.0, 2.0, 2.0]).0, 0.0);
+        // The total over all unit cells of the box is the surface area, 6 * 16.
+        let mut total = 0.0;
+        for i in 0..4 {
+            for j in 0..4 {
+                for k in 0..4 {
+                    let lo = [i as f64, j as f64, k as f64];
+                    total += tree.area_in_box(lo, [lo[0] + 1.0, lo[1] + 1.0, lo[2] + 1.0]).0;
+                }
+            }
+        }
+        assert!((total - 96.0).abs() < 1e-9, "{total}");
+        let (d, n) = tree.nearest_surface([2.0, 2.0, 3.5]).unwrap_or((f64::NAN, [0.0; 3]));
+        assert!((d - 0.5).abs() < 1e-12 && n[2] > 0.99, "{d} {n:?}");
     }
 
     #[test]
