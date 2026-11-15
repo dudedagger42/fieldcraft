@@ -988,3 +988,65 @@ fn sa_rans_channel_at_re_tau_550_on_the_half_way_wall() {
     assert!(error.abs() < 0.03, "C_f error {:+.2} %", 100.0 * error);
     assert!((r.requested.unwrap_or(f64::NAN) / r.carried - 1.0).abs() < 0.01);
 }
+
+/// The turbulent-channel validation case as shipped: SA with its own wall law on the half-way wall
+/// (`spalart_allmaras_bounce_surface`, walls as obstacle slabs two cells thick), the hybrid
+/// collision at σ 0.95, a force-driven channel periodic in x and z, against Lee & Moser's DNS at
+/// Re_τ 182.088, 543.496 and 1000.512. One run per row, nothing tuned per row.
+///
+/// Each row has two bands. The **bar** is the frozen distance from the DNS (the physics): ±1 % in C_f
+/// where the sampled cell (the second open cell) is at y⁺ 15 or more, and the measured miss is stated
+/// beside it. The **regression** band is a tight window around this code's own value, so a later change
+/// says which kind of failure it is. Printed as `ORACLE …` lines for the case's `expected.json`.
+#[test]
+#[ignore = "heavy: cargo xtask test --heavy (CI heavy job)"]
+fn oracle_turbulent_channel_wall_law_on_the_half_way_wall() {
+    // (name, Re_τ, cells per δ, U_b⁺, C_f of the DNS, sampled cell y⁺, measured C_f error at the commit
+    // that froze it (None: not frozen yet))
+    let rows: [(&str, f64, usize, f64, f64, Option<f64>); 5] = [
+        ("re180_n10", LEE_MOSER_180_RE_TAU, 10, LEE_MOSER_180_BULK, LEE_MOSER_180_CF, Some(-0.01029687)),
+        ("re180_n20", LEE_MOSER_180_RE_TAU, 20, LEE_MOSER_180_BULK, LEE_MOSER_180_CF, Some(-0.04923058)),
+        ("re550_n20", LEE_MOSER_550_RE_TAU, 20, LEE_MOSER_550_BULK, LEE_MOSER_550_CF, Some(-0.01373730)),
+        ("re1000_n50", 1000.0, 50, LEE_MOSER_1000_BULK, LEE_MOSER_1000_CF, Some(-0.01168971)),
+        ("re1000_n80", 1000.0, 80, LEE_MOSER_1000_BULK, LEE_MOSER_1000_CF, Some(-0.01702379)),
+    ];
+    let mut failures = Vec::new();
+    for (name, re_tau, cells, bulk, cf_ref, frozen) in rows {
+        let r = Channel {
+            re_tau,
+            cells,
+            bulk_guess: bulk,
+            lattice_bulk: 0.1,
+            collision: Collision::Hrr,
+            sigma: Some(0.95),
+            turbulence: Some(sa(WallModel::SpalartAllmarasBounceSurface)),
+            on_node: false,
+            slabs: true,
+            max_steps: 3_000_000,
+            sample: 100,
+            settling: GATED,
+        }
+        .run();
+        let error = r.carried / cf_ref - 1.0;
+        let y_plus = 1.5 * re_tau / cells as f64;
+        println!(
+            "ORACLE {name}: cf {:.9e} error {:+.6} % bulk {:.6} centre {:.6} requested_over_carried {:.6} steps {} settled {} y_plus_sampled {y_plus:.1}",
+            r.carried,
+            100.0 * error,
+            r.bulk,
+            r.centre,
+            r.requested.unwrap_or(f64::NAN) / r.carried,
+            r.steps,
+            r.settled
+        );
+        if !r.settled {
+            failures.push(format!("{name}: not settled in {} steps", r.steps));
+        }
+        if let Some(frozen) = frozen
+            && (error - frozen).abs() > 5e-4
+        {
+            failures.push(format!("{name}: C_f error {:+.4} % left its regression band {:+.4} ± 0.05 %", 100.0 * error, 100.0 * frozen));
+        }
+    }
+    assert!(failures.is_empty(), "{failures:?}");
+}
