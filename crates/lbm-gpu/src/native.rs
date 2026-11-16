@@ -664,6 +664,8 @@ struct Variant {
     interpolated: bool,
     /// The Spalart–Allmaras model.
     sa: bool,
+    /// Its wall function is the model's own constant-stress law (`sa_law`), not Spalding's.
+    sa_law: bool,
 }
 
 /// A compiled kernel: its pipeline, its bind group's layout and the bindings in it.
@@ -717,6 +719,7 @@ fn compile(device: &wgpu::Device, variant: Variant) -> Result<Kernels> {
                     ("ZONES", if variant.zones { 1.0 } else { 0.0 }),
                     ("INTERPOLATED", if variant.interpolated { 1.0 } else { 0.0 }),
                     ("SA", if variant.sa { 1.0 } else { 0.0 }),
+                    ("SA_LAW", if variant.sa_law { 1.0 } else { 0.0 }),
                     ("MAX_SPEED", MAX_LATTICE_SPEED),
                 ],
                 ..Default::default()
@@ -845,6 +848,11 @@ impl GpuFlow {
                 "radiation from conducting solids is not on the GPU backend yet: solve on the CPU (`backend: \"cpu\"`)".into(),
             ));
         }
+        if flow.wall_nodes().is_some_and(|n| !matches!(n.law(), fieldcraft_lbm::sa::WallLaw::Spalding | fieldcraft_lbm::sa::WallLaw::SpalartAllmaras))
+        {
+            return Err(Error::Invalid("not supported yet on the GPU: this wall law; solve on the CPU (`backend: \"cpu\"`)".into()));
+        }
+        // The Spalart–Allmaras model's parts not on the device yet, and its faces.
         let sa_faces = match flow.spalart_allmaras() {
             None => None,
             Some(field) => {
@@ -1015,11 +1023,6 @@ impl GpuFlow {
             if nodes.distance() != 1.0 {
                 return Err(Error::Invalid(
                     "not supported yet: the half-way wall (`spalding_bounce_surface`, `spalart_allmaras_bounce_surface`) on the GPU; solve on the CPU (`backend: \"cpu\"`)".into(),
-                ));
-            }
-            if nodes.law() != fieldcraft_lbm::sa::WallLaw::Spalding {
-                return Err(Error::Invalid(
-                    "not supported yet on the GPU: the Spalart–Allmaras wall law (`wall_model: \"spalart_allmaras_bounce\"`); solve on the CPU (`backend: \"cpu\"`) or use `spalding_bounce`".into(),
                 ));
             }
             for w in nodes.nodes() {
@@ -1332,6 +1335,18 @@ impl GpuFlow {
             }
             sa_wall_rows = u32::try_from(by_cell.len()).map_err(|_| Error::Limit("too many first fluid nodes for the GPU solver".into()))?;
         }
+        // The model's own wall law: its table after those rows (lbm.wgsl `sa_law_table`), the host's
+        // own (fieldcraft_lbm::sa_law::segments) in f32: a header row with the segment count, then
+        // one row per segment.
+        let sa_law = sa_faces.is_some() && on_node && flow.wall_nodes().is_some_and(|n| n.law() == fieldcraft_lbm::sa::WallLaw::SpalartAllmaras);
+        if sa_law {
+            let segments = fieldcraft_lbm::sa_law::segments();
+            let count = u32::try_from(segments.len()).map_err(|_| Error::Limit("the wall law's table is too long for the GPU solver".into()))?;
+            wall_rows.extend([f32::from_bits(count), 0.0, 0.0, 0.0]);
+            for row in &segments {
+                wall_rows.extend(row.map(|v| v as f32));
+            }
+        }
         let sa_inflow = flow.spalart_allmaras().map_or(0.0, |f| f.inflow());
         let params = [0u32, 1].map(|phase| {
             let mut bytes = params.clone();
@@ -1446,6 +1461,7 @@ impl GpuFlow {
             zones: zones.zones > 0,
             interpolated,
             sa: sa_faces.is_some(),
+            sa_law,
         })?;
         // Every binding's buffer in bind group k (the two differ in the phase and the A–B swap).
         let resource = |binding: u32, k: usize| -> Option<&wgpu::Buffer> {
