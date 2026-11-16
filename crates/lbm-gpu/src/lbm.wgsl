@@ -276,7 +276,7 @@ struct Params {
 @group(0) @binding(26) var<storage, read_write> zones_rw: array<u32>;
 // The Spalart–Allmaras model: ν̃ per cell (0 outside the fluid); each cell's transport rate and
 // coefficient sum of the current sub-step (`sa_rate`); each cell's vorticity (x, `sa_prepare`),
-// wall distance (y, from the host), destruction length (z: d, or DDES's d̃, `sa_prepare`) and
+// wall distance (y, from the host; negative outside DDES's zone), destruction length (z: d, or DDES's d̃, `sa_prepare`) and
 // DDES's shielding f_d (w, 0 without DDES).
 @group(0) @binding(27) var<storage, read_write> nu_tilde: array<f32>;
 @group(0) @binding(28) var<storage, read_write> sa_rates: array<vec2<f32>>;
@@ -1368,17 +1368,20 @@ fn sa_prepare(@builtin(local_invocation_index) lid: u32, @builtin(workgroup_id) 
         var length = 0.0;
         var f = 0.0;
         if is_fluid(cell) {
-            length = c.y;
+            // The wall distance's sign marks the cells outside DDES's zone (negative: RANS, d̃ = d), uploaded once.
+            let outside = (bitcast<u32>(c.y) >> 31u) != 0u;
+            let dist = abs(c.y);
+            length = dist;
             let g = fd_gradient(cell);
             let wx = g.y.z - g.z.y;
             let wy = g.z.x - g.x.z;
             let wz = g.x.y - g.y.x;
             w = sqrt(wx * wx + wy * wy + wz * wz);
             if !(w < 1e30) { w = 0.0; }
-            if ddes {
+            if ddes && !outside {
                 let nu = params.smag.w;
-                f = ddes_f_d(nu + sa_nu_t(nu_tilde[cell], nu), gradient_norm2(g), c.y);
-                length = ddes_length(c.y, params.les.w, f);
+                f = ddes_f_d(nu + sa_nu_t(nu_tilde[cell], nu), gradient_norm2(g), dist);
+                length = ddes_length(dist, params.les.w, f);
                 speed[lid] = f;
                 eddy[lid] = select(0.0, 1.0, f > 0.5);
             }

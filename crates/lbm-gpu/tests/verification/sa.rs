@@ -387,25 +387,64 @@ fn ddes_shielding_follows_the_cpu() {
     assert!(failed.is_empty(), "{failed:?}");
 }
 
-/// A DDES zone is not on the device yet: a flow with one is refused, not run with DDES in every cell.
+/// DDES's zone on the device: the channel of the shielding test with DDES in its lower half only
+/// (the box `y` 0 to 1 m of the 2 m channel; the CPU keeps d̃ = d outside it). After the CPU's 200
+/// steps and one step on each backend, d̃ within 1e-6 of the largest wall distance everywhere,
+/// the cells outside the zone exactly RANS on the device (d̃ = d, f_d = 0), the LES fraction
+/// within 1e-3. Without the zone the same flow shields differently in the upper half (a CPU run
+/// with DDES everywhere has cells there with d̃ < d), so the test fails on a device that ignores the zone.
 #[test]
-fn a_ddes_zone_is_refused_on_the_gpu_until_it_runs_there() {
-    let mut m = forced_channel(Collision::Trt, 400.0, 180.0);
-    let mut step = m.step("Run").cloned().unwrap();
-    if let Procedure::Fluid { turbulence, .. } = &mut step.procedure {
-        let zone = fieldcraft_model::DdesZone { min: [-1.0e3; 3], max: [1.0e3; 3] };
-        *turbulence = Some(Turbulence::SpalartAllmaras {
-            prandtl: 0.9,
-            wall_model: None,
-            inflow_ratio: 3.0,
-            ddes: Some(fieldcraft_model::Ddes { c_des: 0.65, zone: Some(zone) }),
-        });
+fn a_ddes_zone_follows_the_cpu() {
+    let with_zone = |zone| {
+        let mut m = forced_channel(Collision::Trt, 400.0, 180.0);
+        let mut step = m.step("Run").cloned().unwrap();
+        if let Procedure::Fluid { turbulence, .. } = &mut step.procedure {
+            *turbulence = Some(Turbulence::SpalartAllmaras {
+                prandtl: 0.9,
+                wall_model: None,
+                inflow_ratio: 3.0,
+                ddes: Some(fieldcraft_model::Ddes { c_des: 0.65, zone }),
+            });
+        }
+        m.replace_step(step).unwrap();
+        let (_, mut cpu) = prepare(&m, &[]);
+        cpu.set_sa_substeps(Some(2));
+        cpu.advance(200).unwrap();
+        cpu
+    };
+    let zone = fieldcraft_model::DdesZone { min: [-1.0, 0.0, -1.0], max: [2.0, 1.0, 2.0] };
+    let mut cpu = with_zone(Some(zone));
+    let mut ungated = with_zone(None);
+    for streaming in [Streaming::InPlace, Streaming::TwoBuffers] {
+        let Some(mut gpu) = gpu(&cpu, streaming) else { return };
+        gpu.fix_sa_substeps(Some(2)).unwrap();
+        cpu.advance(1).unwrap();
+        gpu.advance(1).unwrap();
+        ungated.advance(1).unwrap();
+        let d = cpu.sa_wall_distance().unwrap().to_vec();
+        let mask = cpu.ddes_zone().unwrap().to_vec();
+        let (lc, lg) = (cpu.ddes_length().unwrap().to_vec(), gpu.ddes_length().unwrap().unwrap());
+        let fg = gpu.ddes_shielding().unwrap().unwrap();
+        let lu = ungated.ddes_length().unwrap().to_vec();
+        let largest = d.iter().fold(0.0f64, |m, v| m.max(*v));
+        let dl = lc.iter().zip(&lg).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max) / largest;
+        let fluid: Vec<usize> = (0..d.len()).filter(|k| d[*k] > 0.0).collect();
+        let outside: Vec<usize> = fluid.iter().copied().filter(|k| !mask[*k]).collect();
+        let inside = fluid.len() - outside.len();
+        let rans = outside.iter().all(|k| lg[*k] == d[*k] && fg[*k] == 0.0);
+        // Cells the zone matters for: outside it, where DDES everywhere would have lowered d̃.
+        let mattered = outside.iter().filter(|k| lu[**k] < d[**k] - 1e-6).count();
+        let (sc, sg) = (Backend::ddes(&cpu).unwrap(), Backend::ddes(&*gpu).unwrap());
+        let dfrac = (sc.les_fraction - sg.les_fraction).abs();
+        println!(
+            "DDES zone ({streaming:?}): d̃ {dl:.2e} of {largest:.2}; {inside} cells inside, {} outside ({mattered} of them shielded differently by DDES everywhere), outside exactly RANS {rans}; LES fraction {:.4} vs {:.4}",
+            outside.len(),
+            sc.les_fraction,
+            sg.les_fraction
+        );
+        assert!(inside > 0 && !outside.is_empty() && mattered > 0, "the zone must split the channel and matter outside it");
+        assert!(sc.les_fraction > 0.0 && dl < 1e-6 && rans && dfrac <= 1e-3, "{streaming:?}");
     }
-    m.replace_step(step).unwrap();
-    let (_, flow) = prepare(&m, &[]);
-    let e = GpuFlow::with_options(&flow, Policy::from_env().expect("FIELDCRAFT_GPU names a policy"), Options::default()).err().map(|e| e.to_string());
-    println!("DDES zone: {e:?}");
-    assert!(e.as_deref().is_some_and(|e| e.contains("DDES zone") && e.contains("not supported yet") && e.contains("cpu")), "{e:?}");
 }
 
 /// The model on Han, Ooka and Kikumoto's on-node wall (`spalding_bounce`), inflow ν̃/ν 3.
