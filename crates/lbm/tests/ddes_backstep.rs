@@ -740,12 +740,23 @@ impl Step {
             println!("stepping on the device: {}", d.name());
             peak_device = peak_device.max(device_memory("at the start").unwrap_or(0.0));
         }
+        // Where the wall time goes, in seconds: advance (the call), the per-step force readback (which waits for the
+        // device, so holds the step's kernel time), the mirror (device fields to the host flow), the host's samples
+        // (inlet read, blocks, window sums) and the restart saves.
+        let mut prof = [0.0f64; 5];
+        let lap = |t: &mut std::time::Instant, slot: &mut f64| {
+            let now = std::time::Instant::now();
+            *slot += now.duration_since(*t).as_secs_f64();
+            *t = now;
+        };
+        let mut tick = std::time::Instant::now();
         while steps < self.max_steps && rule.is_none() {
             steps += 1;
             match device.as_mut() {
                 Some(d) => d.advance(1).map_err(|e| format!("step {steps}: {e}"))?,
                 None => flow.step().map_err(|e| format!("step {steps}: {e}"))?,
             }
+            lap(&mut tick, &mut prof[0]);
             if steps <= startup {
                 if let Some(path) = self.checkpoint.as_ref().filter(|_| steps.is_multiple_of(CHECKPOINT_STEPS)) {
                     if let Some(d) = device.as_mut() {
@@ -762,6 +773,7 @@ impl Step {
             for (s, g) in groups.iter().enumerate() {
                 interval[s] += g.iter().map(|&g| forces.get(g).map_or(f64::NAN, |f| f[0])).sum::<f64>() / areas[s];
             }
+            lap(&mut tick, &mut prof[1]);
             if steps % self.sample != 0 {
                 continue;
             }
@@ -774,12 +786,14 @@ impl Step {
                 ));
             }
             interval.iter_mut().for_each(|v| *v = 0.0);
+            tick = std::time::Instant::now();
             if let Some(d) = device.as_mut() {
                 mirror(&mut flow, d.as_mut(), false)?;
                 if steps.is_multiple_of(CHECKPOINT_STEPS) {
                     peak_device = peak_device.max(device_memory(&format!("at step {steps}")).unwrap_or(0.0));
                 }
             }
+            lap(&mut tick, &mut prof[2]);
             let rhos: Vec<f64> = (0..4.min(nx))
                 .flat_map(|i| (0..nz).flat_map(move |k| (0..ny).map(move |j| [i, j, k])))
                 .filter_map(|c| flow.moments(grid.index(c)).map(|m| m.0 - 1.0))
@@ -794,10 +808,27 @@ impl Step {
             }
             samples.push(sample);
             window.add(&flow);
+            lap(&mut tick, &mut prof[3]);
             // Sample boundaries carry no partial interval, so the file holds the whole state.
             if let Some(path) = self.checkpoint.as_ref().filter(|_| steps.is_multiple_of(CHECKPOINT_STEPS)) {
                 save(path, &mut flow, steps, &samples, Some(&window));
             }
+            lap(&mut tick, &mut prof[4]);
+        }
+        {
+            let total: f64 = prof.iter().sum();
+            let n = steps.max(1) as f64;
+            println!(
+                "profile over {steps} steps ({total:.1} s in the loop, {:.1} ms/step): advance call {:.1} s ({:.1} ms/step), per-step forces readback incl. the wait for the device {:.1} s ({:.1} ms/step), mirror {:.1} s, host sample work (inlet read, blocks) and window sums {:.1} s, restart saves {:.1} s",
+                1e3 * total / n,
+                prof[0],
+                1e3 * prof[0] / n,
+                prof[1],
+                1e3 * prof[1] / n,
+                prof[2],
+                prof[3],
+                prof[4]
+            );
         }
         // The end of the run is saved too, so a run that stops between two checkpoints leaves its field.
         if let Some(d) = device.as_mut() {
