@@ -879,7 +879,7 @@ fn slotted_channel_stability() {
             {
                 let (open, tot, _, u_slot, um_sec) = sec(at(0.7));
                 println!(
-                    "REPORT K on the inlet speed {:.3} (dp/(0.5 U_in^2), U_in {u_in}); K on the mean slot speed {:.3} (mean u_x {u_slot:.5} over the open cells at x 0.7 m, open fraction {:.4}); peak speed over mean slot speed {:.3} (peak in the section {um_sec:.5}); throat Reynolds number {:.0} (mean slot speed x open width {:.2} cells / viscosity {nu_lat:.3e} lattice); friction share: see the FRICTION line",
+                    "REPORT (final snapshot at the last step, not a time average: quote the KLAST line) K on the inlet speed {:.3} (dp/(0.5 U_in^2), U_in {u_in}); K on the mean slot speed {:.3} (mean u_x {u_slot:.5} over the open cells at x 0.7 m, open fraction {:.4}); peak speed over mean slot speed {:.3} (peak in the section {um_sec:.5}); throat Reynolds number {:.0} (mean slot speed x open width {:.2} cells / viscosity {nu_lat:.3e} lattice); friction share: see the FRICTION line",
                     dp_end / (0.5 * u_in * u_in),
                     dp_end / (0.5 * u_slot * u_slot),
                     open as f64 / tot,
