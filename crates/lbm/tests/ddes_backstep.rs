@@ -1504,3 +1504,63 @@ fn a_restart_writes_its_profile() {
     write_profile(&out, &flow, &step).expect("profile written");
     println!("profile written to {}", out.display());
 }
+
+/// T3: the DDES study. The span step of T2 (`FIELDCRAFT_STEP_SPAN` H, short domain) with DDES
+/// (C_DES 0.65, Spalart et al. 2006) acting in the box from 1 H upstream of the step to 12 H
+/// downstream and from the floor to 3 H, RANS everywhere else. It starts from T2's restart file
+/// (`FIELDCRAFT_STEP_RESTART`, a copy: RANS, same grid and span, read as [`transfer`] reads T1s's),
+/// discards the first 50 H/U (the start-up, which the statistics never see), then averages x_r in
+/// blocks of 1000 steps (100 samples of 10) until the blocks' acceptance holds (at least 20 blocks,
+/// 95 % half-width and half-window drift under 1 %, `Blocks::acceptance`), at most 300 H/U in all.
+/// H/U is `FIELDCRAFT_STEP_CELLS_PER_H` over the lattice speed, in steps. Prints `timing:` (cells,
+/// wall time, peak memory), the M cell updates/s, the steps, and x_r with its batch-means error.
+/// `FIELDCRAFT_STEP_CHECKPOINT` is T3's own restart file, resumed when it exists.
+/// `FIELDCRAFT_STEP_RESTART=<copy> FIELDCRAFT_STEP_CELLS_PER_H=24 FIELDCRAFT_STEP_SPAN=4 cargo test --release -p fieldcraft-lbm --test ddes_backstep t3 -- --ignored --nocapture`.
+#[test]
+#[ignore = "hours: the DDES study from T2's restart, FIELDCRAFT_STEP_RESTART"]
+fn t3_ddes_in_the_zone_from_t2s_field_reports_x_r_with_its_error() {
+    let file = std::path::PathBuf::from(std::env::var("FIELDCRAFT_STEP_RESTART").expect("FIELDCRAFT_STEP_RESTART"));
+    let span: f64 = std::env::var("FIELDCRAFT_STEP_SPAN").ok().and_then(|v| v.parse().ok()).unwrap_or(4.0);
+    let checkpoint = std::env::var_os("FIELDCRAFT_STEP_CHECKPOINT").map(std::path::PathBuf::from);
+    let rans = sa_rans();
+    let t2 = Step { startup: 0.0, ..sa_step_in(rans, true, span) };
+    let (mut from, _, _) = t2.build();
+    load(&file, &mut from);
+    let h = t2.spacing();
+    let zone = fieldcraft_model::DdesZone { min: [-1.0, -1.0, -h], max: [12.0, span + 1.0, 3.0] };
+    let Turbulence::SpalartAllmaras { prandtl, wall_model, inflow_ratio, .. } = rans else { panic!("sa_rans is Spalart–Allmaras") };
+    let ddes = Turbulence::SpalartAllmaras {
+        prandtl,
+        wall_model,
+        inflow_ratio,
+        ddes: Some(fieldcraft_model::Ddes { c_des: 0.65, zone: Some(zone) }),
+    };
+    let base = sa_step_in(ddes, true, span);
+    let h_over_u = (base.cells_per_h as f64 / base.lattice_velocity).round() as u64;
+    let flow_through = ((base.upstream + base.downstream) / h / base.lattice_velocity) as u64;
+    let t3 = Step {
+        max_steps: 300 * h_over_u,
+        sample: 100,
+        block: 10,
+        startup: (50 * h_over_u) as f64 / flow_through as f64,
+        checkpoint,
+        ..base
+    };
+    println!("T3: DDES zone {:?} to {:?} (H), C_DES 0.65; H/U = {h_over_u} steps, discard 50 H/U, cap 300 H/U", zone.min, zone.max);
+    let run = t3.try_run_from(Some(&|flow: &mut Flow| transfer(&from, flow))).unwrap_or_else(|e| panic!("T3: {e}"));
+    let a = run.reattachment.acceptance();
+    println!(
+        "T3 x_r {:?} H (gated shear); mean of {} block reattachments {:.4} H, 95 % half-width {:?} (relative {:?}), half-window drift {:?}; {} steps = {:.1} H/U, settled {} ({:?}), {} blocks refused",
+        run.x_r,
+        run.reattachment.means().len(),
+        run.reattachment.mean(),
+        a.half_width_95,
+        a.relative_half_width,
+        a.relative_half_window_drift,
+        run.steps,
+        run.steps as f64 / h_over_u as f64,
+        run.settled,
+        run.rule,
+        run.missing.0
+    );
+}
