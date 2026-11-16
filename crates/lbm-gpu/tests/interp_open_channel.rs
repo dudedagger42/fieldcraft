@@ -6,7 +6,7 @@
 //! over the exact one (12 nu U / H^2 per cell, want 1 within 1 %), the mean density in every window (steady) and the size of the
 //! correction per 10 000 steps. Fields are in lattice units; the lattice viscosity is `NU` (0.05) and the mean speed `UMEAN` (0.02).
 //! Environment: CELLS (8), WIDTH (8.5), NX (64: the channel's length in cells), STEPS (20000), WINDOW (2500), NU, UMEAN, QUAD (1: the
-//! quadratic rule, 0 linear), MASSFIX (2: spread; 0 off, 1 local), INTERP (1: 0 runs the plain half-way wall), CPU (1), GPU (1).
+//! quadratic rule, 0 linear), MRT (0: 1 collides with the multiple-relaxation-time model), SA (0: 1 adds the Spalart–Allmaras model), MASSFIX (2: spread; 0 off, 1 local), INTERP (1: 0 runs the plain half-way wall), CPU (1), GPU (1).
 // A local harness: index loops over the grid and nested ifs read better than iterator chains here.
 #![allow(clippy::needless_range_loop, clippy::collapsible_if)]
 #[path = "../../lbm/tests/common/mod.rs"]
@@ -65,7 +65,13 @@ fn interpolated_wall_open_channel() {
     d.faces.x_max = FaceCondition::Pressure { pressure: 0.0, outflow: Outflow::Uniform };
     d.initial_velocity = [u_phys, 0.0, 0.0];
     d.obstacles = vec!["Wall".into()];
-    let p: Procedure = collide(steps as f64 * dt, dt, None, Collision::Trt);
+    let collision = if env("MRT", 0.0) > 0.5 { Collision::Mrt } else { Collision::Trt };
+    let mut p: Procedure = collide(steps as f64 * dt, dt, None, collision);
+    if env("SA", 0.0) > 0.5
+        && let Procedure::Fluid { turbulence, .. } = &mut p
+    {
+        *turbulence = Some(fieldcraft_model::Turbulence::SpalartAllmaras { prandtl: 0.9, wall_model: None, inflow_ratio: 3.0, ddes: None });
+    }
     let m = model(1.0, 1.0, d, p);
     let setup = fieldcraft_lbm::Setup::new(&m, None, &obstacles, &fieldcraft_lbm::Limits::default()).unwrap_or_else(|e| panic!("setup refused: {e}"));
     let mut cpu = fieldcraft_lbm::Flow::new(&setup, &obstacles).unwrap_or_else(|e| panic!("flow refused: {e}"));
