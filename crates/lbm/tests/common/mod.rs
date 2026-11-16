@@ -5,6 +5,7 @@
 pub mod cases;
 pub mod curved_cht;
 pub mod pressure_zone;
+pub mod step_readings;
 
 use std::collections::BTreeMap;
 
