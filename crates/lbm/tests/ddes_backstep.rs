@@ -47,6 +47,7 @@
 mod common;
 
 use common::cases::*;
+use common::step_readings::{Floor, ROWS, Readings, Station, furthest_crossing};
 use common::*;
 use fieldcraft_lbm::backend::Backend;
 use fieldcraft_lbm::statistics::Blocks;
@@ -134,6 +135,212 @@ impl Shear {
     /// Each strip's time mean: the mean of its complete blocks.
     fn mean(&self) -> Vec<f64> {
         self.strips.iter().map(Blocks::mean).collect()
+    }
+}
+
+/// The reattachment of a floor shear profile. A steady run's has exactly one negative → non-negative
+/// change ([`reattachment`], refused otherwise). A scale-resolving run's has the furthest-downstream
+/// change beyond one step height, the primary reattachment (the corner bubble's crossings lie nearer
+/// the step); it is refused only when there is none.
+fn floor_reattachment(x: &[f64], tau: &[f64], steady: bool) -> Result<f64, NoReattachment> {
+    if steady {
+        return reattachment(x, tau);
+    }
+    crossings(x, tau)?
+        .into_iter()
+        .rfind(|&c| c > 1.0)
+        .ok_or_else(|| NoReattachment::None { lowest: tau.iter().copied().fold(f64::INFINITY, f64::min) })
+}
+
+/// Something a run feeds as it goes, beside the carried shear: handed the flow at every sample
+/// after the start-up (so it can read what the harness does not), told when the run resumes from a
+/// restart file at a step and when one is written, so its sums are kept with the field.
+trait Observe {
+    fn resume(&mut self, steps: u64);
+    fn sample(&mut self, flow: &mut Flow, steps: u64) -> Result<(), String>;
+    fn save(&mut self, steps: u64);
+}
+
+/// The reattachment and resolved-stress readings of the step (`common/step_readings.rs`): the floor's
+/// first rows over every column and the stress at three stations behind the step, accumulated at
+/// each sample. What is reported is all that is kept. The flow is built inside the run, so the
+/// accumulators are set up from it at the first sample.
+struct StepWatch {
+    step: Step,
+    /// Where the running sums are kept beside the restart file.
+    sidecar: Option<std::path::PathBuf>,
+    /// The step the run resumed at, when it did.
+    resume_at: Option<u64>,
+    watched: Option<Watched>,
+}
+
+struct Watched {
+    readings: Readings,
+    /// The first open row above the floor (the wall reader's first row).
+    first_row: usize,
+    /// Half a cell: Han's wall is the node row's centre; 0 for a half-way wall.
+    wall: f64,
+    /// Each station's column, and the rows its heights are read from.
+    columns: Vec<usize>,
+    heights: Vec<usize>,
+}
+
+/// The stations' x behind the step, in H, and the top of the heights read at each.
+const STATIONS: [f64; 3] = [1.0, 3.0, 5.0];
+const STATION_TOP: f64 = 3.0;
+
+impl StepWatch {
+    fn new(step: &Step, sidecar: Option<std::path::PathBuf>) -> StepWatch {
+        StepWatch { step: step.clone(), sidecar, resume_at: None, watched: None }
+    }
+
+    /// The molecular viscosity in lattice units.
+    fn nu(&self) -> f64 {
+        self.step.lattice_velocity * self.step.cells_per_h as f64 / self.step.re_h
+    }
+
+    /// Sets the accumulators up from the flow (once); with a restart, from the file kept beside it
+    /// when it is from the step the run resumed at.
+    fn ensure(&mut self, flow: &Flow) -> Result<&mut Watched, String> {
+        if self.watched.is_none() {
+            let g = flow.grid();
+            let [nx, _, nz] = g.cells;
+            let h = self.step.spacing();
+            let first_row = if flow.on_node_bounce() { 2 } else { 1 };
+            let wall = if flow.on_node_bounce() { 0.5 * h } else { 0.0 };
+            let z = |k: usize| (k as f64 - 0.5) * h - wall;
+            let heights: Vec<usize> = (first_row..nz.saturating_sub(1)).take_while(|&k| z(k) <= STATION_TOP).collect();
+            let columns: Vec<usize> = STATIONS.iter().map(|&x| ((x + self.step.upstream) / h).floor() as usize).collect();
+            if columns.iter().any(|&c| c >= nx) {
+                return Err(format!("the stations at {STATIONS:?} H do not fit the {nx} columns"));
+            }
+            let x: Vec<f64> = (0..nx).map(|i| -self.step.upstream + (i as f64 + 0.5) * h).collect();
+            let stations = STATIONS.iter().map(|&xs| Station::new(xs, heights.iter().map(|&k| z(k)).collect())).collect::<Result<Vec<_>, _>>()?;
+            let mut readings = Readings { floor: Floor::new(x)?, stations };
+            if let (Some(at), Some(path)) = (self.resume_at, self.sidecar.as_ref().filter(|p| p.exists())) {
+                match Readings::load(path) {
+                    Ok((from, r)) if from == at && r.floor.x == readings.floor.x && r.stations.len() == readings.stations.len() => {
+                        println!("readings resumed from {} at step {from} ({} samples)", path.display(), r.floor.samples());
+                        readings = r;
+                    }
+                    Ok((from, _)) => println!("readings file {} is from step {from}, not {at}: the readings start again", path.display()),
+                    Err(why) => println!("readings file {}: {why}: the readings start again", path.display()),
+                }
+            }
+            self.watched = Some(Watched { readings, first_row, wall, columns, heights });
+        }
+        self.watched.as_mut().ok_or_else(|| "the readings were not set up".to_string())
+    }
+
+    /// The two reattachment readings on what has been accumulated, and the resolved share of the
+    /// shear stress at each station; printed, and returned as (mean-shear, forward-flow).
+    fn report(&self) -> (Result<f64, String>, Result<f64, String>) {
+        let Some(w) = &self.watched else {
+            let none = "no sample was taken".to_string();
+            return (Err(none.clone()), Err(none));
+        };
+        let h = self.step.spacing();
+        let f = &w.readings.floor;
+        let rows = f.mean_rows();
+        println!("readings over {} samples", f.samples());
+        // The rows 2-4 reader on the time-mean u: each row's furthest-downstream crossing beyond 1 H,
+        // extrapolated to the wall.
+        let points: Vec<Result<(f64, f64), String>> = (0..ROWS.min(4))
+            .map(|r| {
+                let y = ((w.first_row + r) as f64 - 0.5) * h - w.wall;
+                furthest_crossing(&f.x, &rows[r], 1.0).map(|x| (y, x))
+            })
+            .collect();
+        for (r, p) in points.iter().enumerate() {
+            match p {
+                Ok((y, x)) => println!("time-mean u = 0 crossing, row {} (y = {y:.4} H): x {x:.3} H", r + 1),
+                Err(why) => println!("time-mean u = 0 crossing, row {}: none ({why})", r + 1),
+            }
+        }
+        let mean_shear = match points.as_slice() {
+            [_, Ok(a), Ok(b), Ok(c)] => Ok(intercept(&[*a, *b, *c], 1)),
+            _ => Err("rows 2 to 4 do not all cross".to_string()),
+        };
+        let forward = f.forward_flow(1.0);
+        match (&mean_shear, &forward) {
+            (Ok(m), Ok(v)) => {
+                println!(
+                    "reattachment, mean-shear reading (rows 2-4 on the time-mean u): {m:.3} H; forward-flow reading (near-floor u positive half the time): {v:.3} H"
+                );
+                if (m - v).abs() > 0.2 {
+                    println!("THE TWO READINGS DIFFER BY {:.3} H (over 0.2 H): both are reported", (m - v).abs());
+                }
+            }
+            (m, v) => println!("reattachment readings: mean-shear {m:?}, forward-flow {v:?}"),
+        }
+        for s in &w.readings.stations {
+            match s.resolved_share(self.nu(), 0.25) {
+                Ok((z, share)) => {
+                    println!("stress at x = {} H over {} points: resolved share {share:.3} of the total at its peak, z = {z:.3} H", s.x, s.points())
+                }
+                Err(why) => println!("stress at x = {} H: {why}", s.x),
+            }
+        }
+        (mean_shear, forward)
+    }
+
+    /// One reading of a flow: the floor rows, the forward-flow shares and, at each station, the
+    /// span's columns of u, w and ν_t.
+    fn read(&mut self, flow: &mut Flow) -> Result<(), String> {
+        let nu = self.nu();
+        self.ensure(flow)?;
+        let nu_tilde = flow.nu_tilde().map_err(|e| format!("reading ν̃: {e}"))?;
+        let g = *flow.grid();
+        let [nx, ny, _] = g.cells;
+        let Some(w) = self.watched.as_mut() else { return Err("the readings were not set up".into()) };
+        let moments = |i: usize, j: usize, k: usize| flow.moments(g.index([i, j, k]));
+        let mut rows = vec![vec![0.0; nx]; ROWS];
+        let mut positive = vec![0.0; nx];
+        for i in 0..nx {
+            for (r, row) in rows.iter_mut().enumerate() {
+                let k = w.first_row + r;
+                let (sum, n) = (0..ny).filter_map(|j| moments(i, j, k)).fold((0.0, 0), |(s, n), m| (s + m.1[0], n + 1));
+                row[i] = if n > 0 { sum / n as f64 } else { 0.0 };
+            }
+            let (up, n) = (0..ny).filter_map(|j| moments(i, j, w.first_row)).fold((0, 0), |(u, n), m| (u + usize::from(m.1[0] > 0.0), n + 1));
+            positive[i] = if n > 0 { up as f64 / n as f64 } else { 0.0 };
+        }
+        w.readings.floor.add(&rows, &positive)?;
+        for (s, &i) in w.readings.stations.iter_mut().zip(&w.columns) {
+            for j in 0..ny {
+                let cells: Vec<(f64, [f64; 3])> = w.heights.iter().filter_map(|&k| moments(i, j, k)).collect();
+                if cells.len() != w.heights.len() {
+                    continue;
+                }
+                let u: Vec<f64> = cells.iter().map(|c| c.1[0]).collect();
+                let wz: Vec<f64> = cells.iter().map(|c| c.1[2]).collect();
+                let nu_t: Vec<f64> = w
+                    .heights
+                    .iter()
+                    .map(|&k| nu_tilde.as_ref().and_then(|v| v.get(g.index([i, j, k]))).map_or(0.0, |&nt| fieldcraft_lbm::sa::nu_t(nt, nu)))
+                    .collect();
+                s.add(&u, &wz, &nu_t)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Observe for StepWatch {
+    fn resume(&mut self, steps: u64) {
+        self.resume_at = Some(steps);
+    }
+
+    fn sample(&mut self, flow: &mut Flow, _steps: u64) -> Result<(), String> {
+        self.read(flow)
+    }
+
+    fn save(&mut self, steps: u64) {
+        if let (Some(path), Some(w)) = (&self.sidecar, &self.watched)
+            && let Err(why) = w.readings.save(path, steps)
+        {
+            println!("readings not saved: {why}");
+        }
     }
 }
 
@@ -439,6 +646,17 @@ impl Step {
     /// [`Step::try_run`] starting from the field `init` sets (a settled field from another
     /// grid, [`transfer`]) instead of the uniform one; a restart file still takes precedence.
     fn try_run_from(&self, init: Option<&dyn Fn(&mut Flow) -> Result<(), String>>) -> Result<Run, String> {
+        self.try_run_observed(init, None)
+    }
+
+    /// [`Step::try_run_from`] with an observer: it is handed the flow at every sample after the
+    /// start-up, told when the run resumes from a restart file and when one is written, so what it
+    /// accumulates (the floor's means, the resolved stress) survives a restart like the shear does.
+    fn try_run_observed(
+        &self,
+        init: Option<&dyn Fn(&mut Flow) -> Result<(), String>>,
+        mut observer: Option<&mut dyn Observe>,
+    ) -> Result<Run, String> {
         let (mut flow, strips, _) = self.build();
         if let Some(init) = init {
             init(&mut flow)?;
@@ -504,7 +722,10 @@ impl Step {
                 return None;
             }
             let floor = floor_of(&shear.last_block());
-            let last = reattachment(&floor_x, &floor);
+            // A steady run refuses a block with more than one crossing. A scale-resolving run
+            // never refuses one: it reports the furthest-downstream crossing beyond one step
+            // height (the primary reattachment; the corner bubble's lie nearer the step).
+            let last = floor_reattachment(&floor_x, &floor, steady_run);
             match &last {
                 Ok(x_r) => {
                     blocks.push(*x_r).unwrap();
@@ -538,6 +759,9 @@ impl Step {
         if let Some(path) = self.checkpoint.as_ref().filter(|p| p.exists()) {
             let (at, kept) = load(path, &mut flow);
             steps = at;
+            if let Some(o) = observer.as_mut() {
+                o.resume(steps);
+            }
             println!("resumed {} at step {steps} ({} samples)", path.display(), kept.len());
             let first = startup + self.sample;
             for (n, sample) in kept.iter().enumerate() {
@@ -583,15 +807,24 @@ impl Step {
             if blocks.means().len() > history.len() {
                 history.push((steps, clock.elapsed().as_secs_f64(), blocks.mean()));
             }
+            if let Some(o) = observer.as_mut() {
+                o.sample(&mut flow, steps)?;
+            }
             samples.push(sample);
             // Sample boundaries carry no partial interval, so the file holds the whole state.
             if let Some(path) = self.checkpoint.as_ref().filter(|_| steps.is_multiple_of(CHECKPOINT_STEPS)) {
                 save(path, &mut flow, steps, &samples);
+                if let Some(o) = observer.as_mut() {
+                    o.save(steps);
+                }
             }
         }
         // The end of the run is saved too, so a run that stops between two checkpoints leaves its field.
         if let Some(path) = self.checkpoint.as_ref() {
             save(path, &mut flow, steps, &samples);
+            if let Some(o) = observer.as_mut() {
+                o.save(steps);
+            }
         }
         println!(
             "{} fluid cells, {steps} steps: {:.1} M cell updates/s",
@@ -626,7 +859,7 @@ impl Step {
         let (rho_ref, u_ref) = reference(&flow);
         let q = 0.5 * rho_ref * u_ref * u_ref;
         let mean = shear.mean();
-        let x_r = reattachment(&floor_x, &floor_of(&mean));
+        let x_r = floor_reattachment(&floor_x, &floor_of(&mean), steady_run);
         let cf: Vec<(f64, f64)> = strips.iter().zip(&mean).map(|(s, t)| (0.5 * (s.x.0 + s.x.1), t / q)).collect();
         let p_ref = rho_ref / 3.0;
         let cp: Vec<(f64, f64)> = floor_x.iter().map(|&x| (x, (span_mean(&flow, column(x), 1).0 / 3.0 - p_ref) / q)).collect();
@@ -1516,41 +1749,57 @@ fn a_restart_writes_its_profile() {
 /// wall time, peak memory), the M cell updates/s, the steps, and x_r with its batch-means error.
 /// `FIELDCRAFT_STEP_CHECKPOINT` is T3's own restart file, resumed when it exists.
 /// `FIELDCRAFT_STEP_RESTART=<copy> FIELDCRAFT_STEP_CELLS_PER_H=24 FIELDCRAFT_STEP_SPAN=4 cargo test --release -p fieldcraft-lbm --test ddes_backstep t3 -- --ignored --nocapture`.
+/// The phase-3 DDES run's configuration over the T2 grid: the zone box from 1 H upstream of the step
+/// to 12 H downstream and the floor to 3 H above it, C_DES 0.65.
+fn t3_model(span: f64) -> (Turbulence, fieldcraft_model::DdesZone) {
+    let h = 1.0 / std::env::var("FIELDCRAFT_STEP_CELLS_PER_H").ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(16.0);
+    let zone = fieldcraft_model::DdesZone { min: [-1.0, -1.0, -h], max: [12.0, span + 1.0, 3.0] };
+    let Turbulence::SpalartAllmaras { prandtl, wall_model, inflow_ratio, .. } = sa_rans() else { panic!("sa_rans is Spalart–Allmaras") };
+    let ddes =
+        Turbulence::SpalartAllmaras { prandtl, wall_model, inflow_ratio, ddes: Some(fieldcraft_model::Ddes { c_des: 0.65, zone: Some(zone) }) };
+    (ddes, zone)
+}
+
+/// T3: DDES in the zone, started from T2's field (`FIELDCRAFT_STEP_RESTART`, a copy), on the same
+/// grid, so the restart loads straight into the DDES flow: one flow in memory, not T2's beside T3's.
+/// The reattachment is read two ways on the whole averaging window (the rows 2 to 4 reader on the
+/// time-mean u and the station where the near-floor u is positive half the time), blocks of 30 H/U
+/// give the error bar only and are never refused, and the resolved share of the shear stress is read
+/// at 1, 3 and 5 H behind the step. Only those are accumulated (`StepWatch`), and they are kept
+/// beside the restart file so a resumed run keeps them. `FIELDCRAFT_STEP_MAX_HU` caps the run (300
+/// H/U by default). A plumbing and timing run while the inlet is uniform, not a validation number.
 #[test]
 #[ignore = "hours: the DDES study from T2's restart, FIELDCRAFT_STEP_RESTART"]
 fn t3_ddes_in_the_zone_from_t2s_field_reports_x_r_with_its_error() {
     let file = std::path::PathBuf::from(std::env::var("FIELDCRAFT_STEP_RESTART").expect("FIELDCRAFT_STEP_RESTART"));
     let span: f64 = std::env::var("FIELDCRAFT_STEP_SPAN").ok().and_then(|v| v.parse().ok()).unwrap_or(4.0);
+    let cap_hu: u64 = std::env::var("FIELDCRAFT_STEP_MAX_HU").ok().and_then(|v| v.parse().ok()).unwrap_or(300);
     let checkpoint = std::env::var_os("FIELDCRAFT_STEP_CHECKPOINT").map(std::path::PathBuf::from);
-    let rans = sa_rans();
-    let t2 = Step { startup: 0.0, ..sa_step_in(rans, true, span) };
-    let (mut from, _, _) = t2.build();
-    load(&file, &mut from);
-    let h = t2.spacing();
-    let zone = fieldcraft_model::DdesZone { min: [-1.0, -1.0, -h], max: [12.0, span + 1.0, 3.0] };
-    let Turbulence::SpalartAllmaras { prandtl, wall_model, inflow_ratio, .. } = rans else { panic!("sa_rans is Spalart–Allmaras") };
-    let ddes = Turbulence::SpalartAllmaras {
-        prandtl,
-        wall_model,
-        inflow_ratio,
-        ddes: Some(fieldcraft_model::Ddes { c_des: 0.65, zone: Some(zone) }),
-    };
+    let (ddes, zone) = t3_model(span);
     let base = sa_step_in(ddes, true, span);
+    let h = base.spacing();
     let h_over_u = (base.cells_per_h as f64 / base.lattice_velocity).round() as u64;
     let flow_through = ((base.upstream + base.downstream) / h / base.lattice_velocity) as u64;
-    let t3 = Step {
-        max_steps: 300 * h_over_u,
-        sample: 100,
-        block: 10,
-        startup: (50 * h_over_u) as f64 / flow_through as f64,
-        checkpoint,
-        ..base
+    let sample = 100;
+    // Blocks of at least 30 H/U (72 samples of 100 steps at 240 steps per H/U).
+    let block = (30 * h_over_u).div_ceil(sample) as usize;
+    let sidecar = checkpoint.as_ref().map(|c| c.with_extension("readings"));
+    let t3 = Step { max_steps: cap_hu * h_over_u, sample, block, startup: (50 * h_over_u) as f64 / flow_through as f64, checkpoint, ..base };
+    let mut watch = StepWatch::new(&t3, sidecar);
+    println!(
+        "T3: DDES zone {:?} to {:?} (H), C_DES 0.65; H/U = {h_over_u} steps, discard 50 H/U, cap {cap_hu} H/U, blocks of {block} samples = {:.1} H/U",
+        zone.min,
+        zone.max,
+        (block as u64 * sample) as f64 / h_over_u as f64
+    );
+    let init = |flow: &mut Flow| -> Result<(), String> {
+        load(&file, flow);
+        Ok(())
     };
-    println!("T3: DDES zone {:?} to {:?} (H), C_DES 0.65; H/U = {h_over_u} steps, discard 50 H/U, cap 300 H/U", zone.min, zone.max);
-    let run = t3.try_run_from(Some(&|flow: &mut Flow| transfer(&from, flow))).unwrap_or_else(|e| panic!("T3: {e}"));
+    let run = t3.try_run_observed(Some(&init), Some(&mut watch)).unwrap_or_else(|e| panic!("T3: {e}"));
     let a = run.reattachment.acceptance();
     println!(
-        "T3 x_r {:?} H (gated shear); mean of {} block reattachments {:.4} H, 95 % half-width {:?} (relative {:?}), half-window drift {:?}; {} steps = {:.1} H/U, settled {} ({:?}), {} blocks refused",
+        "T3 x_r {:?} H (time-mean carried shear, furthest crossing); mean of {} block reattachments {:.4} H, 95 % half-width {:?} (relative {:?}), half-window drift {:?}; {} steps = {:.1} H/U, settled {} ({:?}), {} blocks without a crossing",
         run.x_r,
         run.reattachment.means().len(),
         run.reattachment.mean(),
@@ -1563,4 +1812,93 @@ fn t3_ddes_in_the_zone_from_t2s_field_reports_x_r_with_its_error() {
         run.rule,
         run.missing.0
     );
+    let _ = watch.report();
+}
+
+/// The readings of a restart file with no stepping, to try them on a field that exists (T2's RANS
+/// field is its own time mean: the share of resolved stress reads 0, the two reattachment readings
+/// meet where the first open row's u changes sign). Seconds:
+/// `FIELDCRAFT_STEP_RESTART=<copy> FIELDCRAFT_STEP_SPAN=4 cargo test --release -p fieldcraft-lbm --test ddes_backstep readings_of_a_restart_file -- --ignored --nocapture`.
+#[test]
+#[ignore = "reads a restart file: FIELDCRAFT_STEP_RESTART"]
+fn readings_of_a_restart_file() {
+    let file = std::path::PathBuf::from(std::env::var("FIELDCRAFT_STEP_RESTART").expect("FIELDCRAFT_STEP_RESTART"));
+    let span: f64 = std::env::var("FIELDCRAFT_STEP_SPAN").ok().and_then(|v| v.parse().ok()).unwrap_or(4.0);
+    let step = Step { startup: 0.0, ..sa_step_in(sa_rans(), true, span) };
+    let (mut flow, _, _) = step.build();
+    load(&file, &mut flow);
+    let mut watch = StepWatch::new(&step, None);
+    watch.read(&mut flow).unwrap_or_else(|e| panic!("readings: {e}"));
+    let _ = watch.report();
+}
+
+/// The step's readings on a small run: the floor and the stations accumulate once per sample, the
+/// restart's sidecar carries them so a resumed run ends with the readings of an unbroken one, and a
+/// sidecar from another step is not used.
+#[test]
+fn the_readings_follow_a_run_and_survive_its_restart() {
+    let dir = std::env::temp_dir().join(format!("fieldcraft-step-readings-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("step.restart");
+    let side = path.with_extension("readings");
+    let base = Step { re_h: 50.0, cells_per_h: 8, upstream: 6.0, expansion_ratio: 1.5, sample: 20, block: 5, ..laminar(0) };
+    let whole_step = Step { max_steps: 2400, ..base.clone() };
+    let mut whole = StepWatch::new(&whole_step, None);
+    whole_step.try_run_observed(None, Some(&mut whole)).unwrap();
+    let samples = |w: &StepWatch| w.watched.as_ref().map(|w| w.readings.floor.samples());
+    assert_eq!(samples(&whole), Some(120), "one reading per sample of 20 steps");
+    let first_step = Step { max_steps: 2000, checkpoint: Some(path.clone()), ..base.clone() };
+    let mut first = StepWatch::new(&first_step, Some(side.clone()));
+    first_step.try_run_observed(None, Some(&mut first)).unwrap();
+    assert!(side.exists(), "the readings are kept beside the restart file");
+    let resumed_step = Step { max_steps: 2400, checkpoint: Some(path.clone()), ..base.clone() };
+    let mut resumed = StepWatch::new(&resumed_step, Some(side.clone()));
+    resumed_step.try_run_observed(None, Some(&mut resumed)).unwrap();
+    assert_eq!(samples(&resumed), Some(120));
+    assert_eq!(
+        resumed.watched.as_ref().map(|w| &w.readings),
+        whole.watched.as_ref().map(|w| &w.readings),
+        "the resumed run's readings differ from an unbroken run's"
+    );
+    // A sidecar from a different step is refused: the readings start again from the resume.
+    let mut stale = Readings::load(&side).unwrap().1;
+    stale.floor = Floor::new(vec![0.0, 1.0]).unwrap();
+    stale.save(&side, 2400).unwrap();
+    let again_step = Step { max_steps: 2800, checkpoint: Some(path.clone()), ..base };
+    let mut again = StepWatch::new(&again_step, Some(side));
+    again_step.try_run_observed(None, Some(&mut again)).unwrap();
+    assert_eq!(samples(&again), Some(20), "only the 400 steps after the resume were read");
+    std::fs::remove_dir_all(&dir).ok();
+    // The report reads both ways without a panic, whatever they find.
+    let (mean_shear, forward) = whole.report();
+    println!("laminar: mean-shear {mean_shear:?}, forward-flow {forward:?}");
+}
+
+/// A restart of the RANS run loads into the DDES flow of the same grid (T3's one flow), and the DDES
+/// flow steps on from it.
+#[test]
+fn a_ddes_flow_loads_a_rans_restart_and_steps_on() {
+    let dir = std::env::temp_dir().join(format!("fieldcraft-step-ddes-load-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("rans.restart");
+    let rans = Turbulence::SpalartAllmaras { prandtl: 0.9, wall_model: None, inflow_ratio: 3.0, ddes: None };
+    let base = Step { re_h: 50.0, cells_per_h: 8, upstream: 6.0, expansion_ratio: 1.5, sample: 20, block: 5, turbulence: Some(rans), ..laminar(0) };
+    Step { max_steps: 200, checkpoint: Some(path.clone()), ..base.clone() }.try_run().unwrap();
+    let ddes = Turbulence::SpalartAllmaras {
+        prandtl: 0.9,
+        wall_model: None,
+        inflow_ratio: 3.0,
+        ddes: Some(fieldcraft_model::Ddes { c_des: 0.65, zone: Some(fieldcraft_model::DdesZone { min: [-1.0, -1.0, -0.2], max: [8.0, 1.0, 3.0] }) }),
+    };
+    let step = Step { turbulence: Some(ddes), max_steps: 400, ..base };
+    let (mut flow, _, _) = step.build();
+    let (at, _) = load(&path, &mut flow);
+    assert_eq!(at, 200);
+    for _ in 0..20 {
+        flow.step().unwrap();
+    }
+    let g = *flow.grid();
+    let finite = (0..g.len()).filter_map(|c| flow.moments(c)).all(|(r, u)| r.is_finite() && u.iter().all(|v| v.is_finite()));
+    assert!(finite, "the DDES flow stepped on from the RANS restart");
+    std::fs::remove_dir_all(&dir).ok();
 }
