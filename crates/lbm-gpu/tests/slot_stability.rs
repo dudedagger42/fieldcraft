@@ -332,7 +332,7 @@ fn slotted_channel_stability() {
     let print_every = env("PRINT", 2000.0) as u64;
     let diag = env("DIAG", 0.0) > 0.5 || early > 0;
     // the flux planes at x = 0.3 m and 1.7 m, the pressure planes at x = 0.5 m and 0.9 m, on every grid
-    let at = |x: f64| ((x + ext_up) / dx).round() as usize;
+    let at = |x: f64| (((x + ext_up) / dx).round() as usize).min(nx.saturating_sub(1));
     let (i_in, i_out) = (at(0.3), at(1.7));
     // the two pressure planes sit at x = 0.5 m and 0.9 m on every grid: the mean of the cell layers either side
     let (i_up, i_dn) = (at(0.5).max(1), at(0.9).max(1));
@@ -536,7 +536,11 @@ fn slotted_channel_stability() {
             let nwin = (done / win_steps) as usize;
             if nwin >= 6 && done % win_steps == 0 {
                 let mean = |k: usize| {
-                    let v: Vec<f64> = sc.iter().filter(|s| s.0 > k as u64 * win_steps && s.0 <= (k as u64 + 1) * win_steps).map(|s| s.7).collect();
+                    let v: Vec<f64> = (if sc.is_empty() { &sg } else { &sc })
+                        .iter()
+                        .filter(|s| s.0 > k as u64 * win_steps && s.0 <= (k as u64 + 1) * win_steps)
+                        .map(|s| s.7)
+                        .collect();
                     v.iter().sum::<f64>() / v.len().max(1) as f64
                 };
                 let w: Vec<f64> = (0..nwin).map(mean).collect();
@@ -648,13 +652,15 @@ fn slotted_channel_stability() {
     println!("FRICTION {friction}");
     let steps_cap = steps;
     let steps = done;
+    // the samples of the backend that ran (the CPU's, or the device's when CPU=0)
+    let run_samples = if sc.is_empty() { &sg } else { &sc };
     let host = std::env::var("COMPUTERNAME").or_else(|_| std::env::var("HOSTNAME")).unwrap_or_else(|_| "unknown".into());
     println!(
         "RUN ended after {steps} of {steps_cap} steps: {}; host {host}; mean density start {:.5} middle {:.5} end {:.5}",
         stop.as_deref().unwrap_or(if cpu_ok || gpu_ok { "reached the cap" } else { "blew up or stopped" }),
-        sc.first().map_or(f64::NAN, |x| x.4),
-        sc.get(sc.len() / 2).map_or(f64::NAN, |x| x.4),
-        sc.last().map_or(f64::NAN, |x| x.4)
+        run_samples.first().map_or(f64::NAN, |x| x.4),
+        run_samples.get(run_samples.len() / 2).map_or(f64::NAN, |x| x.4),
+        run_samples.last().map_or(f64::NAN, |x| x.4)
     );
     // windows: the second half, and its two quarters
     let win = |v: &[S], lo: u64, hi: u64| -> Option<String> {
