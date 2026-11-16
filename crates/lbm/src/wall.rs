@@ -648,7 +648,7 @@ pub fn friction_velocity(speed: f64, y: f64, nu: f64) -> f64 {
 }
 
 /// [`friction_velocity`] with Kármán's constant `kappa` and the intercept `b`.
-pub(crate) fn spalding_friction(speed: f64, y: f64, nu: f64, kappa: f64, b: f64) -> f64 {
+pub fn spalding_friction(speed: f64, y: f64, nu: f64, kappa: f64, b: f64) -> f64 {
     let re = speed * y / nu;
     if !(re.is_finite() && re > 0.0) {
         return 0.0;
