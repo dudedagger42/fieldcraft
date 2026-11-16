@@ -229,9 +229,10 @@ fn slotted_channel_stability() {
     let [nx, ny, nz] = cpu.grid().cells;
     let scale = setup.velocity_scale();
     println!(
-        "CASE wall law {law}; slot {cells} cells; grid {nx}x{ny}x{nz} = {n} cells; tau+-1/2 {:.3e}; tau- -1/2 {:.3e}; sigma 0.95 HRR; dt {dt:.5} s; velocity scale {scale:.4} m/s; steps {steps}; chunk {chunk}; layer {}",
+        "CASE wall law {law}; slot {cells} cells; grid {nx}x{ny}x{nz} = {n} cells; tau+-1/2 {:.3e}; tau- -1/2 {:.3e}; {}; dt {dt:.5} s; velocity scale {scale:.4} m/s; steps {steps}; chunk {chunk}; layer {}",
         setup.tau_plus - 0.5,
         setup.tau_minus - 0.5,
+        if mrt { "MRT (no sigma)" } else { "sigma 0.95 HRR" },
         std::env::var("LAYER_CELLS").map_or("default 10 cells".to_string(), |c| format!("{c} cells = {:.4} m", c.parse::<f64>().unwrap_or(0.0) * dx))
     );
     if surface {
