@@ -168,11 +168,13 @@ fn slotted_channel_stability() {
         obstacles.push(obstacle("SlabZLow", cuboid([a, -1.0, -1.0], [b, 2.0, 0.0]), &CUBOID_FACES));
     }
     println!(
-        "PLATE faces (m): x {:.5} to {x_hi:.5} (thickness {:.5}); lower plate z {z0:.5} to 0.40000; upper plate z {z_hi:.5} to 2.00000; slot edges z 0.40000 and {z_hi:.5} (width {:.5}); ROUND {round} (radius {:.5} m on the two slot-side corners; the plate's faces are the same for every ROUND)",
+        "PLATE faces (m): x {:.5} to {x_hi:.5} (thickness {:.5}); lower plate z {z0:.5} to 0.40000; upper plate z {z_hi:.5} to 2.00000; slot edges z 0.40000 and {z_hi:.5} (width {:.5}); ROUND {round} (radius {:.5} m on the two slot-side corners; the plate's faces are the same for every ROUND); series geometry: L/w 1 (plate {:.3} m thick, slot {:.3} m wide), both slot-side corners rounded",
         0.6,
         x_hi - 0.6,
         z_hi - 0.4,
-        round * slot_w * dx
+        round * slot_w * dx,
+        x_hi - 0.6,
+        z_hi - 0.4
     );
     let wall_model = match law.as_str() {
         "sa" => Some(WallModel::SpalartAllmarasBounce),
@@ -678,23 +680,27 @@ fn slotted_channel_stability() {
             let avg = fieldcraft_lbm::flow::WallSplit { normal: fnn.map(|v| v / counted as f64), tangential: ft.map(|v| v / counted as f64) };
             split_avg = Some(avg);
             let flat = fieldcraft_lbm::flow::WallSplit { normal: kn.map(|v| v / counted as f64), tangential: kt.map(|v| v / counted as f64) };
-            // The flat faces' own normal force has no component along the flow (their normals are along z), so a share of the flat links
-            // alone is 1 by construction: the lower bound is their tangential force over the total wall force of ALL links along the flow.
+            // Fable's definition: share_low = the tangential force along the flow on the flat throat faces over the TOTAL wall force along
+            // the flow of every plate link (no tangential/normal split in the denominator); share_high scales it by (flat length + both
+            // arc lengths) / flat length. No flat face (ROUND 0.5): not measurable by this method.
             let total_all = (avg.tangential[0] + avg.normal[0]).abs();
-            println!(
-                "FRICTION flat throat faces only (exact friction, the lower bound): |F_t flat| / |F_t + F_n all links| {:.4} (flat tangential {:+.4e}, flat normal along the flow {:+.4e}, all-links total {:+.4e})",
-                if total_all > 0.0 { flat.tangential[0].abs() / total_all } else { f64::NAN },
-                flat.tangential[0],
-                flat.normal[0],
-                avg.tangential[0] + avg.normal[0]
-            );
-            // Fable's definition: tangential over tangential plus normal, over every tracked wall link of the plates, along the flow
-            friction = format!(
-                "friction share along the flow, all plate wall links: tangential/(tangential+normal) {:.4} (tangential {:+.4e}, normal {:+.4e} lattice force per step, mean of {counted} steps after the run)",
-                avg.friction_share([1.0, 0.0, 0.0]).unwrap_or(f64::NAN),
-                avg.tangential[0],
-                avg.normal[0]
-            );
+            let r_m = round * slot_w * dx;
+            let flat_len = plate_t - 2.0 * r_m;
+            let low = if total_all > 0.0 { flat.tangential[0].abs() / total_all } else { f64::NAN };
+            friction = if flat_len <= 1e-9 {
+                format!(
+                    "friction share: not measurable by this method (ROUND {round}: no flat throat face; all-links wall force along the flow {:+.4e})",
+                    avg.tangential[0] + avg.normal[0]
+                )
+            } else {
+                format!(
+                    "friction share along the flow: low (flat throat faces only) {low:.4}, high (x (flat {flat_len:.4} m + arcs {:.4} m) / flat) {:.4}; flat tangential {:+.4e}, all-links wall force {:+.4e} lattice force per step, mean of {counted} steps after the run",
+                    std::f64::consts::PI * r_m,
+                    low * (flat_len + std::f64::consts::PI * r_m) / flat_len,
+                    flat.tangential[0],
+                    avg.tangential[0] + avg.normal[0]
+                )
+            };
         }
     }
     println!("FRICTION {friction}");
@@ -879,7 +885,7 @@ fn slotted_channel_stability() {
             {
                 let (open, tot, _, u_slot, um_sec) = sec(at(0.7));
                 println!(
-                    "REPORT (final snapshot at the last step, not a time average: quote the KLAST line) K on the inlet speed {:.3} (dp/(0.5 U_in^2), U_in {u_in}); K on the mean slot speed {:.3} (mean u_x {u_slot:.5} over the open cells at x 0.7 m, open fraction {:.4}); peak speed over mean slot speed {:.3} (peak in the section {um_sec:.5}); throat Reynolds number {:.0} (mean slot speed x open width {:.2} cells / viscosity {nu_lat:.3e} lattice); friction share: see the FRICTION line",
+                    "REPORT (final snapshot at the last step, not a time average: quote the KLAST line) K on the inlet speed {:.3} (dp/(0.5 U_in^2), U_in {u_in} = the inlet PEAK speed of the parabolic profile, its mean is 2/3 of it); K on the mean slot speed {:.3} (mean u_x {u_slot:.5} over the open cells at x 0.7 m, open fraction {:.4}); peak speed over mean slot speed {:.3} (peak in the section {um_sec:.5}); throat Reynolds number {:.0} (mean slot speed x open width {:.2} cells / viscosity {nu_lat:.3e} lattice); friction share: see the FRICTION line",
                     dp_end / (0.5 * u_in * u_in),
                     dp_end / (0.5 * u_slot * u_slot),
                     open as f64 / tot,
@@ -911,9 +917,7 @@ fn slotted_channel_stability() {
                 // times the duct's fluid cross-section at x 0.4; 1 within about 2 % or the share is untrusted.
                 if let Some(w) = split_avg {
                     let section = (0..nz).flat_map(|k| (0..ny).map(move |j| (j, k))).filter(|&(j, k)| fluid[grid.index([at(0.4), j, k])]).count();
-                    let drop = (up - p_tot(at(1.0))).abs() * section as f64;
                     let force = w.tangential[0].abs() + w.normal[0].abs();
-                    let closure = force / drop.max(1e-300);
                     // the momentum balance of the same two planes: the force on the plates = the drop of the section sums of p + rho u_x^2
                     let mom = |i: usize| -> f64 {
                         let i = i.min(nx.saturating_sub(1));
@@ -928,14 +932,13 @@ fn slotted_channel_stability() {
                         }
                         sum
                     };
-                    let drop_m = mom(at(0.4)) - mom(at(1.0));
+                    let (i0, i1) = (at(0.4), at(1.0));
+                    let drop_m = mom(i0) - mom(i1);
+                    let closure = force / drop_m.abs().max(1e-300);
                     println!(
-                        "CLOSURE_MOMENTUM (|F_t.d| + |F_n.d|) / (drop of the section sum of p + rho u_x^2, x 0.4 to 1.0) = {:.4} (force {force:.4e}, momentum drop {drop_m:.4e})",
-                        force / drop_m.abs().max(1e-300)
-                    );
-                    println!(
-                        "CLOSURE (|F_t.d| + |F_n.d|) / (total-pressure drop x section) = {closure:.4} (force {force:.4e}, drop {:.4e} x {section} cells){}",
-                        (up - p_tot(at(1.0))).abs(),
+                        "CLOSURE wall force / [drop of the static pressure x section + the momentum flux difference] = {closure:.4} (force {force:.4e}; sum over the {section} fluid cells of p + rho u_x^2: planes x {:.3} m and x {:.3} m, drop {drop_m:.4e}){}",
+                        dx * (i0 as f64 + 0.5) - ext_up,
+                        dx * (i1 as f64 + 0.5) - ext_up,
                         if (closure - 1.0).abs() > 0.02 { "  UNTRUSTED: not within 2 % of 1" } else { "" }
                     );
                 }
@@ -1033,6 +1036,30 @@ fn slotted_channel_stability() {
                         }
                     }
                 }
+            }
+            // THROAT: nu_t / nu between the plate faces (x 0.6 to the plate's far face, z from the lower slot edge to the upper one)
+            {
+                let (mut n, mut sum, mut peak) = (0usize, 0.0f64, 0.0f64);
+                for k in 0..nz {
+                    for j in 0..ny {
+                        for i in 0..nx {
+                            let c = grid.index([i, j, k]);
+                            let (x, z) = (dx * (i as f64 + 0.5) - ext_up, lo + (k as f64 + 0.5) * dx);
+                            if fluid[c] && x > 0.6 && x < x_hi && z > 0.4 && z < z_hi {
+                                let chi = nt.as_ref().and_then(|v| v.get(c)).copied().unwrap_or(0.0) / nu_lat;
+                                let r = chi * chi.powi(3) / (chi.powi(3) + 7.1f64.powi(3));
+                                n += 1;
+                                sum += r;
+                                peak = peak.max(r);
+                            }
+                        }
+                    }
+                }
+                println!(
+                    "THROAT nu_t/nu between the plate faces (x 0.6 to {x_hi:.3} m, z 0.4 to {z_hi:.3} m, {n} fluid cells): mean {:.4}, peak {peak:.4} (Spalart-Allmaras from nu_tilde; zero with another model; backend max over the domain {:.3})",
+                    sum / n.max(1) as f64,
+                    evr
+                );
             }
             let slot_w = cells; // cells
             println!(
