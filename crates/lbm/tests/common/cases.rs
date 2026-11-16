@@ -202,6 +202,34 @@ pub fn reattachment(xs: &[f64], tau: &[f64]) -> Result<f64, NoReattachment> {
     }
 }
 
+/// How a [`furthest_crossing`] reading was found.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Found {
+    /// The furthest downstream change from negative to non-negative beyond the start.
+    Crossing,
+    /// No negative value beyond the start: attached from the start on, the reading is the start.
+    Attached,
+    /// Negative at the last station and no crossing beyond the start: not reattached inside the
+    /// samples, the reading is the last station (a lower bound).
+    Open,
+}
+
+/// The reattachment of a floor whose mean shear (or forward-flow fraction less one half) `tau` is
+/// sampled at `xs`: the furthest downstream change from negative to non-negative at `beyond` or
+/// further, which is the primary reattachment (the crossings nearer the step belong to the corner
+/// bubble). Unlike [`reattachment`] it reads more than one crossing and is never refused for the
+/// shape of the profile, so a block of a long run always gives a reading; only samples that cannot
+/// be read at all (see [`crossings`]) are an error.
+pub fn furthest_crossing(xs: &[f64], tau: &[f64], beyond: f64) -> Result<(f64, Found), NoReattachment> {
+    let at = crossings(xs, tau)?;
+    if let Some(x) = at.into_iter().filter(|&x| x >= beyond).fold(None, |m: Option<f64>, x| Some(m.map_or(x, |m| m.max(x)))) {
+        return Ok((x, Found::Crossing));
+    }
+    // `crossings` accepted the samples, so there is a last one.
+    let (last_x, last_tau) = (xs.last().copied().unwrap_or(beyond), tau.last().copied().unwrap_or(0.0));
+    if last_tau < 0.0 { Ok((last_x, Found::Open)) } else { Ok((beyond, Found::Attached)) }
+}
+
 /// When a gated case has settled: after at least `min_flow_throughs` flow-throughs, the time
 /// mean of every gated quantity over the last averaging window differs from its mean over the
 /// window before by less than `drift` of its magnitude. Each case sets its averaging window to

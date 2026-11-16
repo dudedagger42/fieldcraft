@@ -153,6 +153,11 @@ struct Run {
     reattachment: Blocks,
     /// Blocks whose mean floor shear was refused (left out of `reattachment`), and the last refusal.
     missing: (usize, Option<NoReattachment>),
+    /// Blocks of a scale-resolving run with no crossing beyond [`PRIMARY_BEYOND`] (read at the
+    /// start or at the last station, [`Found`]); counted, never refused.
+    censored: usize,
+    /// The readings of the whole averaging window, none of them from blocks.
+    readings: Readings,
     /// Re_θ, δ₉₉ (in H) and U_ref (in units of the inlet speed) at x = −4 H, at the end.
     inflow: (f64, f64, f64),
     steps: u64,
@@ -476,6 +481,9 @@ impl Step {
         let floor_x: Vec<f64> = strips.iter().filter(|s| s.floor).map(|s| 0.5 * (s.x.0 + s.x.1)).collect();
         let floor_of = |v: &[f64]| strips.iter().zip(v).filter(|(s, _)| s.floor).map(|(_, &t)| t).collect::<Vec<f64>>();
         let mut rule = None;
+        let censored = std::cell::Cell::new(0usize);
+        // The floor's near-wall velocity over the whole window, for the readings that need no blocks.
+        let mut rows = FloorRows::new(&flow, self);
         // A steady (RANS, no DDES) run stops by the steady rule; a scale-resolving one by `Blocks`.
         let steady_run = matches!(self.turbulence, Some(Turbulence::SpalartAllmaras { ddes: None, .. }));
         // The last completed blocks' (x_r, floor shear), for the steady rule; a refused block
@@ -504,7 +512,19 @@ impl Step {
                 return None;
             }
             let floor = floor_of(&shear.last_block());
-            let last = reattachment(&floor_x, &floor);
+            // A steady run reads the one crossing and refuses a profile with none or several; a
+            // scale-resolving one reads the furthest downstream crossing beyond one step height
+            // and never refuses a block, a block with no such crossing counting as censored.
+            let last = if steady_run {
+                reattachment(&floor_x, &floor)
+            } else {
+                furthest_crossing(&floor_x, &floor, PRIMARY_BEYOND).map(|(x, found)| {
+                    if found != Found::Crossing {
+                        censored.set(censored.get() + 1);
+                    }
+                    x
+                })
+            };
             match &last {
                 Ok(x_r) => {
                     blocks.push(*x_r).unwrap();
@@ -519,11 +539,12 @@ impl Step {
                 }
             }
             println!(
-                "step {steps}: block {} x_r {last:?}, mean {:.3} H over {} blocks ({} refused), inlet ρ − 1: face mean {}, change {}, deviation {}, {:.0} s",
+                "step {steps}: block {} x_r {last:?}, mean {:.3} H over {} blocks ({} refused, {} censored), inlet ρ − 1: face mean {}, change {}, deviation {}, {:.0} s",
                 shear.blocks(),
                 blocks.mean(),
                 blocks.means().len(),
                 missing.0,
+                censored.get(),
                 inlet.map_or("(replayed)".into(), |v| format!("{:+.4e}", v[0])),
                 inlet.map_or("(replayed)".into(), |v| format!("{:+.1e}", v[1])),
                 inlet.map_or("(replayed)".into(), |v| format!("{:.2e}", v[2])),
@@ -536,7 +557,8 @@ impl Step {
             }
         };
         if let Some(path) = self.checkpoint.as_ref().filter(|p| p.exists()) {
-            let (at, kept) = load(path, &mut flow);
+            let (at, kept, saved) = load_all(path, &mut flow);
+            rows.restore(&saved);
             steps = at;
             println!("resumed {} at step {steps} ({} samples)", path.display(), kept.len());
             let first = startup + self.sample;
@@ -551,7 +573,7 @@ impl Step {
             flow.step().map_err(|e| format!("step {steps}: {e}"))?;
             if steps <= startup {
                 if let Some(path) = self.checkpoint.as_ref().filter(|_| steps.is_multiple_of(CHECKPOINT_STEPS)) {
-                    save(path, &mut flow, steps, &samples);
+                    save(path, &mut flow, steps, &samples, Some(&rows));
                 }
                 continue;
             }
@@ -584,14 +606,15 @@ impl Step {
                 history.push((steps, clock.elapsed().as_secs_f64(), blocks.mean()));
             }
             samples.push(sample);
+            rows.add(&flow);
             // Sample boundaries carry no partial interval, so the file holds the whole state.
             if let Some(path) = self.checkpoint.as_ref().filter(|_| steps.is_multiple_of(CHECKPOINT_STEPS)) {
-                save(path, &mut flow, steps, &samples);
+                save(path, &mut flow, steps, &samples, Some(&rows));
             }
         }
         // The end of the run is saved too, so a run that stops between two checkpoints leaves its field.
         if let Some(path) = self.checkpoint.as_ref() {
-            save(path, &mut flow, steps, &samples);
+            save(path, &mut flow, steps, &samples, Some(&rows));
         }
         println!(
             "{} fluid cells, {steps} steps: {:.1} M cell updates/s",
@@ -626,7 +649,13 @@ impl Step {
         let (rho_ref, u_ref) = reference(&flow);
         let q = 0.5 * rho_ref * u_ref * u_ref;
         let mean = shear.mean();
-        let x_r = reattachment(&floor_x, &floor_of(&mean));
+        let x_r = if steady_run {
+            reattachment(&floor_x, &floor_of(&mean))
+        } else {
+            furthest_crossing(&floor_x, &floor_of(&mean), PRIMARY_BEYOND).map(|(x, _)| x)
+        };
+        let readings = Readings::of(&floor_x, &floor_of(&mean), &rows);
+        println!("{readings}");
         let cf: Vec<(f64, f64)> = strips.iter().zip(&mean).map(|(s, t)| (0.5 * (s.x.0 + s.x.1), t / q)).collect();
         let p_ref = rho_ref / 3.0;
         let cp: Vec<(f64, f64)> = floor_x.iter().map(|&x| (x, (span_mean(&flow, column(x), 1).0 / 3.0 - p_ref) / q)).collect();
@@ -645,6 +674,8 @@ impl Step {
             crossing,
             reattachment: blocks,
             missing,
+            censored: censored.get(),
+            readings,
             inflow: (u_ref_inlet * theta * self.re_h, delta, u_ref_inlet),
             steps,
             settled: rule.is_some(),
@@ -686,11 +717,20 @@ impl Restart {
         fieldcraft_lbm::checkpoint::Archive::bytes(self, &mut b).unwrap();
         u64::from_le_bytes(b)
     }
+
+    /// The next value of a file being read, or none at its end.
+    fn try_u64(&mut self) -> Option<u64> {
+        let mut b = [0u8; 8];
+        fieldcraft_lbm::checkpoint::Archive::bytes(self, &mut b).ok()?;
+        Some(u64::from_le_bytes(b))
+    }
 }
 
-/// Write the restart file: to `path` with `.tmp` added, then renamed over `path`.
-fn save(path: &std::path::Path, flow: &mut Flow, steps: u64, samples: &[Vec<f64>]) {
+/// Write the restart file, the near-wall rows' sums after the samples so a resumed run's window
+/// is whole: to `path` with `.tmp` added, then renamed over `path`.
+fn save(path: &std::path::Path, flow: &mut Flow, steps: u64, samples: &[Vec<f64>], rows: Option<&FloorRows>) {
     use std::io::Write;
+    let rows = rows.map(FloorRows::state).unwrap_or_default();
     let tmp = path.with_extension("tmp");
     let mut a = Restart { read: None, write: Some(std::io::BufWriter::new(std::fs::File::create(&tmp).unwrap())) };
     flow.checkpoint(&mut a).unwrap();
@@ -702,6 +742,10 @@ fn save(path: &std::path::Path, flow: &mut Flow, steps: u64, samples: &[Vec<f64>
             a.u64(v.to_bits());
         }
     }
+    a.u64(rows.len() as u64);
+    for v in &rows {
+        a.u64(v.to_bits());
+    }
     if let Some(w) = a.write.as_mut() {
         w.flush().unwrap();
     }
@@ -711,11 +755,175 @@ fn save(path: &std::path::Path, flow: &mut Flow, steps: u64, samples: &[Vec<f64>
 
 /// Read a restart file into `flow`: the step count and the samples.
 fn load(path: &std::path::Path, flow: &mut Flow) -> (u64, Vec<Vec<f64>>) {
+    let (steps, samples, _) = load_all(path, flow);
+    (steps, samples)
+}
+
+/// [`load`] with the near-wall rows' sums (none in a file written before they were kept).
+fn load_all(path: &std::path::Path, flow: &mut Flow) -> (u64, Vec<Vec<f64>>, Vec<f64>) {
     let mut a = Restart { read: Some(std::io::BufReader::new(std::fs::File::open(path).unwrap())), write: None };
     flow.checkpoint(&mut a).unwrap();
     let steps = a.u64(0);
     let samples = (0..a.u64(0)).map(|_| (0..a.u64(0)).map(|_| f64::from_bits(a.u64(0))).collect()).collect();
-    (steps, samples)
+    let rows = a.try_u64().map_or_else(Vec::new, |n| (0..n).map(|_| f64::from_bits(a.u64(0))).collect());
+    (steps, samples, rows)
+}
+
+/// Reattachments are read at or beyond this x (in H): the crossings nearer the step (about 0.2 and
+/// 1.3 H) belong to the corner bubble, the primary reattachment is the furthest downstream one.
+const PRIMARY_BEYOND: f64 = 1.0;
+/// The two readings of the whole averaging window differ by more than this (H): both are reported
+/// and the difference is said.
+const READINGS_AGREE: f64 = 0.2;
+/// Cell rows above the floor's wall the near-wall velocity is accumulated in (rows 1 to 4).
+const FLOOR_ROWS: usize = 4;
+
+/// The near-wall velocity of the floor behind the step over the whole averaging window: for each of
+/// the first [`FLOOR_ROWS`] rows above the wall and each column, the running sum of the span-mean
+/// u and of the fraction of the span with u > 0, one sample (the run's `sample` interval) at a
+/// time. Only these `FLOOR_ROWS × nx` triples are kept, not whole fields, so the memory is nothing
+/// next to the flow's.
+struct FloorRows {
+    /// Cell row of row 1 (Han's wall: the node row is row 1).
+    first: usize,
+    /// The columns' centres, in H.
+    x: Vec<f64>,
+    /// Row n's height above the wall, in H.
+    y: [f64; FLOOR_ROWS],
+    /// `[Σ span-mean u, Σ forward fraction, samples]` of row n (0-based), column i, at `n * nx + i`.
+    sums: Vec<[f64; 3]>,
+}
+
+impl FloorRows {
+    fn new(flow: &Flow, step: &Step) -> FloorRows {
+        let h = step.spacing();
+        let nx = flow.grid().cells[0];
+        let wall = if flow.on_node_bounce() { 0.5 * h } else { 0.0 };
+        let first = if flow.on_node_bounce() { 2 } else { 1 };
+        FloorRows {
+            first,
+            x: (0..nx).map(|i| -step.upstream + (i as f64 + 0.5) * h).collect(),
+            y: std::array::from_fn(|n| ((first + n) as f64 - 0.5) * h - wall),
+            sums: vec![[0.0; 3]; FLOOR_ROWS * nx],
+        }
+    }
+
+    /// One sample of the flow's current field.
+    fn add(&mut self, flow: &Flow) {
+        let g = *flow.grid();
+        let [nx, ny, nz] = g.cells;
+        for n in 0..FLOOR_ROWS.min(nz.saturating_sub(self.first)) {
+            for i in 0..nx {
+                let u: Vec<f64> = (0..ny).filter_map(|j| flow.moments(g.index([i, j, self.first + n])).map(|m| m.1[0])).collect();
+                if let Some(s) = self.sums.get_mut(n * nx + i).filter(|_| !u.is_empty()) {
+                    s[0] += u.iter().sum::<f64>() / u.len() as f64;
+                    s[1] += u.iter().filter(|&&v| v > 0.0).count() as f64 / u.len() as f64;
+                    s[2] += 1.0;
+                }
+            }
+        }
+    }
+
+    /// The sums, for the restart file.
+    fn state(&self) -> Vec<f64> {
+        self.sums.iter().flatten().copied().collect()
+    }
+
+    /// Takes the sums of a restart file back; one of another shape (or none) is ignored, so the
+    /// window then starts at the restart.
+    fn restore(&mut self, state: &[f64]) {
+        if state.len() == 3 * self.sums.len() {
+            for (s, v) in self.sums.iter_mut().flatten().zip(state) {
+                *s = *v;
+            }
+        }
+    }
+
+    /// The columns behind the step (x > 0) and their centres.
+    fn behind(&self) -> (Vec<usize>, Vec<f64>) {
+        (0..self.x.len()).filter(|&i| self.x[i] > 0.0).map(|i| (i, self.x[i])).unzip()
+    }
+
+    /// Row `n`'s time-mean span-mean u, or its forward fraction, at the columns `at` (NaN where no
+    /// sample was taken).
+    fn column(&self, n: usize, at: &[usize], what: usize) -> Vec<f64> {
+        let nx = self.x.len();
+        at.iter().map(|&i| self.sums.get(n * nx + i).map_or(f64::NAN, |s| if s[2] > 0.0 { s[what] / s[2] } else { f64::NAN })).collect()
+    }
+
+    /// Samples taken (the most of any column of row 1).
+    fn samples(&self) -> u64 {
+        self.sums.iter().map(|s| s[2]).fold(0.0, f64::max) as u64
+    }
+}
+
+/// What the whole averaging window says about the reattachment, from no blocks: the time-mean floor
+/// shear's furthest downstream crossing, the same crossing of the time-mean u in rows 2 to 4 taken
+/// to the wall, and the station where the near-wall flow is forward half the time. Blocks give
+/// only the error bar.
+#[derive(Debug, Clone)]
+struct Readings {
+    /// The mean floor shear (the gated reading).
+    shear: Result<(f64, Found), NoReattachment>,
+    /// The u = 0 crossings of the time-mean u in rows 2, 3 and 4, least squares to y = 0.
+    rows_2_4: Result<f64, String>,
+    /// The station where row 2, 3 and 4 are forward half of the time (row 2 is the one compared).
+    forward: Vec<Result<(f64, Found), NoReattachment>>,
+    /// The samples the near-wall readings average.
+    samples: u64,
+}
+
+impl Readings {
+    fn of(floor_x: &[f64], mean_shear: &[f64], rows: &FloorRows) -> Readings {
+        let (at, xs) = rows.behind();
+        let forward = (1..FLOOR_ROWS)
+            .map(|n| {
+                let half: Vec<f64> = rows.column(n, &at, 1).iter().map(|f| f - 0.5).collect();
+                furthest_crossing(&xs, &half, PRIMARY_BEYOND)
+            })
+            .collect();
+        let crossings: Result<Vec<(f64, f64)>, String> = (1..FLOOR_ROWS)
+            .map(|n| match furthest_crossing(&xs, &rows.column(n, &at, 0), PRIMARY_BEYOND) {
+                Ok((x, Found::Crossing)) => Ok((rows.y[n], x)),
+                Ok((_, found)) => Err(format!("row {}: {found:?}", n + 1)),
+                Err(why) => Err(format!("row {}: {why:?}", n + 1)),
+            })
+            .collect();
+        Readings {
+            shear: furthest_crossing(floor_x, mean_shear, PRIMARY_BEYOND),
+            rows_2_4: crossings.map(|c| intercept(&c, 1)),
+            forward,
+            samples: rows.samples(),
+        }
+    }
+
+    /// The gap between the mean-shear and the forward-flow (row 2) readings when it exceeds
+    /// [`READINGS_AGREE`].
+    fn disagreement(&self) -> Option<f64> {
+        let (Ok((a, _)), Some(Ok((b, _)))) = (&self.shear, self.forward.first()) else { return None };
+        ((a - b).abs() > READINGS_AGREE).then_some((a - b).abs())
+    }
+}
+
+impl std::fmt::Display for Readings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let show = |r: &Result<(f64, Found), NoReattachment>| match r {
+            Ok((x, Found::Crossing)) => format!("{x:.3} H"),
+            Ok((x, found)) => format!("{x:.3} H ({found:?})"),
+            Err(why) => format!("none ({why:?})"),
+        };
+        write!(f, "x_r readings of the whole window ({} samples of the near-wall rows): mean floor shear {}", self.samples, show(&self.shear))?;
+        match &self.rows_2_4 {
+            Ok(x) => write!(f, "; rows 2-4 of the time-mean u at the wall {x:.3} H")?,
+            Err(why) => write!(f, "; rows 2-4 of the time-mean u none ({why})")?,
+        }
+        let rows: Vec<String> = self.forward.iter().enumerate().map(|(n, r)| format!("row {} {}", n + 2, show(r))).collect();
+        write!(f, "; forward half the time: {}", rows.join(", "))?;
+        if let Some(gap) = self.disagreement() {
+            write!(f, "; THE MEAN-SHEAR AND FORWARD-FLOW READINGS DIFFER BY {gap:.3} H (over {READINGS_AGREE} H), both are reported")?;
+        }
+        Ok(())
+    }
 }
 
 /// Where u = 0 meets the floor behind the step, from the final field's first four rows above the
@@ -1357,6 +1565,107 @@ fn the_wall_crossing_fits_recover_lines_and_parabolas() {
 /// spread, or a strong floor strip's drift over the floor's scale, fails; a strip near zero
 /// shear with round-off jitter passes; a value that is not finite never settles.
 #[test]
+fn the_furthest_downstream_crossing_beyond_one_step_height_is_the_reattachment() {
+    let xs: Vec<f64> = (0..20).map(|i| 0.5 * i as f64 + 0.25).collect();
+    // The corner bubble's change at about 0.9 H and the primary one at about 6.3 H: negative,
+    // positive (the corner eddy), negative, positive.
+    let tau: Vec<f64> = xs
+        .iter()
+        .map(|&x| {
+            if x < 0.5 {
+                -1.0
+            } else if x < 1.3 {
+                0.5
+            } else if x < 6.3 {
+                -1.0
+            } else {
+                0.5
+            }
+        })
+        .collect();
+    assert!(matches!(reattachment(&xs, &tau), Err(NoReattachment::Several(_))), "the old reader refuses two changes");
+    let (x, found) = furthest_crossing(&xs, &tau, 1.0).unwrap();
+    assert_eq!(found, Found::Crossing);
+    assert!((6.0..6.6).contains(&x), "{x}");
+    // Never refused: attached everywhere beyond the start reads the start, never reattached reads the last station.
+    let attached = vec![0.5; xs.len()];
+    assert_eq!(furthest_crossing(&xs, &attached, 1.0).unwrap(), (1.0, Found::Attached));
+    let open = vec![-0.5; xs.len()];
+    assert_eq!(furthest_crossing(&xs, &open, 1.0).unwrap(), (xs[xs.len() - 1], Found::Open));
+    // A crossing nearer than the start is a corner bubble's, so with none beyond it the profile reads as attached.
+    let near: Vec<f64> = xs.iter().map(|&x| if x < 0.6 { -1.0 } else { 1.0 }).collect();
+    assert_eq!(furthest_crossing(&xs, &near, 1.0).unwrap().1, Found::Attached);
+    assert!(furthest_crossing(&xs[..1], &tau[..1], 1.0).is_err(), "one sample cannot be read");
+}
+
+/// A [`FloorRows`] holding a given forward fraction and mean u in every row, as if sampled `n` times.
+fn synthetic_rows(x: &[f64], mean_u: impl Fn(usize, f64) -> f64, forward: impl Fn(usize, f64) -> f64) -> FloorRows {
+    let nx = x.len();
+    let mut sums = vec![[0.0; 3]; FLOOR_ROWS * nx];
+    for n in 0..FLOOR_ROWS {
+        for (i, &xi) in x.iter().enumerate() {
+            sums[n * nx + i] = [4.0 * mean_u(n, xi), 4.0 * forward(n, xi), 4.0];
+        }
+    }
+    FloorRows { first: 1, x: x.to_vec(), y: [0.02, 0.06, 0.1, 0.14], sums }
+}
+
+#[test]
+fn the_window_readings_come_from_the_time_means_and_say_when_they_differ() {
+    let x: Vec<f64> = (0..120).map(|i| -2.0 + 0.1 * (i as f64 + 0.5)).collect();
+    // Row n's u = 0 line leans downstream towards the wall: x = 6.0 + 4 y. Forward half of the time at 6.1 in row 2.
+    let u = |n: usize, x: f64| x - (6.0 + 4.0 * [0.02, 0.06, 0.1, 0.14][n]);
+    let forward = |_: usize, x: f64| 0.5 + 0.4 * (x - 6.1).clamp(-1.0, 1.0);
+    let rows = synthetic_rows(&x, u, forward);
+    let floor_x: Vec<f64> = (0..80).map(|i| 0.1 * i as f64 + 0.05).collect();
+    let shear: Vec<f64> = floor_x.iter().map(|&x| x - 6.0).collect();
+    let r = Readings::of(&floor_x, &shear, &rows);
+    let (shear_x, _) = r.shear.clone().unwrap();
+    assert!((shear_x - 6.0).abs() < 1e-9, "{shear_x}");
+    // The least-squares line through rows 2-4 to y = 0 recovers the wall value 6.0.
+    assert!((r.rows_2_4.clone().unwrap() - 6.0).abs() < 1e-6, "{:?}", r.rows_2_4);
+    let (forward_x, _) = r.forward[0].clone().unwrap();
+    assert!((forward_x - 6.1).abs() < 1e-9, "{forward_x}");
+    assert_eq!(r.disagreement(), None, "0.1 H apart is inside the 0.2 H band");
+    assert_eq!(r.samples, 4);
+    // Moved 0.5 H apart they differ, and the report says so.
+    let far = Readings::of(&floor_x, &floor_x.iter().map(|&x| x - 5.5).collect::<Vec<f64>>(), &rows);
+    assert!(far.disagreement().is_some_and(|g| (g - 0.6).abs() < 1e-6));
+    assert!(far.to_string().contains("DIFFER"), "{far}");
+    // No samples: the readings say so, never a number.
+    let empty = FloorRows { sums: vec![[0.0; 3]; rows.sums.len()], ..synthetic_rows(&x, u, forward) };
+    assert!(Readings::of(&floor_x, &shear, &empty).forward[0].is_err());
+}
+
+#[test]
+fn the_near_wall_rows_ride_in_the_restart_file_and_an_old_file_reads_without_them() {
+    let step = laminar(10);
+    let (mut flow, _, _) = step.build();
+    let mut rows = FloorRows::new(&flow, &step);
+    flow.step().unwrap();
+    rows.add(&flow);
+    rows.add(&flow);
+    assert_eq!(rows.samples(), 2);
+    let dir = std::env::temp_dir().join(format!("fieldcraft-rows-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("step.restart");
+    save(&file, &mut flow, 1, &[vec![1.0, 2.0]], Some(&rows));
+    let (mut again, _, _) = step.build();
+    let (steps, samples, state) = load_all(&file, &mut again);
+    assert_eq!((steps, samples), (1, vec![vec![1.0, 2.0]]));
+    let mut back = FloorRows::new(&again, &step);
+    back.restore(&state);
+    assert_eq!(back.state(), rows.state());
+    // A file written without them (the old layout ends after the samples) reads as an empty window.
+    save(&file, &mut flow, 1, &[vec![1.0, 2.0]], None);
+    let (_, _, none) = load_all(&file, &mut again);
+    let mut empty = FloorRows::new(&again, &step);
+    empty.restore(&none);
+    assert_eq!(empty.samples(), 0);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn the_steady_rule_needs_five_agreeing_blocks_in_x_r_and_every_floor_strip() {
     let block = |x_r: f64, drift: f64| (x_r, vec![-7.0e-4 * (1.0 + drift), 0.0, 3.0e-4]);
     let still: Vec<(f64, Vec<f64>)> = (0..5).map(|_| block(5.7834, 0.0)).collect();
@@ -1529,19 +1838,16 @@ fn t3_ddes_in_the_zone_from_t2s_field_reports_x_r_with_its_error() {
     let h = t2.spacing();
     let zone = fieldcraft_model::DdesZone { min: [-1.0, -1.0, -h], max: [12.0, span + 1.0, 3.0] };
     let Turbulence::SpalartAllmaras { prandtl, wall_model, inflow_ratio, .. } = rans else { panic!("sa_rans is Spalart–Allmaras") };
-    let ddes = Turbulence::SpalartAllmaras {
-        prandtl,
-        wall_model,
-        inflow_ratio,
-        ddes: Some(fieldcraft_model::Ddes { c_des: 0.65, zone: Some(zone) }),
-    };
+    let ddes =
+        Turbulence::SpalartAllmaras { prandtl, wall_model, inflow_ratio, ddes: Some(fieldcraft_model::Ddes { c_des: 0.65, zone: Some(zone) }) };
     let base = sa_step_in(ddes, true, span);
     let h_over_u = (base.cells_per_h as f64 / base.lattice_velocity).round() as u64;
     let flow_through = ((base.upstream + base.downstream) / h / base.lattice_velocity) as u64;
     let t3 = Step {
         max_steps: 300 * h_over_u,
         sample: 100,
-        block: 10,
+        // A block is 30 H/U at least, for the error bar only: no block is refused.
+        block: (30 * h_over_u).div_ceil(100) as usize,
         startup: (50 * h_over_u) as f64 / flow_through as f64,
         checkpoint,
         ..base
@@ -1550,7 +1856,8 @@ fn t3_ddes_in_the_zone_from_t2s_field_reports_x_r_with_its_error() {
     let run = t3.try_run_from(Some(&|flow: &mut Flow| transfer(&from, flow))).unwrap_or_else(|e| panic!("T3: {e}"));
     let a = run.reattachment.acceptance();
     println!(
-        "T3 x_r {:?} H (gated shear); mean of {} block reattachments {:.4} H, 95 % half-width {:?} (relative {:?}), half-window drift {:?}; {} steps = {:.1} H/U, settled {} ({:?}), {} blocks refused",
+        "T3 x_r {:?} H (mean-shear reading); mean of {} block reattachments {:.4} H, 95 % half-width {:?} (relative {:?}), half-window drift {:?}; {} steps = {:.1} H/U, settled {} ({:?}), {} blocks refused, {} censored
+{}",
         run.x_r,
         run.reattachment.means().len(),
         run.reattachment.mean(),
@@ -1561,6 +1868,8 @@ fn t3_ddes_in_the_zone_from_t2s_field_reports_x_r_with_its_error() {
         run.steps as f64 / h_over_u as f64,
         run.settled,
         run.rule,
-        run.missing.0
+        run.missing.0,
+        run.censored,
+        run.readings
     );
 }
