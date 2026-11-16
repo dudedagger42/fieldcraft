@@ -163,7 +163,7 @@ pub const MAX_INFLOW_ROWS: usize = 4096;
 pub struct InflowTable {
     /// The axis the rows' coordinate runs along.
     pub axis: crate::fluid_zones::Axis,
-    /// `[coordinate, factor, ν̃/ν]`: coordinates strictly increasing, factors 0 or more, ratios 0 to 100.
+    /// `[coordinate, factor, ν̃/ν]`: coordinates strictly increasing, factors 0 or more, ratios 0 to 1000 (a boundary layer's ν̃/ν reaches κ y⁺, over 100 at y⁺ in the hundreds).
     pub rows: Vec<[f64; 3]>,
 }
 
@@ -178,9 +178,9 @@ impl InflowTable {
             finite("inflow table coordinate", *x)?;
             finite("inflow table factor", *f)?;
             finite("inflow table ν̃/ν", *r)?;
-            if *f < 0.0 || !(0.0..=100.0).contains(r) || last.is_some_and(|l| *x <= l) {
+            if *f < 0.0 || !(0.0..=1000.0).contains(r) || last.is_some_and(|l| *x <= l) {
                 return Err(Error::Invalid(format!(
-                    "inflow table row {k} ([{x}, {f}, {r}]): coordinates must increase, factors must be 0 or more and ν̃/ν from 0 to 100"
+                    "inflow table row {k} ([{x}, {f}, {r}]): coordinates must increase, factors must be 0 or more and ν̃/ν from 0 to 1000"
                 )));
             }
             last = Some(*x);
@@ -1422,7 +1422,7 @@ mod tests {
         assert!(bad(vec![]).contains("1 to"));
         assert!(bad(vec![[0.0, 1.0, 3.0], [0.0, 1.0, 3.0]]).contains("row 1"));
         assert!(bad(vec![[0.0, -1.0, 3.0]]).contains("row 0"));
-        assert!(bad(vec![[0.0, 1.0, -1.0]]).contains("row 0") && bad(vec![[0.0, 1.0, 101.0]]).contains("row 0"));
+        assert!(bad(vec![[0.0, 1.0, -1.0]]).contains("row 0") && bad(vec![[0.0, 1.0, 1001.0]]).contains("row 0"));
         assert!(bad(vec![[0.0, 0.0, 3.0]]).contains("no factor above 0"));
         assert!(bad(vec![[f64::NAN, 1.0, 3.0]]).contains("finite") && bad(vec![[0.0, f64::INFINITY, 3.0]]).contains("finite"));
         assert!(bad(vec![[0.0, 1.0, f64::NAN]]).contains("finite"));

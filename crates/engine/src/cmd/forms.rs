@@ -923,7 +923,7 @@ const INFLOW_TABLE: Field = group(
     &[
         choice("axis", "Axis", AXIS).help("The coordinate axis the rows run along; not the face's own normal.").req(),
         table("rows", "Profile", D::InflowTable, &["coordinate", "factor", "nu_tilde_ratio"], fieldcraft_model::fluids::MAX_INFLOW_ROWS)
-            .help("Rows of coordinate (increasing), factor on the velocity (0 or more) and, for the Spalart–Allmaras model, the inflow viscosity ratio ν̃/ν (0 to 100); linear between rows, the end rows beyond them. One row reproduces a uniform inlet.")
+            .help("Rows of coordinate (increasing), factor on the velocity (0 or more) and, for the Spalart–Allmaras model, the inflow viscosity ratio ν̃/ν (0 to 1000); linear between rows, the end rows beyond them. One row reproduces a uniform inlet.")
             .req(),
     ],
 )
