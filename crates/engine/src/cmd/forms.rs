@@ -698,8 +698,8 @@ const FACE_CONDITION: &[Variant] = &[
         "Velocity inlet",
         &[
             xyz("velocity", "Velocity", D::Velocity).help("Inflow velocity.").req(),
-            choice("profile", "Profile", &[("uniform", "Uniform"), ("parabolic", "Parabolic"), ("radial", "Radial")])
-                .help("Uniform across the inlet, parabolic (fully developed laminar flow), or radial: the domain's radial inflow table, with the velocity as the bulk velocity (a turbulent pipe).")
+            choice("profile", "Profile", &[("uniform", "Uniform"), ("parabolic", "Parabolic"), ("radial", "Radial"), ("table", "Table")])
+                .help("Uniform across the inlet, parabolic (fully developed laminar flow), radial: the domain's radial inflow table, with the velocity as the bulk velocity (a turbulent pipe), or table: the domain's inflow table, a factor on the velocity against one coordinate (a measured or precomputed boundary layer).")
                 .def("\"uniform\""),
         ],
     ),
@@ -917,6 +917,18 @@ const RADIAL_INFLOW: Field = group(
 )
 .help("The profile that velocity faces with the radial profile read: a turbulent pipe flow entering the box.");
 
+const INFLOW_TABLE: Field = group(
+    "inflow_table",
+    "Inflow table",
+    &[
+        choice("axis", "Axis", AXIS).help("The coordinate axis the rows run along; not the face's own normal.").req(),
+        table("rows", "Profile", D::InflowTable, &["coordinate", "factor", "nu_tilde_ratio"], fieldcraft_model::fluids::MAX_INFLOW_ROWS)
+            .help("Rows of coordinate (increasing), factor on the velocity (0 or more) and, for the Spalart–Allmaras model, the inflow viscosity ratio ν̃/ν (0 to 100); linear between rows, the end rows beyond them. One row reproduces a uniform inlet.")
+            .req(),
+    ],
+)
+.help("The profile that velocity faces with the table profile read: the velocity at each inlet cell is the face velocity times the factor at its coordinate, and the model's inflow ν̃ follows the ratio column.");
+
 pub const FLUID_DOMAIN: &[Field] = &[
     NAME,
     reference("material", "Fluid", C::Material).help("The fluid material: needs a density and a viscosity.").req(),
@@ -961,6 +973,7 @@ pub const FLUID_DOMAIN: &[Field] = &[
     FREE_SURFACE,
     ABSORBING,
     RADIAL_INFLOW,
+    INFLOW_TABLE,
     positive("moving_wall_ramp", "Moving-wall ramp", D::Time)
         .help("How long every moving wall takes to reach its velocity from rest, with a smooth (cosine) start: a wall switched on at full speed sends a pressure pulse through the box. It ramps moving walls only, not the cells of a velocity inlet, which run at their velocity from the first step. Left out or 0, the walls move at full speed from the first step.")
         .hint("none"),
