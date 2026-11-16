@@ -352,6 +352,21 @@ not measured for these runs.
 
 The first cell's y⁺ is the measured Re_τ × 0.5 / N.
 
+### Spalart–Allmaras wall law on Han's wall
+
+Spalding's law (κ 0.41, B 5.5) is low in the buffer layer, and the ν̃ the wall function derives
+from it there is too high, so a first node at y⁺ 5 to 15 reads the centreline of the Re_τ 182
+channel 3 to 5 % off. The model has its own constant-stress layer (ν̃ = κ u_τ y exactly, u⁺ the
+integral of 1 / (1 + κ y⁺ f_v1(κ y⁺)); `crates/lbm/src/sa_law.rs`), selected with
+`wall_model: "spalart_allmaras_bounce"`; the law is tested against an independent quadrature, the
+model's steady equation to round-off and the model's own one-dimensional solver. The channel
+gates, all heavy (`cargo xtask test --heavy`), are in `crates/lbm/tests/sa_channel.rs`: Re_τ 182
+(Lee & Moser, U_b⁺ and C_f, centreline U⁺ in 17.75 to 18.65) at 12 and 24 cells per half-height,
+Re_τ 1000 within 5 % of C_f at 20 and 32 cells, and a held-out Re_τ 543 channel, a report and not
+a validation because the law was tuned by the people who ran it. The same channels run on the
+half-way wall (`*_surface`), where the first open cell is at 1½ cells. The measured values are
+printed by each test (its gate table); freeze them as fixtures once they are accepted.
+
 ### What #664's acceptance still lacks
 
 - **Developing pipe flow against Shah & London (1978)**: not built.
