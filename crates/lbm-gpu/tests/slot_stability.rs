@@ -167,6 +167,13 @@ fn slotted_channel_stability() {
         obstacles.push(obstacle("SlabYHigh", cuboid([a, 1.0, -1.0], [b, 2.0, 2.0]), &CUBOID_FACES));
         obstacles.push(obstacle("SlabZLow", cuboid([a, -1.0, -1.0], [b, 2.0, 0.0]), &CUBOID_FACES));
     }
+    println!(
+        "PLATE faces (m): x {:.5} to {x_hi:.5} (thickness {:.5}); lower plate z {z0:.5} to 0.40000; upper plate z {z_hi:.5} to 2.00000; slot edges z 0.40000 and {z_hi:.5} (width {:.5}); ROUND {round} (radius {:.5} m on the two slot-side corners; the plate's faces are the same for every ROUND)",
+        0.6,
+        x_hi - 0.6,
+        z_hi - 0.4,
+        round * slot_w * dx
+    );
     let wall_model = match law.as_str() {
         "sa" => Some(WallModel::SpalartAllmarasBounce),
         "sa_surface" => Some(WallModel::SpalartAllmarasBounceSurface),
@@ -844,11 +851,13 @@ fn slotted_channel_stability() {
             {
                 let (open, tot, _, u_slot, um_sec) = sec(at(0.7));
                 println!(
-                    "REPORT K on the inlet speed {:.3} (dp/(0.5 U_in^2), U_in {u_in}); K on the mean slot speed {:.3} (mean u_x {u_slot:.5} over the open cells at x 0.7 m, open fraction {:.4}); peak speed over mean slot speed {:.3} (peak in the section {um_sec:.5}); friction share: see the FRICTION line",
+                    "REPORT K on the inlet speed {:.3} (dp/(0.5 U_in^2), U_in {u_in}); K on the mean slot speed {:.3} (mean u_x {u_slot:.5} over the open cells at x 0.7 m, open fraction {:.4}); peak speed over mean slot speed {:.3} (peak in the section {um_sec:.5}); throat Reynolds number {:.0} (mean slot speed x open width {:.2} cells / viscosity {nu_lat:.3e} lattice); friction share: see the FRICTION line",
                     dp_end / (0.5 * u_in * u_in),
                     dp_end / (0.5 * u_slot * u_slot),
                     open as f64 / tot,
-                    if u_slot.abs() > 1e-12 { um_sec / u_slot } else { f64::NAN }
+                    if u_slot.abs() > 1e-12 { um_sec / u_slot } else { f64::NAN },
+                    u_slot * (open as f64 / ny as f64) / nu_lat,
+                    open as f64 / ny as f64
                 );
             }
             // DIAG4 (g): the loss metric for every arm: the area-mean total pressure p + rho |u|^2 / 2 (lattice, p = (rho - 1) / 3,
