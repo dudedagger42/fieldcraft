@@ -279,6 +279,16 @@ impl WallLinks {
     }
 }
 
+/// Diagnostic switch for stability studies, never set by a solve: while it is on, a flow built
+/// with interpolated walls gives every link with `q > ½` the half-way rule (links with `q <= ½`
+/// keep theirs). It shows where an instability lives; it is not a scheme.
+static HALFWAY_ABOVE_HALF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Switch the diagnostic of [`HALFWAY_ABOVE_HALF`] (affects flows built afterwards, process wide).
+pub fn set_halfway_above_half_diagnostic(on: bool) {
+    HALFWAY_ABOVE_HALF.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// An inlet or outlet cell.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct OpenCell {
@@ -969,6 +979,9 @@ impl Flow {
                 counts.no_crossing += 1;
                 return rule;
             };
+            if frac > 0.5 && HALFWAY_ABOVE_HALF.load(std::sync::atomic::Ordering::Relaxed) {
+                return rule;
+            }
             // The next fluid cell away from the wall, across periodic faces.
             let next = crate::surface::neighbour(&grid, periodic, grid.coords(cell), q).filter(|n| fluid.get(*n).copied().unwrap_or(false));
             if frac < 0.5 && next.is_none() {
