@@ -158,6 +158,8 @@ struct Run {
     censored: usize,
     /// The readings of the whole averaging window, none of them from blocks.
     readings: Readings,
+    /// The shear layer's resolved and modelled stress at [`STRESS_STATIONS`].
+    stresses: Vec<Result<Stress, String>>,
     /// Re_θ, δ₉₉ (in H) and U_ref (in units of the inlet speed) at x = −4 H, at the end.
     inflow: (f64, f64, f64),
     steps: u64,
@@ -483,7 +485,7 @@ impl Step {
         let mut rule = None;
         let censored = std::cell::Cell::new(0usize);
         // The floor's near-wall velocity over the whole window, for the readings that need no blocks.
-        let mut rows = FloorRows::new(&flow, self);
+        let mut window = Window::new(&flow, self);
         // A steady (RANS, no DDES) run stops by the steady rule; a scale-resolving one by `Blocks`.
         let steady_run = matches!(self.turbulence, Some(Turbulence::SpalartAllmaras { ddes: None, .. }));
         // The last completed blocks' (x_r, floor shear), for the steady rule; a refused block
@@ -558,7 +560,7 @@ impl Step {
         };
         if let Some(path) = self.checkpoint.as_ref().filter(|p| p.exists()) {
             let (at, kept, saved) = load_all(path, &mut flow);
-            rows.restore(&saved);
+            window.restore(&saved);
             steps = at;
             println!("resumed {} at step {steps} ({} samples)", path.display(), kept.len());
             let first = startup + self.sample;
@@ -573,7 +575,7 @@ impl Step {
             flow.step().map_err(|e| format!("step {steps}: {e}"))?;
             if steps <= startup {
                 if let Some(path) = self.checkpoint.as_ref().filter(|_| steps.is_multiple_of(CHECKPOINT_STEPS)) {
-                    save(path, &mut flow, steps, &samples, Some(&rows));
+                    save(path, &mut flow, steps, &samples, Some(&window));
                 }
                 continue;
             }
@@ -606,15 +608,15 @@ impl Step {
                 history.push((steps, clock.elapsed().as_secs_f64(), blocks.mean()));
             }
             samples.push(sample);
-            rows.add(&flow);
+            window.add(&flow);
             // Sample boundaries carry no partial interval, so the file holds the whole state.
             if let Some(path) = self.checkpoint.as_ref().filter(|_| steps.is_multiple_of(CHECKPOINT_STEPS)) {
-                save(path, &mut flow, steps, &samples, Some(&rows));
+                save(path, &mut flow, steps, &samples, Some(&window));
             }
         }
         // The end of the run is saved too, so a run that stops between two checkpoints leaves its field.
         if let Some(path) = self.checkpoint.as_ref() {
-            save(path, &mut flow, steps, &samples, Some(&rows));
+            save(path, &mut flow, steps, &samples, Some(&window));
         }
         println!(
             "{} fluid cells, {steps} steps: {:.1} M cell updates/s",
@@ -654,8 +656,15 @@ impl Step {
         } else {
             furthest_crossing(&floor_x, &floor_of(&mean), PRIMARY_BEYOND).map(|(x, _)| x)
         };
-        let readings = Readings::of(&floor_x, &floor_of(&mean), &rows);
+        let readings = Readings::of(&floor_x, &floor_of(&mean), &window.floor);
         println!("{readings}");
+        let stresses = window.layer.stresses();
+        for s in &stresses {
+            match s {
+                Ok(s) => println!("resolved against modelled shear stress, {s}"),
+                Err(why) => println!("resolved against modelled shear stress: none ({why})"),
+            }
+        }
         let cf: Vec<(f64, f64)> = strips.iter().zip(&mean).map(|(s, t)| (0.5 * (s.x.0 + s.x.1), t / q)).collect();
         let p_ref = rho_ref / 3.0;
         let cp: Vec<(f64, f64)> = floor_x.iter().map(|&x| (x, (span_mean(&flow, column(x), 1).0 / 3.0 - p_ref) / q)).collect();
@@ -676,6 +685,7 @@ impl Step {
             missing,
             censored: censored.get(),
             readings,
+            stresses,
             inflow: (u_ref_inlet * theta * self.re_h, delta, u_ref_inlet),
             steps,
             settled: rule.is_some(),
@@ -726,11 +736,11 @@ impl Restart {
     }
 }
 
-/// Write the restart file, the near-wall rows' sums after the samples so a resumed run's window
+/// Write the restart file, the window's sums (near-wall rows, shear layer) after the samples so a resumed run's window
 /// is whole: to `path` with `.tmp` added, then renamed over `path`.
-fn save(path: &std::path::Path, flow: &mut Flow, steps: u64, samples: &[Vec<f64>], rows: Option<&FloorRows>) {
+fn save(path: &std::path::Path, flow: &mut Flow, steps: u64, samples: &[Vec<f64>], window: Option<&Window>) {
     use std::io::Write;
-    let rows = rows.map(FloorRows::state).unwrap_or_default();
+    let rows = window.map(Window::state).unwrap_or_default();
     let tmp = path.with_extension("tmp");
     let mut a = Restart { read: None, write: Some(std::io::BufWriter::new(std::fs::File::create(&tmp).unwrap())) };
     flow.checkpoint(&mut a).unwrap();
@@ -923,6 +933,172 @@ impl std::fmt::Display for Readings {
             write!(f, "; THE MEAN-SHEAR AND FORWARD-FLOW READINGS DIFFER BY {gap:.3} H (over {READINGS_AGREE} H), both are reported")?;
         }
         Ok(())
+    }
+}
+
+/// The stations behind the step (x, in H) where the resolved and the modelled shear stress are
+/// compared in the shear layer.
+const STRESS_STATIONS: [f64; 3] = [1.0, 3.0, 5.0];
+
+/// The shear layer's stress at [`STRESS_STATIONS`] over the whole averaging window: for each
+/// station and cell row, the running sums of the span-mean u, w, u w and the eddy viscosity ν_t,
+/// one sample at a time. The resolved stress is −(⟨u w⟩ − ⟨u⟩⟨w⟩), the modelled one ⟨ν_t⟩ d⟨u⟩/dz
+/// (the molecular part is negligible at these Reynolds numbers and is left out of both).
+struct ShearLayer {
+    /// The column of each station.
+    columns: [usize; STRESS_STATIONS.len()],
+    /// Cell rows, the cell size in H, and the lattice speed the stress is scaled by.
+    nz: usize,
+    spacing: f64,
+    lattice_velocity: f64,
+    /// The fluid's molecular viscosity (lattice units), the argument of the model's ν_t.
+    nu: f64,
+    /// `[Σ u, Σ w, Σ u w, Σ ν_t, samples]` of station s, row k, at `s * nz + k`.
+    sums: Vec<[f64; 5]>,
+}
+
+/// The stress of one station: at the height of the largest total stress, and over the layer.
+#[derive(Debug, Clone, PartialEq)]
+struct Stress {
+    x: f64,
+    /// The height (H) where the total stress |τ_res + τ_mod| is largest.
+    z: f64,
+    /// The resolved and the modelled stress there, in units of the inlet speed squared.
+    resolved: f64,
+    modelled: f64,
+    /// Resolved over total at that height, and ∫|τ_res| over ∫(|τ_res| + |τ_mod|) over the rows.
+    peak_fraction: f64,
+    layer_fraction: f64,
+}
+
+impl ShearLayer {
+    fn new(flow: &Flow, step: &Step) -> ShearLayer {
+        let g = flow.grid();
+        let h = step.spacing();
+        let column = |x: f64| ((x + step.upstream) / h).floor().clamp(0.0, g.cells[0] as f64 - 1.0) as usize;
+        let (omega, _) = flow.omegas();
+        ShearLayer {
+            columns: STRESS_STATIONS.map(column),
+            nz: g.cells[2],
+            spacing: h,
+            lattice_velocity: step.lattice_velocity,
+            nu: (1.0 / omega - 0.5) / 3.0,
+            sums: vec![[0.0; 5]; STRESS_STATIONS.len() * g.cells[2]],
+        }
+    }
+
+    /// One sample of the flow's current field.
+    fn add(&mut self, flow: &Flow) {
+        let g = *flow.grid();
+        let ny = g.cells[1];
+        let sa = flow.spalart_allmaras();
+        for (s, &i) in self.columns.iter().enumerate() {
+            for k in 0..self.nz {
+                let cells: Vec<(f64, f64, f64)> = (0..ny)
+                    .filter_map(|j| {
+                        let c = g.index([i, j, k]);
+                        flow.moments(c).map(|m| (m.1[0], m.1[2], sa.map_or(0.0, |f| f.nu_t(c, self.nu))))
+                    })
+                    .collect();
+                if let Some(a) = self.sums.get_mut(s * self.nz + k).filter(|_| !cells.is_empty()) {
+                    let n = cells.len() as f64;
+                    a[0] += cells.iter().map(|c| c.0).sum::<f64>() / n;
+                    a[1] += cells.iter().map(|c| c.1).sum::<f64>() / n;
+                    a[2] += cells.iter().map(|c| c.0 * c.1).sum::<f64>() / n;
+                    a[3] += cells.iter().map(|c| c.2).sum::<f64>() / n;
+                    a[4] += 1.0;
+                }
+            }
+        }
+    }
+
+    fn state(&self) -> Vec<f64> {
+        self.sums.iter().flatten().copied().collect()
+    }
+
+    fn restore(&mut self, state: &[f64]) {
+        if state.len() == 5 * self.sums.len() {
+            for (s, v) in self.sums.iter_mut().flatten().zip(state) {
+                *s = *v;
+            }
+        }
+    }
+
+    /// Each station's stress, or why there is none (no samples, or no fluid row with both
+    /// neighbours to difference).
+    fn stresses(&self) -> Vec<Result<Stress, String>> {
+        (0..self.columns.len())
+            .map(|s| {
+                let rows = &self.sums[s * self.nz..(s + 1) * self.nz];
+                let mean = |k: usize, what: usize| rows.get(k).filter(|r| r[4] > 0.0).map(|r| r[what] / r[4]);
+                let scale = self.lattice_velocity * self.lattice_velocity;
+                // (height in H, resolved, modelled) of every row with fluid in it and in both neighbours.
+                let layer: Vec<(f64, f64, f64)> = (1..self.nz.saturating_sub(1))
+                    .filter_map(|k| {
+                        let (up, down) = (mean(k + 1, 0)?, mean(k - 1, 0)?);
+                        let resolved = -(mean(k, 2)? - mean(k, 0)? * mean(k, 1)?);
+                        let modelled = mean(k, 3)? * (up - down) / 2.0;
+                        Some(((k as f64 - 0.5) * self.spacing, resolved / scale, modelled / scale))
+                    })
+                    .collect();
+                let peak = layer
+                    .iter()
+                    .copied()
+                    .max_by(|a, b| (a.1 + a.2).abs().total_cmp(&(b.1 + b.2).abs()))
+                    .ok_or_else(|| format!("x = {} H: no sample", STRESS_STATIONS[s]))?;
+                let (res, tot): (f64, f64) = layer.iter().fold((0.0, 0.0), |(r, t), l| (r + l.1.abs(), t + l.1.abs() + l.2.abs()));
+                Ok(Stress {
+                    x: STRESS_STATIONS[s],
+                    z: peak.0,
+                    resolved: peak.1,
+                    modelled: peak.2,
+                    peak_fraction: peak.1 / (peak.1 + peak.2),
+                    layer_fraction: if tot > 0.0 { res / tot } else { f64::NAN },
+                })
+            })
+            .collect()
+    }
+}
+
+impl std::fmt::Display for Stress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "x = {} H: at the stress peak z = {:.2} H, resolved {:.3e} and modelled {:.3e} U²: resolved fraction {:.2} (whole layer {:.2})",
+            self.x, self.z, self.resolved, self.modelled, self.peak_fraction, self.layer_fraction
+        )
+    }
+}
+
+/// Everything a run averages over its window apart from the floor shear's blocks.
+struct Window {
+    floor: FloorRows,
+    layer: ShearLayer,
+}
+
+impl Window {
+    fn new(flow: &Flow, step: &Step) -> Window {
+        Window { floor: FloorRows::new(flow, step), layer: ShearLayer::new(flow, step) }
+    }
+
+    fn add(&mut self, flow: &Flow) {
+        self.floor.add(flow);
+        self.layer.add(flow);
+    }
+
+    /// The floor rows' sums, then the shear layer's, for the restart file.
+    fn state(&self) -> Vec<f64> {
+        let mut v = self.floor.state();
+        v.extend(self.layer.state());
+        v
+    }
+
+    fn restore(&mut self, state: &[f64]) {
+        let split = 3 * self.floor.sums.len();
+        if state.len() >= split {
+            self.floor.restore(&state[..split]);
+            self.layer.restore(&state[split..]);
+        }
     }
 }
 
@@ -1638,14 +1814,36 @@ fn the_window_readings_come_from_the_time_means_and_say_when_they_differ() {
 }
 
 #[test]
+fn the_shear_layers_stress_splits_into_resolved_and_modelled() {
+    // One station's rows: u rises linearly (du/dz = 2 per cell row), w = 0 on average, u w
+    // correlated to give a resolved stress of 0.004 at row 5 and 0.001 elsewhere, ν_t = 0.003.
+    let (nz, spacing, lattice_velocity) = (10, 0.1, 1.0);
+    let station = |tau_res: &dyn Fn(usize) -> f64| -> Vec<[f64; 5]> {
+        (0..nz).map(|k| [4.0 * 2.0 * k as f64, 0.0, 4.0 * -tau_res(k), 4.0 * 0.003, 4.0]).collect()
+    };
+    let rows = station(&|k| if k == 5 { 0.004 } else { 0.001 });
+    let layer = ShearLayer { columns: [0; 3], nz, spacing, lattice_velocity, nu: 0.01, sums: rows.iter().cycle().take(3 * nz).copied().collect() };
+    let s = layer.stresses().remove(0).unwrap();
+    // Modelled: ⟨ν_t⟩ d⟨u⟩/dz = 0.003 × 2 = 0.006 everywhere; the total peaks at row 5 (0.004 + 0.006).
+    assert!((s.z - 4.5 * spacing).abs() < 1e-12, "{}", s.z);
+    assert!((s.resolved - 0.004).abs() < 1e-12 && (s.modelled - 0.006).abs() < 1e-12, "{s:?}");
+    assert!((s.peak_fraction - 0.4).abs() < 1e-12);
+    // Over rows 1 to 8: resolved 7 × 0.001 + 0.004 = 0.011 against 8 × 0.006 modelled.
+    assert!((s.layer_fraction - 0.011 / (0.011 + 0.048)).abs() < 1e-12, "{}", s.layer_fraction);
+    // No samples: no stress.
+    let none = ShearLayer { sums: vec![[0.0; 5]; 3 * nz], ..layer };
+    assert!(none.stresses().iter().all(Result::is_err));
+}
+
+#[test]
 fn the_near_wall_rows_ride_in_the_restart_file_and_an_old_file_reads_without_them() {
     let step = laminar(10);
     let (mut flow, _, _) = step.build();
-    let mut rows = FloorRows::new(&flow, &step);
+    let mut rows = Window::new(&flow, &step);
     flow.step().unwrap();
     rows.add(&flow);
     rows.add(&flow);
-    assert_eq!(rows.samples(), 2);
+    assert_eq!(rows.floor.samples(), 2);
     let dir = std::env::temp_dir().join(format!("fieldcraft-rows-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let file = dir.join("step.restart");
@@ -1653,15 +1851,15 @@ fn the_near_wall_rows_ride_in_the_restart_file_and_an_old_file_reads_without_the
     let (mut again, _, _) = step.build();
     let (steps, samples, state) = load_all(&file, &mut again);
     assert_eq!((steps, samples), (1, vec![vec![1.0, 2.0]]));
-    let mut back = FloorRows::new(&again, &step);
+    let mut back = Window::new(&again, &step);
     back.restore(&state);
     assert_eq!(back.state(), rows.state());
     // A file written without them (the old layout ends after the samples) reads as an empty window.
     save(&file, &mut flow, 1, &[vec![1.0, 2.0]], None);
     let (_, _, none) = load_all(&file, &mut again);
-    let mut empty = FloorRows::new(&again, &step);
+    let mut empty = Window::new(&again, &step);
     empty.restore(&none);
-    assert_eq!(empty.samples(), 0);
+    assert_eq!(empty.floor.samples(), 0);
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -1872,4 +2070,13 @@ fn t3_ddes_in_the_zone_from_t2s_field_reports_x_r_with_its_error() {
         run.censored,
         run.readings
     );
+    // The plan's check: under half of the stress resolved at 3 H is the delayed break-up of the shear
+    // layer, not physics.
+    match run.stresses.get(1) {
+        Some(Ok(s)) if s.peak_fraction < 0.5 => {
+            println!("T3: resolved stress is {:.2} of the total at 3 H, under half: the shear layer breaks up late", s.peak_fraction)
+        }
+        Some(Ok(s)) => println!("T3: resolved stress is {:.2} of the total at 3 H, at least half", s.peak_fraction),
+        other => println!("T3: no stress reading at 3 H: {other:?}"),
+    }
 }
