@@ -229,6 +229,21 @@ fn slotted_channel_stability() {
             "WALLS interpolated ({order:?}, mass fix {fix:?}): {} links, {} interpolated ({} quadratic), {} half way, {} without a second node, {} without a surface",
             r.links, r.interpolated, r.quadratic, r.half_way, r.no_second_node, r.no_surface
         );
+        // CENSUS: the links by wall fraction q (the link's fraction from the fluid node to the wall), the interpolated ones in bins,
+        // and the half-way ones split into true q = 1/2 and fallbacks (no second node, no surface found).
+        let q: Vec<f64> = cpu.interpolated_links().iter().map(|l| l.wall).collect();
+        let bin = |lo: f64, hi: f64| q.iter().filter(|&&w| w > lo && w <= hi).count();
+        println!(
+            "CENSUS links {}: q = 1/2 exactly {}; interpolated q below 1/2 {}, 1/2 to 0.6 {}, 0.6 to 0.8 {}, above 0.8 {}; fallbacks to half-way: no second node {}, no surface {}",
+            r.links,
+            r.half_way,
+            bin(0.0, 0.5 - 1e-9),
+            bin(0.5 - 1e-9, 0.6),
+            bin(0.6, 0.8),
+            bin(0.8, f64::INFINITY),
+            r.no_second_node,
+            r.no_surface
+        );
     }
     let n = cpu.grid().len();
     let [nx, ny, nz] = cpu.grid().cells;
@@ -291,6 +306,14 @@ fn slotted_channel_stability() {
         None
     };
     let (mut done, mut cpu_ok, mut gpu_ok) = (0u64, use_cpu, use_gpu);
+    // SERIES=1: the series' reporting (settle rule, self-stop, DIAG4). SETTLE=1: stop when K is settled (STEPS is the cap); the rule: windows of
+    // WIN steps (2000), a least-squares line through the last third of the windows drifts less than 0.2 % over that third and the last three
+    // windows are within 0.5 % of each other (at least 6 windows). SELFSTOP=v (0.1): stop when the wall-normal speed of any wall cell passes v.
+    let series = env("SERIES", 0.0) > 0.5;
+    let settle = env("SETTLE", if series { 1.0 } else { 0.0 }) > 0.5;
+    let win_steps = env("WIN", 2000.0) as u64;
+    let selfstop = env("SELFSTOP", 0.1);
+    let mut stop: Option<String> = None;
     let (mut worst_u, mut worst_r) = (0.0f64, 0.0f64);
     let (mut t_gpu, mut t_cpu) = (0.0f64, 0.0f64);
     let fluid: Vec<bool> = (0..n).map(|c| Backend::is_fluid(&cpu, c)).collect();
@@ -351,7 +374,7 @@ fn slotted_channel_stability() {
     let (mut sc, mut sg): (Vec<S>, Vec<S>) = (vec![], vec![]);
     let mut rho_diff: Vec<(u64, f64)> = vec![];
     let mut last_good: Option<(u64, [usize; 3], f64, [usize; 3], f64)> = None;
-    while done < steps && (cpu_ok || gpu_ok) {
+    while done < steps && (cpu_ok || gpu_ok) && stop.is_none() {
         let c = chunk.min(steps - done);
         if gpu_ok {
             let t = Instant::now();
@@ -454,6 +477,79 @@ fn slotted_channel_stability() {
         if let Some(x) = sb {
             sg.push(x);
         }
+        // self-stop: the wall-normal speed in a wall cell (a fluid cell with a solid neighbour along an axis: the velocity component along
+        // that axis, the lattice's own notion of the normal) above SELFSTOP
+        if let Some(f) = fa.as_ref().or(fb.as_ref()) {
+            let mut worst = (0.0f64, [0usize; 3]);
+            for k in 0..nz {
+                for j in 0..ny {
+                    for i in 0..nx {
+                        let c = grid.index([i, j, k]);
+                        if !fluid[c] {
+                            continue;
+                        }
+                        for (axis, sz) in [(0usize, nx), (1, ny), (2, nz)] {
+                            let at_c = [i, j, k];
+                            let solid = |n: usize| {
+                                let mut p = at_c;
+                                p[axis] = n;
+                                !fluid[grid.index(p)]
+                            };
+                            let next = at_c[axis] + 1;
+                            let touches = (next < sz && solid(next)) || (at_c[axis] > 0 && solid(at_c[axis] - 1));
+                            if touches {
+                                let v = f.velocity[c][axis].abs();
+                                if v > worst.0 {
+                                    worst = (v, at_c);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if done % print_every == 0 {
+                println!("WALLN step {done}: largest wall-normal speed {:.4} at {:?}", worst.0, worst.1);
+            }
+            if worst.0 > selfstop {
+                println!(
+                    "EVENT SELFSTOP at step {done}: wall-normal speed {:.4} above {selfstop} at wall cell {:?} (x {:.3} m)",
+                    worst.0,
+                    worst.1,
+                    dx * (worst.1[0] as f64 + 0.5) - ext_up
+                );
+                stop = Some("selfstop".into());
+            }
+        }
+        // the settle rule on the plate's pressure drop (K is dp over a constant)
+        if settle && stop.is_none() && win_steps > 0 {
+            let nwin = (done / win_steps) as usize;
+            if nwin >= 6 && done % win_steps == 0 {
+                let mean = |k: usize| {
+                    let v: Vec<f64> = sc.iter().filter(|s| s.0 > k as u64 * win_steps && s.0 <= (k as u64 + 1) * win_steps).map(|s| s.7).collect();
+                    v.iter().sum::<f64>() / v.len().max(1) as f64
+                };
+                let w: Vec<f64> = (0..nwin).map(mean).collect();
+                let third = (nwin / 3).max(3);
+                let last = &w[nwin - third..];
+                let m = last.iter().sum::<f64>() / third as f64;
+                let tbar = (third as f64 - 1.0) / 2.0;
+                let slope = last.iter().enumerate().map(|(t, y)| (t as f64 - tbar) * (y - m)).sum::<f64>()
+                    / (0..third).map(|t| (t as f64 - tbar).powi(2)).sum::<f64>();
+                let drift = (slope * (third as f64 - 1.0) / m).abs();
+                let l3 = &w[nwin - 3..];
+                let spread =
+                    (l3.iter().cloned().fold(f64::MIN, f64::max) - l3.iter().cloned().fold(f64::MAX, f64::min)) / (l3.iter().sum::<f64>() / 3.0);
+                println!(
+                    "SETTLE step {done}: {nwin} windows of {win_steps}; fitted drift over the last {third} windows {:.3} %, last three windows within {:.3} %",
+                    100.0 * drift,
+                    100.0 * spread
+                );
+                if drift < 2e-3 && spread < 5e-3 {
+                    println!("EVENT SETTLED at step {done}");
+                    stop = Some("settled".into());
+                }
+            }
+        }
         let mut line = format!("step {done}:");
         if let (Some(a), Some(b), Some(fa), Some(fb)) = (sa, sb, fa.as_ref(), fb.as_ref()) {
             let (mut du, mut dr) = (0.0f64, 0.0f64);
@@ -492,6 +588,16 @@ fn slotted_channel_stability() {
             println!("{line} gpu s {t_gpu:.2} cpu s {t_cpu:.2}");
         }
     }
+    let steps_cap = steps;
+    let steps = done;
+    let host = std::env::var("COMPUTERNAME").or_else(|_| std::env::var("HOSTNAME")).unwrap_or_else(|_| "unknown".into());
+    println!(
+        "RUN ended after {steps} of {steps_cap} steps: {}; host {host}; mean density start {:.5} middle {:.5} end {:.5}",
+        stop.as_deref().unwrap_or(if cpu_ok || gpu_ok { "reached the cap" } else { "blew up or stopped" }),
+        sc.first().map_or(f64::NAN, |x| x.4),
+        sc.get(sc.len() / 2).map_or(f64::NAN, |x| x.4),
+        sc.last().map_or(f64::NAN, |x| x.4)
+    );
     // windows: the second half, and its two quarters
     let win = |v: &[S], lo: u64, hi: u64| -> Option<String> {
         let w: Vec<&S> = v.iter().filter(|s| s.0 > lo && s.0 <= hi).collect();
@@ -543,7 +649,7 @@ fn slotted_channel_stability() {
     }
     // DIAG4 reads the final fields from the CPU flow when it ran, else from the device (CPU=0): the same prints either way.
     // The device's nu_tilde may be missing, then the viscosity line reads zero.
-    let diag4 = if env("DIAG4", 0.0) <= 0.5 {
+    let diag4 = if env("DIAG4", 0.0) <= 0.5 && !series {
         None
     } else if cpu_ok {
         match (Backend::fields(&mut cpu), Backend::nu_tilde(&mut cpu)) {
@@ -648,6 +754,16 @@ fn slotted_channel_stability() {
                 dp_end / (0.5 * gm * gm),
                 sec(at(0.7)).0 as f64 / sec(at(0.7)).1
             );
+            {
+                let (open, tot, _, u_slot, um_sec) = sec(at(0.7));
+                println!(
+                    "REPORT K on the inlet speed {:.3} (dp/(0.5 U_in^2), U_in {u_in}); K on the mean slot speed {:.3} (mean u_x {u_slot:.5} over the open cells at x 0.7 m, open fraction {:.4}); peak speed over mean slot speed {:.3} (peak in the section {um_sec:.5}); friction share: not measured here (the harness has no per-link tangential exchange)",
+                    dp_end / (0.5 * u_in * u_in),
+                    dp_end / (0.5 * u_slot * u_slot),
+                    open as f64 / tot,
+                    if u_slot.abs() > 1e-12 { um_sec / u_slot } else { f64::NAN }
+                );
+            }
             // DIAG4 (g): the loss metric for every arm: the area-mean total pressure p + rho |u|^2 / 2 (lattice, p = (rho - 1) / 3,
             // mean over the fluid cells of the section) at x 0.4, less the same at the downstream plane, over 0.5 u_nom^2.
             {
