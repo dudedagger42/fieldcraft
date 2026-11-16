@@ -74,7 +74,9 @@ fn slotted_channel_stability() {
     let cells = env("SLOT_CELLS", 4.0);
     let law = std::env::var("LAW").unwrap_or_else(|_| "spalding".into());
     let steps = env("STEPS", 20000.0) as u64;
-    let chunk = env("CHUNK", 500.0) as u64;
+    // EARLY=n (steps): chunks of 10 and a diag line (max|u|, its cell and what the cell touches) for the first n steps.
+    let early = env("EARLY", 0.0) as u64;
+    let chunk = if early > 0 { 10 } else { env("CHUNK", 500.0) as u64 };
     let tau_half = env("TAU", 2.4e-4);
     let u_in = env("ULAT", 0.014);
     let use_cpu = env("CPU", 1.0) > 0.5;
@@ -95,7 +97,10 @@ fn slotted_channel_stability() {
         d.faces.y_max = FaceCondition::Slip {};
         d.faces.z_min = FaceCondition::Slip {};
     }
-    d.faces.x_min = FaceCondition::Velocity { velocity: [0.1, 0.02, 0.0], profile: if std::env::var("INLET").is_ok_and(|v| v == "uniform") { Profile::Uniform } else { Profile::Parabolic } };
+    d.faces.x_min = FaceCondition::Velocity {
+        velocity: [0.1, 0.02, 0.0],
+        profile: if std::env::var("INLET").is_ok_and(|v| v == "uniform") { Profile::Uniform } else { Profile::Parabolic },
+    };
     d.faces.x_max = FaceCondition::Pressure { pressure: 0.0, outflow: Outflow::Uniform };
     d.faces.z_max = FaceCondition::Slip {};
     if std::env::var("ZMAX").is_ok_and(|v| v == "wall") {
@@ -291,7 +296,7 @@ fn slotted_channel_stability() {
     let fluid: Vec<bool> = (0..n).map(|c| Backend::is_fluid(&cpu, c)).collect();
     let grid = *cpu.grid();
     let print_every = env("PRINT", 2000.0) as u64;
-    let diag = env("DIAG", 0.0) > 0.5;
+    let diag = env("DIAG", 0.0) > 0.5 || early > 0;
     // the flux planes at x = 0.3 m and 1.7 m, the pressure planes at x = 0.5 m and 0.9 m, on every grid
     let at = |x: f64| ((x + ext_up) / dx).round() as usize;
     let (i_in, i_out) = (at(0.3), at(1.7));
@@ -396,8 +401,40 @@ fn slotted_channel_stability() {
                     }
                 }
                 last_good = Some((done, im, um, ir, dr));
-                if done % 20 == 0 && done >= 400 {
-                    println!("diag step {done}: max|u| {um:.4} at {im:?}; max|rho-1| {dr:.4} at {ir:?}");
+                if (early > 0 && done <= early) || (done % 20 == 0 && done >= 400) {
+                    // What a cell touches: the box's inlet or outlet layer, a solid or wall neighbour, or the open interior.
+                    let touches = |c: [usize; 3]| {
+                        let mut t = Vec::new();
+                        if c[0] < 2 {
+                            t.push("inlet");
+                        }
+                        if c[0] + 2 >= nx {
+                            t.push("outlet");
+                        }
+                        for (axis, name) in [(0usize, "x"), (1, "y"), (2, "z")] {
+                            for up in [false, true] {
+                                let mut n = c;
+                                let ok = if up { n[axis] + 1 < [nx, ny, nz][axis] } else { n[axis] > 0 };
+                                if ok {
+                                    n[axis] = if up { n[axis] + 1 } else { n[axis] - 1 };
+                                    if !fluid[grid.index(n)] {
+                                        t.push(if axis == 0 { "solid-x" } else { name });
+                                    }
+                                }
+                            }
+                        }
+                        if t.is_empty() {
+                            "open interior".to_string()
+                        } else {
+                            t.join("+")
+                        }
+                    };
+                    println!(
+                        "diag step {done}: max|u| {um:.4} at {im:?} (x {:.3} m; touches {}); max|rho-1| {dr:.4} at {ir:?} (touches {})",
+                        dx * (im[0] as f64 + 0.5) - ext_up,
+                        touches(im),
+                        touches(ir)
+                    );
                 }
             }
         }
