@@ -1,0 +1,86 @@
+{
+ "title": "Turbulent channel flow at Re_τ 182, 543 and 1000 against direct numerical simulation (Lee and Moser)",
+ "kind": "experiment",
+ "source": "M. Lee and R. D. Moser, Direct numerical simulation of turbulent channel flow up to Re_τ ≈ 5200, J. Fluid Mech. 774:395–415 (2015), doi:10.1017/jfm.2015.268; Re_τ 182.088, 543.496 and 1000.512 mean-profile data, u_τ and the bulk velocity from each file's header",
+ "status": "pending",
+ "requires": "the Spalart–Allmaras wall law on the half-way wall with the regularised collision; each row is run by that feature's heavy test on one CPU thread, 40,000 to 110,000 steps",
+ "slow": true,
+ "nightly": true,
+ "quantities": [
+  {
+   "id": "re180_n10",
+   "quantity": "skin friction C_f = 2 (u_τ/U_b)² of the turbulent channel at Re_τ 182.088, 10 cells per half-height",
+   "value": 0.008123255,
+   "tolerance": {
+    "relative": 0.01
+   },
+   "reason": "1 % on the bulk-velocity friction coefficient: the DNS reference is a time average to about 0.1 %, and a wall model that works should be within a percent",
+   "known_failure": "FieldCraft's value is 8.039611e-03, -1.03 % from the reference, outside the 1 % bar; reported, not tuned away",
+   "regression": {
+    "value": 0.008039611,
+    "relative": 0.0005,
+    "reason": "our own result at the commit that recorded it (settled run, drag balances the body force to 5e-5): a later change that moves it by more than 0.05 % must say why"
+   }
+  },
+  {
+   "id": "re180_n20",
+   "quantity": "skin friction C_f = 2 (u_τ/U_b)² of the turbulent channel at Re_τ 182.088, 20 cells per half-height",
+   "value": 0.008123255,
+   "tolerance": {
+    "relative": 0.01
+   },
+   "reason": "1 % on the bulk-velocity friction coefficient: the DNS reference is a time average to about 0.1 %, and a wall model that works should be within a percent",
+   "known_failure": "FieldCraft's value is 7.723343e-03, -4.92 % from the reference, outside the 1 % bar; reported, not tuned away",
+   "regression": {
+    "value": 0.007723343,
+    "relative": 0.0005,
+    "reason": "our own result at the commit that recorded it (settled run, drag balances the body force to 5e-5): a later change that moves it by more than 0.05 % must say why"
+   }
+  },
+  {
+   "id": "re550_n20",
+   "quantity": "skin friction C_f = 2 (u_τ/U_b)² of the turbulent channel at Re_τ 543.496, 20 cells per half-height",
+   "value": 0.005907758,
+   "tolerance": {
+    "relative": 0.01
+   },
+   "reason": "1 % on the bulk-velocity friction coefficient: the DNS reference is a time average to about 0.1 %, and a wall model that works should be within a percent",
+   "known_failure": "FieldCraft's value is 5.826601e-03, -1.37 % from the reference, outside the 1 % bar; reported, not tuned away",
+   "regression": {
+    "value": 0.005826601,
+    "relative": 0.0005,
+    "reason": "our own result at the commit that recorded it (settled run, drag balances the body force to 5e-5): a later change that moves it by more than 0.05 % must say why"
+   }
+  },
+  {
+   "id": "re1000_n50",
+   "quantity": "skin friction C_f = 2 (u_τ/U_b)² of the turbulent channel at Re_τ 1000, 50 cells per half-height",
+   "value": 0.005005121,
+   "tolerance": {
+    "relative": 0.01
+   },
+   "reason": "1 % on the bulk-velocity friction coefficient: the DNS reference is a time average to about 0.1 %, and a wall model that works should be within a percent",
+   "known_failure": "FieldCraft's value is 4.946613e-03, -1.17 % from the reference, outside the 1 % bar; reported, not tuned away",
+   "regression": {
+    "value": 0.004946613,
+    "relative": 0.0005,
+    "reason": "our own result at the commit that recorded it (settled run, drag balances the body force to 5e-5): a later change that moves it by more than 0.05 % must say why"
+   }
+  },
+  {
+   "id": "re1000_n80",
+   "quantity": "skin friction C_f = 2 (u_τ/U_b)² of the turbulent channel at Re_τ 1000, 80 cells per half-height",
+   "value": 0.005005121,
+   "tolerance": {
+    "relative": 0.01
+   },
+   "reason": "1 % on the bulk-velocity friction coefficient: the DNS reference is a time average to about 0.1 %, and a wall model that works should be within a percent",
+   "known_failure": "FieldCraft's value is 4.919915e-03, -1.70 % from the reference, outside the 1 % bar; reported, not tuned away",
+   "regression": {
+    "value": 0.004919915,
+    "relative": 0.0005,
+    "reason": "our own result at the commit that recorded it (settled run, drag balances the body force to 5e-5): a later change that moves it by more than 0.05 % must say why"
+   }
+  }
+ ]
+}
