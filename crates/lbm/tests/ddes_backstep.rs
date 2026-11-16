@@ -86,7 +86,9 @@ fn mirror(flow: &mut Flow, device: &mut dyn Backend, for_save: bool) -> Result<(
         let bad =
             (0..flow.grid().len()).filter(|c| flow.moments(*c).is_some_and(|(r, u)| !r.is_finite() || !u.iter().all(|v| v.is_finite()))).count();
         let bad_sa = flow.spalart_allmaras().map(|s| s.nu_tilde().iter().filter(|v| !v.is_finite()).count()).unwrap_or(0);
-        println!("mirror for save: non-finite cells after the settling step: moments {bad}, nu-tilde {bad_sa}");
+        println!(
+            "mirror for save: the file holds the device's density, velocity and nu-tilde (equilibrium part only) plus one CPU settling step, so it is one step ahead of the device; non-finite cells: moments {bad}, nu-tilde {bad_sa}"
+        );
     }
     Ok(())
 }
@@ -430,7 +432,7 @@ impl Step {
         d.absorbing = self.absorbing;
         // `FIELDCRAFT_STEP_INLET_TABLE`: a profile file (`z/H u/U_ref nu_tilde/nu`, as `write_profile` writes it) as
         // the inlet's tabulated profile: the incoming boundary layer of a full domain on the short one.
-        if let Some(path) = std::env::var_os("FIELDCRAFT_STEP_INLET_TABLE") {
+        if let Some(path) = std::env::var_os("FIELDCRAFT_STEP_INLET_TABLE").filter(|_| self.short) {
             let rows = read_inlet_table(std::path::Path::new(&path)).unwrap_or_else(|e| panic!("the inlet table: {e}"));
             d.faces.x_min = FaceCondition::Velocity { velocity: [1.0, 0.0, 0.0], profile: fieldcraft_model::Profile::Table };
             d.inflow_table = Some(fieldcraft_model::InflowTable { axis: fieldcraft_model::fluid_zones::Axis::Z, rows });
@@ -748,6 +750,9 @@ impl Step {
             furthest_crossing(&floor_x, &floor_of(&mean), PRIMARY_BEYOND).map(|(x, _)| x)
         };
         let readings = Readings::of(&floor_x, &floor_of(&mean), &window.floor);
+        for line in window.floor.describe() {
+            println!("{line}");
+        }
         let partial = if rule.is_some() { "" } else { "partial (the run stopped unsettled, at its step cap): " };
         println!("{partial}{readings}");
         let stresses = window.layer.stresses();
@@ -941,9 +946,10 @@ impl FloorRows {
         }
     }
 
-    /// The columns behind the step (x > 0) and their centres.
+    /// The columns behind the step (x > 0) that took samples and their centres (the column against the step's face holds
+    /// the corner's solid cells and has none).
     fn behind(&self) -> (Vec<usize>, Vec<f64>) {
-        (0..self.x.len()).filter(|&i| self.x[i] > 0.0).map(|i| (i, self.x[i])).unzip()
+        (0..self.x.len()).filter(|&i| self.x[i] > 0.0 && self.sums.get(i).is_some_and(|s| s[2] > 0.0)).map(|i| (i, self.x[i])).unzip()
     }
 
     /// Row `n`'s time-mean span-mean u, or its forward fraction, at the columns `at` (NaN where no
@@ -951,6 +957,26 @@ impl FloorRows {
     fn column(&self, n: usize, at: &[usize], what: usize) -> Vec<f64> {
         let nx = self.x.len();
         at.iter().map(|&i| self.sums.get(n * nx + i).map_or(f64::NAN, |s| if s[2] > 0.0 { s[what] / s[2] } else { f64::NAN })).collect()
+    }
+
+    /// What the rows hold, one line per row: the columns behind the step with no sample, with a non-finite sum, and
+    /// the first such station.
+    fn describe(&self) -> Vec<String> {
+        let nx = self.x.len();
+        (0..FLOOR_ROWS)
+            .map(|n| {
+                let cols: Vec<(usize, &[f64; 3])> =
+                    (0..nx).filter(|&i| self.x[i] > 0.0).filter_map(|i| self.sums.get(n * nx + i).map(|s| (i, s))).collect();
+                let empty = cols.iter().filter(|(_, s)| s[2] <= 0.0).count();
+                let bad = cols.iter().filter(|(_, s)| !(s[0].is_finite() && s[1].is_finite())).count();
+                let first = cols.iter().find(|(_, s)| s[2] <= 0.0 || !(s[0].is_finite() && s[1].is_finite())).map(|(i, _)| self.x[*i]);
+                format!(
+                    "floor row {}: {} columns behind the step, {empty} without a sample, {bad} with a non-finite sum, first at x = {first:?} H",
+                    n + 1,
+                    cols.len()
+                )
+            })
+            .collect()
     }
 
     /// Samples taken (the most of any column of row 1).
