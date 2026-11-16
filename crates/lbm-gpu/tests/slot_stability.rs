@@ -330,6 +330,8 @@ fn slotted_channel_stability() {
     let win_steps = env("WIN", 2000.0) as u64;
     let selfstop = env("SELFSTOP", 0.1);
     let mut stop: Option<String> = None;
+    // the last settle window the rule read (from step, to step), reported per run
+    let mut settle_window: Option<(u64, u64)> = None;
     let (mut worst_u, mut worst_r) = (0.0f64, 0.0f64);
     let (mut t_gpu, mut t_cpu) = (0.0f64, 0.0f64);
     let fluid: Vec<bool> = (0..n).map(|c| Backend::is_fluid(&cpu, c)).collect();
@@ -536,6 +538,19 @@ fn slotted_channel_stability() {
                 stop = Some("selfstop".into());
             }
         }
+        // second self-stop: the largest speed anywhere above twice the peak speed of the preceding windows (a run that is still going
+        // out of its settled range), read from the backend that ran
+        if stop.is_none() && win_steps > 0 && done > 3 * win_steps {
+            let src = if sc.is_empty() { &sg } else { &sc };
+            let before: Vec<f64> = src.iter().filter(|x| x.0 + chunk <= done && x.0 + 2 * win_steps > done).map(|x| x.1).collect();
+            if let (false, Some(now)) = (before.is_empty(), src.last()) {
+                let reference = before.iter().sum::<f64>() / before.len() as f64;
+                if now.1 > 2.0 * reference {
+                    println!("EVENT SELFSTOP at step {done}: max|u| {:.4} is above twice the preceding peak {reference:.4}", now.1);
+                    stop = Some("selfstop (peak speed)".into());
+                }
+            }
+        }
         // the settle rule on the plate's pressure drop (K is dp over a constant)
         if settle && stop.is_none() && win_steps > 0 {
             let nwin = (done / win_steps) as usize;
@@ -564,6 +579,7 @@ fn slotted_channel_stability() {
                     100.0 * drift,
                     100.0 * spread
                 );
+                settle_window = Some((done - third as u64 * win_steps, done));
                 if drift < 2e-3 && spread < 5e-3 {
                     println!("EVENT SETTLED at step {done}");
                     stop = Some("settled".into());
@@ -661,8 +677,9 @@ fn slotted_channel_stability() {
     let run_samples = if sc.is_empty() { &sg } else { &sc };
     let host = std::env::var("COMPUTERNAME").or_else(|_| std::env::var("HOSTNAME")).unwrap_or_else(|_| "unknown".into());
     println!(
-        "RUN ended after {steps} of {steps_cap} steps: {}; host {host}; mean density start {:.5} middle {:.5} end {:.5}",
+        "RUN ended after {steps} of {steps_cap} steps: {}; settle window {}; host {host}; mean density start {:.5} middle {:.5} end {:.5}",
         stop.as_deref().unwrap_or(if cpu_ok || gpu_ok { "reached the cap" } else { "blew up or stopped" }),
+        settle_window.map_or("none read".to_string(), |(a, b)| format!("steps {a} to {b} (the last third of the windows the rule read)")),
         run_samples.first().map_or(f64::NAN, |x| x.4),
         run_samples.get(run_samples.len() / 2).map_or(f64::NAN, |x| x.4),
         run_samples.last().map_or(f64::NAN, |x| x.4)
