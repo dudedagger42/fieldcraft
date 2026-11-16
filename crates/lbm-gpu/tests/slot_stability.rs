@@ -244,6 +244,12 @@ fn slotted_channel_stability() {
             r.no_second_node,
             r.no_surface
         );
+        if env("SERIES", 0.0) > 0.5 {
+            match cpu.track_wall_split(&obstacles, &["PlateLow", "PlateHigh"]) {
+                Ok(n) => println!("SPLIT tracking {n} plate wall links for the friction share"),
+                Err(e) => println!("SPLIT not tracked: {e}"),
+            }
+        }
     }
     let n = cpu.grid().len();
     let [nx, ny, nz] = cpu.grid().cells;
@@ -588,6 +594,39 @@ fn slotted_channel_stability() {
             println!("{line} gpu s {t_gpu:.2} cpu s {t_cpu:.2}");
         }
     }
+    // The friction share: the plates' wall exchange split by the local wall normal, averaged over SPLIT_STEPS (200) single steps after
+    // the run (they are not in `steps`), the tangential part over tangential plus normal along the flow.
+    let mut friction = String::from("friction share: not tracked");
+    let mut split_avg: Option<fieldcraft_lbm::flow::WallSplit> = None;
+    if series && cpu_ok && cpu.wall_split().is_some() {
+        let n_avg = env("SPLIT_STEPS", 200.0) as usize;
+        let (mut ft, mut fnn) = ([0.0f64; 3], [0.0f64; 3]);
+        let mut counted = 0usize;
+        for _ in 0..n_avg {
+            if Backend::advance(&mut cpu, 1).is_err() {
+                break;
+            }
+            if let Some(w) = cpu.wall_split() {
+                for a in 0..3 {
+                    ft[a] += w.tangential[a];
+                    fnn[a] += w.normal[a];
+                }
+                counted += 1;
+            }
+        }
+        if counted > 0 {
+            let avg = fieldcraft_lbm::flow::WallSplit { normal: fnn.map(|v| v / counted as f64), tangential: ft.map(|v| v / counted as f64) };
+            split_avg = Some(avg);
+            // Fable's definition: tangential over tangential plus normal, over every tracked wall link of the plates, along the flow
+            friction = format!(
+                "friction share along the flow, all plate wall links: tangential/(tangential+normal) {:.4} (tangential {:+.4e}, normal {:+.4e} lattice force per step, mean of {counted} steps after the run)",
+                avg.friction_share([1.0, 0.0, 0.0]).unwrap_or(f64::NAN),
+                avg.tangential[0],
+                avg.normal[0]
+            );
+        }
+    }
+    println!("FRICTION {friction}");
     let steps_cap = steps;
     let steps = done;
     let host = std::env::var("COMPUTERNAME").or_else(|_| std::env::var("HOSTNAME")).unwrap_or_else(|_| "unknown".into());
@@ -757,7 +796,7 @@ fn slotted_channel_stability() {
             {
                 let (open, tot, _, u_slot, um_sec) = sec(at(0.7));
                 println!(
-                    "REPORT K on the inlet speed {:.3} (dp/(0.5 U_in^2), U_in {u_in}); K on the mean slot speed {:.3} (mean u_x {u_slot:.5} over the open cells at x 0.7 m, open fraction {:.4}); peak speed over mean slot speed {:.3} (peak in the section {um_sec:.5}); friction share: not measured here (the harness has no per-link tangential exchange)",
+                    "REPORT K on the inlet speed {:.3} (dp/(0.5 U_in^2), U_in {u_in}); K on the mean slot speed {:.3} (mean u_x {u_slot:.5} over the open cells at x 0.7 m, open fraction {:.4}); peak speed over mean slot speed {:.3} (peak in the section {um_sec:.5}); friction share: see the FRICTION line",
                     dp_end / (0.5 * u_in * u_in),
                     dp_end / (0.5 * u_slot * u_slot),
                     open as f64 / tot,
@@ -782,6 +821,19 @@ fn slotted_channel_stability() {
                     s / n.max(1) as f64
                 };
                 let up = p_tot(at(0.4));
+                // CLOSURE: the tracked wall force (|F_t.d| + |F_n.d|, d along the flow) over the total-pressure drop (x 0.4 to 1.0 m)
+                // times the duct's fluid cross-section at x 0.4; 1 within about 2 % or the share is untrusted.
+                if let Some(w) = split_avg {
+                    let section = (0..nz).flat_map(|k| (0..ny).map(move |j| (j, k))).filter(|&(j, k)| fluid[grid.index([at(0.4), j, k])]).count();
+                    let drop = (up - p_tot(at(1.0))).abs() * section as f64;
+                    let force = w.tangential[0].abs() + w.normal[0].abs();
+                    let closure = force / drop.max(1e-300);
+                    println!(
+                        "CLOSURE (|F_t.d| + |F_n.d|) / (total-pressure drop x section) = {closure:.4} (force {force:.4e}, drop {:.4e} x {section} cells){}",
+                        (up - p_tot(at(1.0))).abs(),
+                        if (closure - 1.0).abs() > 0.02 { "  UNTRUSTED: not within 2 % of 1" } else { "" }
+                    );
+                }
                 for x in [1.0, 1.5, 2.0] {
                     let dn = p_tot(at(x));
                     println!(
