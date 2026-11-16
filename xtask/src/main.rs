@@ -9,6 +9,7 @@ mod affected;
 mod app_icon;
 mod assets;
 mod book;
+mod figure;
 mod icons;
 mod layers;
 mod licences;
@@ -35,6 +36,10 @@ commands:
                   build the documentation site (docs/book.toml, docs/SUMMARY.md) with mdbook
                   into target/book; links that leave docs/ point at the repository on GitHub;
                   --no-build stages target/book-src only
+  figure [--data FILE] [--out DIR] [--final]
+                  draw the validation figure (docs/figure/README.md) from docs/figure/results.json
+                  into target/figure/figure.svg; no number is typed in the code; --final refuses a
+                  figure with items not yet reproduced at the proposed commit
   licences        write THIRD-PARTY-LICENSES.txt (the licences of every shipped crate; the
                   release workflow runs it before packaging, the file is not committed)
   test [--heavy] [CARGO ARGS] [-- TEST ARGS]
@@ -84,6 +89,7 @@ fn main() -> ExitCode {
         Some("app-icon") => app_icon::run(&root()),
         Some("book") => book::run(&root(), !rest.contains(&"--no-build")),
         Some("licences") => licences::run(&root()),
+        Some("figure") => figure::run(&root(), &rest),
         Some("test") => {
             let (heavy, rest) = match rest.split_first() {
                 Some((&"--heavy", after)) => (true, after),
