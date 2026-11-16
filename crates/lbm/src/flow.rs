@@ -609,6 +609,8 @@ pub struct Flow {
     wall_model: bool,
     /// Whether the wall-function bounce gives the walls their stress (`spalding_bounce_halfway`).
     wall_bounce: bool,
+    /// Diagnostic only (stability studies): links whose fraction `q` is above this keep the half-way rule.
+    force_half_way_above: Option<f64>,
     /// Han et al.'s on-node wall-function bounce (`spalding_bounce`): its boundary nodes.
     nodes: Option<WallNodes>,
     /// The inlet cells the on-node wall law's corner rule made wall cells.
@@ -1718,6 +1720,7 @@ impl Flow {
             walls,
             wall_model: setup.wall_model == Some(WallModel::Musker),
             wall_bounce: setup.wall_model == Some(WallModel::SpaldingBounceHalfway),
+            force_half_way_above: None,
             nodes: on_node.then(|| {
                 let mut node_list = node_list;
                 if surface_model {
@@ -2049,6 +2052,13 @@ impl Flow {
         self.interpolate_walls_with(setup, obstacles, crate::interpolated::WallOrder::Linear)
     }
 
+    /// A diagnostic for stability studies, never a scheme and never set by a solve: when the walls are
+    /// interpolated afterwards, every link with `q` above `q_min` keeps the half-way rule (`None`
+    /// clears it). Call it before `interpolate_walls`.
+    pub fn force_half_way_above(&mut self, q_min: Option<f64>) {
+        self.force_half_way_above = q_min;
+    }
+
     /// [`Flow::interpolate_walls`] with the rule's order: linear, or quadratic where three fluid nodes lie in line.
     pub fn interpolate_walls_with(
         &mut self,
@@ -2125,7 +2135,7 @@ impl Flow {
                 report.no_surface += 1;
                 continue;
             };
-            if (t - 0.5).abs() < 1e-9 {
+            if (t - 0.5).abs() < 1e-9 || self.force_half_way_above.is_some_and(|q_min| t > q_min) {
                 report.half_way += 1;
                 continue;
             }
@@ -3867,6 +3877,7 @@ impl crate::backend::Backend for Flow {
             absorbing,
             surface,
             interpolated: _,
+            force_half_way_above: _,
         } = self;
         let n = *n;
         fixed(a, n as u64)?;
