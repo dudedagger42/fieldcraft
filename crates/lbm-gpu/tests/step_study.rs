@@ -99,6 +99,18 @@ fn zone_mask_parity_over_200_steps() {
     assert!(worst <= column, "the LES-mode cell counts differ by {worst} (more than one {column}-cell spanwise column): {mismatched:?}");
 }
 
+/// The f32 floor rule on T1's restart file (`FIELDCRAFT_STEP_RESTART`): over its last 10 blocks, no trend and a scatter
+/// under the caps; prints the measured numbers.
+#[test]
+#[ignore = "local: needs T1's restart file"]
+fn the_f32_floor_holds_over_t1s_last_blocks() {
+    let file = std::path::PathBuf::from(std::env::var("FIELDCRAFT_STEP_RESTART").expect("FIELDCRAFT_STEP_RESTART"));
+    let (f, x_r) = ddes_backstep::f32_floor_of_restart(&file).expect("the restart's blocks");
+    println!("last blocks' x_r {x_r:?}");
+    println!("F32 FLOOR {f:?}");
+    assert!(f.ok, "the f32 floor is not met: {f:?}");
+}
+
 /// T1 itself on the device: the full-domain RANS step (`FIELDCRAFT_STEP_CELLS_PER_H`, `_MAX_STEPS`, `_CHECKPOINT`,
 /// `_PROFILE`), whose restart file and inlet profile T1s starts from.
 #[test]

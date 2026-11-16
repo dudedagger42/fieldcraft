@@ -226,6 +226,8 @@ enum Settled {
     Steady { block: usize, x_r: f64, shear: f64 },
     /// The `Blocks` acceptance on the reattachments, for scale-resolving runs.
     Blocks,
+    /// The f32 floor ([`f32_floor`]) of a run on the device, over the last [`F32_BLOCKS`] blocks.
+    F32Floor(F32Floor),
 }
 
 /// A steady run stops once the x_r of its last `STEADY_BLOCKS` completed blocks agree within
@@ -238,6 +240,73 @@ enum Settled {
 const STEADY_BLOCKS: usize = 5;
 const STEADY_X_R: f64 = 1e-5;
 const STEADY_SHEAR: f64 = 1e-4;
+
+/// The steady rule for a run on the device (f32 noise, ruled 2026-11-16: f64 keeps [`STEADY_X_R`] and [`STEADY_SHEAR`]),
+/// over the last [`F32_BLOCKS`] blocks: the x_r and each floor strip's block-mean shear have (a) no trend: the
+/// least-squares slope times the blocks is under twice the scatter about the fitted line, and (b) a scatter under a cap:
+/// 5e-5 of x_r, and 5e-4 of the largest strip's shear (provisional).
+const F32_BLOCKS: usize = 10;
+const F32_X_R_SCATTER: f64 = 5e-5;
+const F32_SHEAR_SCATTER: f64 = 5e-4;
+
+/// What the f32 floor measured over the last blocks, and whether it holds.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct F32Floor {
+    /// x_r: the fitted change over the blocks (slope × blocks), in H; the scatter about the line, in H and relative.
+    x_r_trend: f64,
+    x_r_scatter: f64,
+    x_r_scatter_rel: f64,
+    /// The largest of the strips' trend-over-scatter ratio (|slope × blocks| / scatter), and of their scatter relative
+    /// to the largest block-mean shear of any strip.
+    shear_trend_ratio: f64,
+    shear_scatter_rel: f64,
+    /// The largest strip's fitted change over the blocks, relative to the largest block-mean shear of any strip.
+    shear_trend_rel: f64,
+    /// All three tests hold.
+    pub(crate) ok: bool,
+}
+
+/// Slope × n and the standard deviation about the least-squares line of `values` (n − 2 degrees of freedom).
+fn line_fit(values: &[f64]) -> Option<(f64, f64)> {
+    let n = values.len();
+    if n < 3 || values.iter().any(|v| !v.is_finite()) {
+        return None;
+    }
+    let nf = n as f64;
+    let (mx, my) = ((nf - 1.0) / 2.0, values.iter().sum::<f64>() / nf);
+    let sxx: f64 = (0..n).map(|i| (i as f64 - mx).powi(2)).sum();
+    let sxy: f64 = values.iter().enumerate().map(|(i, v)| (i as f64 - mx) * (v - my)).sum();
+    let slope = sxy / sxx;
+    let ssr: f64 = values.iter().enumerate().map(|(i, v)| (v - my - slope * (i as f64 - mx)).powi(2)).sum();
+    Some((slope * nf, (ssr / (nf - 2.0)).sqrt()))
+}
+
+/// The f32 floor over the last [`F32_BLOCKS`] of `recent` (oldest first); none for fewer blocks.
+fn f32_floor(recent: &[(f64, Vec<f64>)]) -> Option<F32Floor> {
+    let window = recent.get(recent.len().checked_sub(F32_BLOCKS)?..)?;
+    let strips = window.first()?.1.len();
+    if window.iter().any(|(_, t)| t.len() != strips) {
+        return None;
+    }
+    let x_r: Vec<f64> = window.iter().map(|(x, _)| *x).collect();
+    let (x_r_trend, x_r_scatter) = line_fit(&x_r)?;
+    let x_r_scatter_rel = x_r_scatter / (x_r.iter().sum::<f64>() / x_r.len() as f64).abs();
+    let scale = window.iter().flat_map(|(_, t)| t).fold(0.0, |a: f64, v| a.max(v.abs()));
+    let (mut shear_trend_ratio, mut shear_scatter_rel, mut shear_trend_rel) = (0.0f64, 0.0f64, 0.0f64);
+    let mut trend_ok = x_r_trend.abs() <= 2.0 * x_r_scatter;
+    for s in 0..strips {
+        let v: Vec<f64> = window.iter().filter_map(|(_, t)| t.get(s).copied()).collect();
+        let (trend, scatter) = line_fit(&v)?;
+        trend_ok &= trend.abs() <= 2.0 * scatter;
+        if scatter > 0.0 {
+            shear_trend_ratio = shear_trend_ratio.max(trend.abs() / scatter);
+        }
+        shear_scatter_rel = shear_scatter_rel.max(scatter / scale);
+        shear_trend_rel = shear_trend_rel.max(trend.abs() / scale);
+    }
+    let ok = trend_ok && x_r_scatter_rel < F32_X_R_SCATTER && shear_scatter_rel < F32_SHEAR_SCATTER;
+    Some(F32Floor { x_r_trend, x_r_scatter, x_r_scatter_rel, shear_trend_ratio, shear_scatter_rel, shear_trend_rel, ok })
+}
 
 /// max − min of `values`.
 fn range(values: &[f64]) -> f64 {
@@ -600,7 +669,7 @@ impl Step {
                 Ok(x_r) => {
                     blocks.push(*x_r).unwrap();
                     recent.push((*x_r, floor));
-                    if recent.len() > STEADY_BLOCKS {
+                    if recent.len() > F32_BLOCKS.max(STEADY_BLOCKS) {
                         recent.remove(0);
                     }
                 }
@@ -622,7 +691,11 @@ impl Step {
                 clock.elapsed().as_secs_f64()
             );
             if steady_run {
-                steady(recent).map(|(x_r, spread)| Settled::Steady { block: shear.blocks(), x_r, shear: spread })
+                if DEVICE.get().is_some() {
+                    f32_floor(recent).filter(|f| f.ok).map(Settled::F32Floor)
+                } else {
+                    steady(recent).map(|(x_r, spread)| Settled::Steady { block: shear.blocks(), x_r, shear: spread })
+                }
             } else {
                 blocks.acceptance().accepted.then_some(Settled::Blocks)
             }
@@ -760,6 +833,17 @@ impl Step {
             println!("{line}");
         }
         if rule.is_none() {
+            if let Some(f) = f32_floor(&recent) {
+                println!(
+                    "capped (f32 floor {}): over the last {F32_BLOCKS} blocks x_r changes {:+.2e} H (scatter {:.2e} H = {:.1e}, cap {F32_X_R_SCATTER:.0e}); floor shear largest trend over scatter {:.2}, scatter {:.1e} of the largest strip (cap {F32_SHEAR_SCATTER:.0e})",
+                    if f.ok { "holds" } else { "not met" },
+                    f.x_r_trend,
+                    f.x_r_scatter,
+                    f.x_r_scatter_rel,
+                    f.shear_trend_ratio,
+                    f.shear_scatter_rel
+                );
+            }
             match steady_spreads(&recent) {
                 Some((x_r, shear)) => println!(
                     "capped: x_r spread {x_r:.1e} over the last {STEADY_BLOCKS} blocks (rule < {STEADY_X_R:.0e}: {}), floor shear spread {shear:.1e} (rule < {STEADY_SHEAR:.0e}: {})",
@@ -1348,6 +1432,10 @@ fn report(step: &Step, r: &Run) -> Score {
             r.steps
         ),
         Some(Settled::Blocks) => println!("{} steps, settled by the Blocks acceptance", r.steps),
+        Some(Settled::F32Floor(f)) => println!(
+            "{} steps, settled (f32 floor): over the last {F32_BLOCKS} blocks x_r changes {:+.2e} H along the fitted line (scatter {:.2e} H = {:.1e} of x_r, cap {F32_X_R_SCATTER:.0e}); floor shear: largest trend over scatter {:.2}, largest scatter {:.1e} of the largest strip (cap {F32_SHEAR_SCATTER:.0e})",
+            r.steps, f.x_r_trend, f.x_r_scatter, f.x_r_scatter_rel, f.shear_trend_ratio, f.shear_scatter_rel
+        ),
         None => println!("{} steps, not settled", r.steps),
     }
     println!(
@@ -2090,6 +2178,26 @@ fn the_settle_point_is_the_first_block_within_half_a_percent_of_a_fifth_earlier(
     // Step 1300 is the first whose fifth-earlier block (step 1000, running mean 6.0) agrees.
     assert_eq!(settle_point(&settling).map(|p| p.0), Some(1300));
     assert_eq!(settle_point(&[]), None);
+}
+
+/// The f32 floor over the last blocks of T1's restart file: its stored samples replayed into the blocks, the floor's
+/// x_r and strip shears of each, and the rule of [`f32_floor`] on the last [`F32_BLOCKS`]; with those blocks' x_r.
+pub(crate) fn f32_floor_of_restart(file: &std::path::Path) -> Result<(F32Floor, Vec<f64>), String> {
+    let step = sa_step_in(sa_rans(), false, 0.0);
+    let (mut flow, strips, _) = step.build();
+    let (_, samples) = load(file, &mut flow);
+    let mut shear = Shear::new(strips.len(), step.block);
+    let x: Vec<f64> = strips.iter().filter(|s| s.floor).map(|s| 0.5 * (s.x.0 + s.x.1)).collect();
+    let mut recent: Vec<(f64, Vec<f64>)> = Vec::new();
+    for sample in &samples {
+        if shear.push(sample) {
+            let floor: Vec<f64> = strips.iter().zip(shear.last_block()).filter(|(s, _)| s.floor).map(|(_, t)| t).collect();
+            let x_r = reattachment(&x, &floor).map_err(|e| format!("block {}: {e:?}", shear.blocks()))?;
+            recent.push((x_r, floor));
+        }
+    }
+    let last: Vec<f64> = recent.iter().rev().take(F32_BLOCKS).rev().map(|(x, _)| *x).collect();
+    f32_floor(&recent).map(|f| (f, last)).ok_or_else(|| format!("{} blocks, fewer than {F32_BLOCKS}", recent.len()))
 }
 
 /// The gated x_r of a finished run's restart file: the stored samples replayed into the strips'
