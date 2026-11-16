@@ -120,7 +120,12 @@ fn measure(mut flow: fieldcraft_lbm::Flow, direction: [f64; 3], along: f64, refe
 
 /// The plane channel of `width` cells (fractions allowed) turned `a:b` against the grid (b = 0: aligned), its walls
 /// offset `phase` cells, on a grid of `cells` per metre.
-fn rotated(cells: usize, (a, b): (usize, usize), phase: f64, width: f64) -> Measured {
+fn rotated(cells: usize, dir_ab: (usize, usize), phase: f64, width: f64) -> Measured {
+    rotated_with(cells, dir_ab, phase, width, LIN, false)
+}
+
+/// The same with the wall rule and the mass correction chosen.
+fn rotated_with(cells: usize, (a, b): (usize, usize), phase: f64, width: f64, walls: WallTreatment, correct: bool) -> Measured {
     let wall_min = 4.0;
     let (nx, ny, pitch, dir) = if b == 0 {
         let ny = (width + wall_min).ceil() as usize;
@@ -153,7 +158,10 @@ fn rotated(cells: usize, (a, b): (usize, usize), phase: f64, width: f64) -> Meas
     }
     // g = 12 ν U / H² in lattice units gives the exact mean speed U.
     let g_lat = 12.0 * NU_LAT * U_LAT / (width * width);
-    let flow = periodic_flow([nx, ny, nz], &obstacles, [g_lat * dir[0], g_lat * dir[1], 0.0], LIN, cells);
+    let mut flow = periodic_flow([nx, ny, nz], &obstacles, [g_lat * dir[0], g_lat * dir[1], 0.0], walls, cells);
+    if correct {
+        flow.set_wall_mass_correction(true).expect("mass correction");
+    }
     let along = if b == 0 { nx as f64 } else { ((nx * nx + ny * ny) as f64).sqrt() };
     measure(flow, [dir[0], dir[1], 0.0], along * nz as f64, U_LAT * width)
 }
@@ -397,4 +405,29 @@ fn open_channel_conserves_the_flux_between_interior_planes() {
     assert!((ratio - OPEN.0).abs() < 1e-4, "flux ratio {ratio} left its frozen value {}", OPEN.0);
     assert!((gradient - OPEN.1).abs() < BAND, "gradient error {gradient} left its frozen value {}", OPEN.1);
     assert!((rho - OPEN.2).abs() < 1e-4, "mean density {rho} left its frozen value {}", OPEN.2);
+}
+
+/// Not a gate: the width sweep in the four columns (linear and quadratic, mass correction off and spread), printed.
+#[test]
+#[ignore = "heavy: prints the sweep columns"]
+fn width_sweep_columns() {
+    for (name, walls, correct) in [
+        ("L-m0", WallTreatment::Interpolated, false),
+        ("Q-m0", WallTreatment::InterpolatedQuadratic, false),
+        ("L-m2", WallTreatment::Interpolated, true),
+        ("Q-m2", WallTreatment::InterpolatedQuadratic, true),
+    ] {
+        for cells in [8usize, 16] {
+            for k in 0..5 {
+                let width = cells as f64 + 0.25 * k as f64;
+                let m = rotated_with(cells, (1, 0), 0.0, width, walls, correct);
+                println!(
+                    "SWEEP {name} {cells} cells width {width}: flow rate {:+.4} % of exact, drift {:+.3e} per 10000 steps, {} links at half-way",
+                    100.0 * m.flow,
+                    m.drift,
+                    m.fallback
+                );
+            }
+        }
+    }
 }
