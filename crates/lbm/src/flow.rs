@@ -181,6 +181,35 @@ pub enum Target {
     Convective(f64),
 }
 
+/// The momentum the tracked wall links exchanged in one step, split by the wall's normal
+/// (lattice units, force per step): the normal part is the pressure force, the tangential part the
+/// friction.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct WallSplit {
+    /// The sum of the links' force components along their wall normals, as vectors.
+    pub normal: [f64; 3],
+    /// The sum of the links' force components in the wall, as vectors.
+    pub tangential: [f64; 3],
+}
+
+impl WallSplit {
+    /// The friction's share of the force along `direction` (a unit vector, the flow's): the
+    /// tangential part over the tangential plus the normal part, both along `direction`, each as an absolute value:
+    /// `|F_t . d| / (|F_t . d| + |F_n . d|)`; `None` when both are zero.
+    pub fn friction_share(&self, direction: [f64; 3]) -> Option<f64> {
+        let dot = |v: &[f64; 3]| (v[0] * direction[0] + v[1] * direction[1] + v[2] * direction[2]).abs();
+        let (t, n) = (dot(&self.tangential), dot(&self.normal));
+        (t + n > 0.0).then(|| t / (t + n))
+    }
+}
+
+/// The normals of the tracked links and the last step's split.
+#[derive(Debug, Clone)]
+struct WallSplitState {
+    normals: Vec<[f64; 3]>,
+    last: WallSplit,
+}
+
 /// A force group: a box face or a face of an obstacle.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Group {
@@ -627,6 +656,9 @@ pub struct Flow {
     acceleration: [f64; 3],
     /// The momentum transferred to each group in the last step (lattice units).
     forces: Vec<[f64; 3]>,
+    /// Diagnostic: the wall links' momentum exchange split into wall-normal and tangential parts
+    /// ([`Flow::track_wall_split`]).
+    wall_split: Option<WallSplitState>,
     groups: Vec<Group>,
     /// Per direction, the index offset of the neighbour a population streams from.
     offset: [isize; Q],
@@ -1755,6 +1787,7 @@ impl Flow {
             clamps: Clamps::default(),
             acceleration: setup.acceleration,
             forces: vec![[0.0; 3]; groups.len()],
+            wall_split: None,
             groups,
             offset,
             fluid_cells,
@@ -2299,6 +2332,44 @@ impl Flow {
     /// The momentum each group received in the last step (lattice units: force per step).
     pub fn forces(&self) -> &[[f64; 3]] {
         &self.forces
+    }
+
+    /// Start splitting the momentum exchange of the bounce-back links into the obstacles `bodies` into
+    /// its wall-normal and tangential parts at every step, read with [`Flow::wall_split`]. The wall's
+    /// normal at a link is the surface normal where the segment from the fluid cell towards the solid
+    /// one meets the surface (the half-way point where it meets none). Returns the number of links
+    /// tracked. Not counted: the wall model's and the on-node bounce's shares (their momentum is
+    /// tangential by construction). Read only: the flow itself is not changed.
+    pub fn track_wall_split(&mut self, obstacles: &[Obstacle], bodies: &[&str]) -> Result<usize> {
+        let h = self.grid.spacing;
+        let trees: Vec<(Option<TriangleTree>, bool)> =
+            obstacles.iter().map(|o| (Some(TriangleTree::new(&o.surface)), bodies.contains(&o.body.as_str()))).collect();
+        let mut normals = vec![[0.0; 3]; self.links.len()];
+        let mut tracked = 0usize;
+        for (i, link) in self.links.iter().enumerate() {
+            let Rule::Bounce { group, .. } = link.rule else { continue };
+            let Some(body) = self.groups.get(group as usize).and_then(|g| g.body.as_deref()) else { continue };
+            let Some(k) = obstacles.iter().position(|o| o.body == body) else { continue };
+            let Some((Some(tree), true)) = trees.get(k).map(|t| (t.0.as_ref(), t.1)) else { continue };
+            let (p0, cq) = (self.grid.centre(link.cell as usize), c(link.q as usize));
+            let p1 = [0, 1, 2].map(|a| p0[a] - cq[a] * h);
+            let t = tree.first_hit(p0, p1).unwrap_or(0.5);
+            let hit = [0, 1, 2].map(|a| p0[a] + t * (p1[a] - p0[a]));
+            if let Some((_, n)) = tree.nearest_surface(hit)
+                && let Some(slot) = normals.get_mut(i)
+            {
+                *slot = n;
+                tracked += 1;
+            }
+        }
+        self.wall_split = Some(WallSplitState { normals, last: WallSplit::default() });
+        Ok(tracked)
+    }
+
+    /// The tracked links' momentum exchange at the last step, split into its wall-normal and
+    /// tangential parts (lattice units: force per step), or `None` before [`Flow::track_wall_split`].
+    pub fn wall_split(&self) -> Option<WallSplit> {
+        self.wall_split.as_ref().map(|s| s.last)
     }
 
     /// Obstacles that cover no cell centre.
@@ -3561,6 +3632,36 @@ impl Flow {
                 Rule::Pull { .. } | Rule::Open => {}
             }
         }
+        // The tracked links' exchange split by the wall normal (a diagnostic, [`Flow::track_wall_split`]).
+        if let Some(split) = &mut self.wall_split {
+            split.last = WallSplit::default();
+            let mut add = |link: usize, q: usize, amount: f64| {
+                let Some(n) = split.normals.get(link).copied().filter(|n| *n != [0.0; 3]) else { return };
+                let cq = c(q);
+                // The force of the link: -c_q times what it exchanged.
+                let f = [-cq[0] * amount, -cq[1] * amount, -cq[2] * amount];
+                let fn_ = f[0] * n[0] + f[1] * n[1] + f[2] * n[2];
+                for a in 0..3 {
+                    split.last.normal[a] += fn_ * n[a];
+                    split.last.tangential[a] += f[a] - fn_ * n[a];
+                }
+            };
+            for (i, link) in self.links.iter().enumerate() {
+                if let Rule::Bounce { du, .. } = link.rule {
+                    let (cell, q) = (link.cell as usize, link.q as usize);
+                    let out = self.f[opposite(q) * s + cell];
+                    add(i, q, out + out + du * self.wall_ramp);
+                }
+            }
+            if let Some(ip) = &self.interpolated {
+                for e in ip.entries() {
+                    let (cell, q) = (e.cell as usize, usize::from(e.dir));
+                    if let Some(v) = crate::interpolated::Interpolated::incoming(e, &self.f, s) {
+                        add(e.link as usize, q, v - self.f[opposite(q) * s + cell]);
+                    }
+                }
+            }
+        }
         // An interpolated link returns another population than the half-way one counted above.
         if let Some(ip) = &self.interpolated {
             for e in ip.entries() {
@@ -3877,6 +3978,7 @@ impl crate::backend::Backend for Flow {
             absorbing,
             surface,
             interpolated: _,
+            wall_split: _,
             force_half_way_above: _,
         } = self;
         let n = *n;
