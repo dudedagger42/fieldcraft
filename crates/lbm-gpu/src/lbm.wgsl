@@ -279,7 +279,7 @@ struct Params {
 // wall distance (y, from the host; negative outside DDES's zone), destruction length (z: d, or DDES's d̃, `sa_prepare`) and
 // DDES's shielding f_d (w, 0 without DDES).
 @group(0) @binding(27) var<storage, read_write> nu_tilde: array<f32>;
-@group(0) @binding(28) var<storage, read_write> sa_rates: array<vec2<f32>>;
+@group(0) @binding(28) var<storage, read_write> sa_rates: array<vec4<f32>>;
 @group(0) @binding(29) var<storage, read_write> sa_cell: array<vec4<f32>>;
 // Per cell: x the share a wall node hands to each target per unit of lattice weight (its delta
 // over W), y 1 where the cell takes mass back.
@@ -1417,7 +1417,7 @@ fn sa_side(p: vec3<i32>, d: vec3<i32>, face: u32) -> vec2<u32> {
 
 // One face of SaField::rate: the face value's contribution to the rate and the coefficient sum
 // (x, y, with z = 1 when the face has a value) and the slope per half spacing (w).
-fn sa_face(side: vec2<u32>, v: f32, uc: f32, axis: u32, sign: f32, nu: f32, eta_c: f32) -> vec4<f32> {
+fn sa_face(side: vec2<u32>, v: f32, uc: f32, axis: u32, sign: f32, nu: f32, eta_c: f32, inflow: f32) -> vec4<f32> {
     var face = 0.0;
     var un = 0.0;
     var d = 0.0;
@@ -1440,7 +1440,6 @@ fn sa_face(side: vec2<u32>, v: f32, uc: f32, axis: u32, sign: f32, nu: f32, eta_
             d = 0.5 * (eta_c + nu) / SA_SIGMA;
         }
         case 2u: {
-            let inflow = bitcast<f32>(params.sa.y);
             slope = 2.0 * (inflow - v);
             face = inflow;
             un = uc * sign;
@@ -1473,18 +1472,21 @@ fn sa_rate(@builtin(local_invocation_index) lid: u32, @builtin(workgroup_id) wg:
     speed[lid] = 0.0;
     if SA && cell < params.n {
         var out = vec2<f32>(0.0);
+        // z of a cell's slot is its own inflow ν̃ (a tabulated inlet), below 0 for the face value.
+        let own = sa_rates[cell].z;
         if is_fluid(cell) {
             let nu = params.smag.w;
+            let inflow = select(bitcast<f32>(params.sa.y), own, own >= 0.0);
             let v = nu_tilde[cell];
             let uc = velocity_of(cell);
             let eta_c = sa_diffusivity(v, nu);
             let p = coords(cell);
-            let xm = sa_face(sa_side(p, vec3<i32>(-1, 0, 0), 0u), v, uc.x, 0u, -1.0, nu, eta_c);
-            let xp = sa_face(sa_side(p, vec3<i32>(1, 0, 0), 1u), v, uc.x, 0u, 1.0, nu, eta_c);
-            let ym = sa_face(sa_side(p, vec3<i32>(0, -1, 0), 2u), v, uc.y, 1u, -1.0, nu, eta_c);
-            let yp = sa_face(sa_side(p, vec3<i32>(0, 1, 0), 3u), v, uc.y, 1u, 1.0, nu, eta_c);
-            let zm = sa_face(sa_side(p, vec3<i32>(0, 0, -1), 4u), v, uc.z, 2u, -1.0, nu, eta_c);
-            let zp = sa_face(sa_side(p, vec3<i32>(0, 0, 1), 5u), v, uc.z, 2u, 1.0, nu, eta_c);
+            let xm = sa_face(sa_side(p, vec3<i32>(-1, 0, 0), 0u), v, uc.x, 0u, -1.0, nu, eta_c, inflow);
+            let xp = sa_face(sa_side(p, vec3<i32>(1, 0, 0), 1u), v, uc.x, 0u, 1.0, nu, eta_c, inflow);
+            let ym = sa_face(sa_side(p, vec3<i32>(0, -1, 0), 2u), v, uc.y, 1u, -1.0, nu, eta_c, inflow);
+            let yp = sa_face(sa_side(p, vec3<i32>(0, 1, 0), 3u), v, uc.y, 1u, 1.0, nu, eta_c, inflow);
+            let zm = sa_face(sa_side(p, vec3<i32>(0, 0, -1), 4u), v, uc.z, 2u, -1.0, nu, eta_c, inflow);
+            let zp = sa_face(sa_side(p, vec3<i32>(0, 0, 1), 5u), v, uc.z, 2u, 1.0, nu, eta_c, inflow);
             var rate = xm.x + xp.x + ym.x + yp.x + zm.x + zp.x;
             let coef = xm.y + xp.y + ym.y + yp.y + zm.y + zp.y;
             rate = rate + SA_CB2 / SA_SIGMA * (sa_grad2(xm, xp) + sa_grad2(ym, yp) + sa_grad2(zm, zp));
@@ -1492,7 +1494,7 @@ fn sa_rate(@builtin(local_invocation_index) lid: u32, @builtin(workgroup_id) wg:
             // A coefficient that is not a number shows as the largest bits (NaN above +inf).
             speed[lid] = select(bitcast<f32>(0x7fc00000u), coef, coef == coef);
         }
-        sa_rates[cell] = out;
+        sa_rates[cell] = vec4<f32>(out, own, 0.0);
     }
     workgroupBarrier();
     for (var k = 128u; k > 0u; k = k >> 1u) {

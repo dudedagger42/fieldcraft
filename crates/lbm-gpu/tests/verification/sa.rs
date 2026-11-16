@@ -838,3 +838,50 @@ fn the_model_on_han_s_wall_is_deterministic_on_its_device() {
         assert!(a == b);
     }
 }
+
+/// [`inflow_channel`] with the inlet read from a table along y (`rows`: coordinate, factor and
+/// ν̃/ν), or the uniform inlet with inflow ratio `ratio` when `rows` is empty.
+fn tabulated_channel(collision: Collision, steps: f64, rows: &[[f64; 3]], ratio: f64) -> Model {
+    let mut m = inflow_channel(collision, steps, ratio);
+    if !rows.is_empty() {
+        let table = fieldcraft_model::InflowTable { axis: fieldcraft_model::fluid_zones::Axis::Y, rows: rows.to_vec() };
+        let mut d = m.fluid_domain("Flow").cloned().expect("the model's domain");
+        d.faces.x_min = FaceCondition::Velocity { velocity: [0.05, 0.0, 0.0], profile: Profile::Table };
+        d.inflow_table = Some(table);
+        m.replace_fluid_domain("Flow", d).expect("the table channel");
+    }
+    m
+}
+
+/// A tabulated inlet on the device: a table holding one constant is the uniform inlet bit for bit
+/// on the GPU too (velocities, densities and ν̃), and a sloped table with a ν̃/ν that changes
+/// across the inlet follows the CPU within the coupled channel's bounds (5e-5 ν̃, 1e-4 / 1e-5
+/// velocity and density).
+#[test]
+fn a_tabulated_inlet_follows_the_uniform_one_and_the_cpu() {
+    let steps = 200.0;
+    let state = |m: &Model| -> Option<(Vec<u32>, Vec<u32>)> {
+        let (setup, flow) = prepare(m, &[]);
+        let mut gpu = gpu(&flow, Streaming::InPlace)?;
+        gpu.advance(setup.steps).unwrap();
+        let f = gpu.fields().unwrap();
+        let bits = |v: Vec<f64>| v.into_iter().map(|x| (x as f32).to_bits()).collect::<Vec<_>>();
+        let nu = gpu.nu_tilde().unwrap().unwrap();
+        Some((bits(f.velocity.iter().flat_map(|u| u.iter().copied()).chain(f.density.iter().copied()).collect()), bits(nu)))
+    };
+    let uniform = state(&tabulated_channel(Collision::Trt, steps, &[], 3.0));
+    let constant = state(&tabulated_channel(Collision::Trt, steps, &[[0.5, 1.0, 3.0]], 3.0));
+    assert_eq!(uniform, constant, "a constant table is the uniform inlet on the device");
+    let rows = [[0.0, 0.5, 2.0], [0.5, 1.0, 4.0], [1.0, 1.5, 6.0]];
+    let m = tabulated_channel(Collision::Trt, steps, &rows, 3.0);
+    let (setup, mut cpu) = prepare(&m, &[]);
+    let Some(mut gpu) = gpu(&cpu, Streaming::InPlace) else { return };
+    cpu.set_sa_substeps(Some(4));
+    gpu.fix_sa_substeps(Some(4)).unwrap();
+    cpu.advance(setup.steps).unwrap();
+    gpu.advance(setup.steps).unwrap();
+    let (du, drho) = field_difference(&mut cpu, &mut gpu);
+    let (dnu, scale) = nu_tilde_difference(&mut cpu, &mut gpu);
+    println!("tabulated inlet, CPU against GPU after {} steps: velocity {du:.2e}, density {drho:.2e}, ν̃ {dnu:.2e} of {scale:.3e}", setup.steps);
+    assert!(du < 1e-4 && drho < 1e-5 && dnu < 5e-5, "{du} {drho} {dnu}");
+}
