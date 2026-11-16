@@ -987,6 +987,11 @@ impl GpuFlow {
         for (cell, flag) in fluid_u32.iter_mut().enumerate() {
             *flag = u32::from(flow.is_fluid(cell));
         }
+        if sa_faces.is_some() && flow.ddes_zone().is_some() {
+            return Err(Error::Invalid(
+                "not supported yet: DDES zone on the GPU (the device would run DDES in every cell); solve on the CPU (`backend: \"cpu\"`)".into(),
+            ));
+        }
         let zones = crate::zones::append(flow, &mut fluid_u32)?;
         if sa_faces.is_some() && zones.zones > 0 {
             return Err(Error::Invalid(

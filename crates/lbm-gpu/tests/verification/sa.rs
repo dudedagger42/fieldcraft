@@ -387,6 +387,27 @@ fn ddes_shielding_follows_the_cpu() {
     assert!(failed.is_empty(), "{failed:?}");
 }
 
+/// A DDES zone is not on the device yet: a flow with one is refused, not run with DDES in every cell.
+#[test]
+fn a_ddes_zone_is_refused_on_the_gpu_until_it_runs_there() {
+    let mut m = forced_channel(Collision::Trt, 400.0, 180.0);
+    let mut step = m.step("Run").cloned().unwrap();
+    if let Procedure::Fluid { turbulence, .. } = &mut step.procedure {
+        let zone = fieldcraft_model::DdesZone { min: [-1.0e3; 3], max: [1.0e3; 3] };
+        *turbulence = Some(Turbulence::SpalartAllmaras {
+            prandtl: 0.9,
+            wall_model: None,
+            inflow_ratio: 3.0,
+            ddes: Some(fieldcraft_model::Ddes { c_des: 0.65, zone: Some(zone) }),
+        });
+    }
+    m.replace_step(step).unwrap();
+    let (_, flow) = prepare(&m, &[]);
+    let e = GpuFlow::with_options(&flow, Policy::from_env().expect("FIELDCRAFT_GPU names a policy"), Options::default()).err().map(|e| e.to_string());
+    println!("DDES zone: {e:?}");
+    assert!(e.as_deref().is_some_and(|e| e.contains("DDES zone") && e.contains("not supported yet") && e.contains("cpu")), "{e:?}");
+}
+
 /// The model on Han, Ooka and Kikumoto's on-node wall (`spalding_bounce`), inflow ν̃/ν 3.
 fn on_han() -> Turbulence {
     sa(3.0, Some(WallModel::SpaldingBounce))
