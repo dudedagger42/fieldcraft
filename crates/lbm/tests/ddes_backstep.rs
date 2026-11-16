@@ -53,6 +53,53 @@ use fieldcraft_lbm::statistics::Blocks;
 use fieldcraft_lbm::{Flow, Grid, Limits, Obstacle};
 use fieldcraft_model::{AbsorbingLayer, BoxFaces, Collision, FaceCondition, HrrSigma, Outflow, Procedure, Turbulence, WallModel};
 
+/// What steps a run on a device: from the built CPU flow (already holding any carried-in field), a
+/// device backend. A test binary that links one (the GPU crate's `step_study`) sets it; then every
+/// [`Step::run`] steps the device, reads the wall shear from it each step and mirrors its fields (and ν̃)
+/// into the CPU flow at each sample, so the statistics, the restart file and the reports are the same code.
+#[allow(dead_code)]
+pub(crate) type DeviceFactory = Box<dyn Fn(&Flow) -> Result<Box<dyn Backend>, String> + Send + Sync>;
+#[allow(dead_code)]
+pub(crate) static DEVICE: std::sync::OnceLock<DeviceFactory> = std::sync::OnceLock::new();
+
+/// The device's density, velocity and ν̃ set in the CPU flow (equilibrium populations at that state).
+fn mirror(flow: &mut Flow, device: &mut dyn Backend, for_save: bool) -> Result<(), String> {
+    let f = device.fields().map_err(|e| format!("device fields: {e}"))?;
+    flow.set_equilibrium(|c| match (f.density.get(c), f.velocity.get(c)) {
+        (Some(r), Some(u)) if r.is_finite() && *r > 0.0 && u.iter().all(|v| v.is_finite()) => (*r, *u),
+        _ => (1.0, [0.0; 3]),
+    });
+    let bad_rho = f.density.iter().filter(|v| !v.is_finite()).count();
+    let bad_u = f.velocity.iter().filter(|u| !u.iter().all(|v| v.is_finite())).count();
+    if let Some(nu) = device.nu_tilde().map_err(|e| format!("device nu-tilde: {e}"))? {
+        let bad_nu = nu.iter().filter(|v| !v.is_finite()).count();
+        if bad_rho + bad_u + bad_nu > 0 {
+            println!("mirror: non-finite device cells: density {bad_rho}, velocity {bad_u}, nu-tilde {bad_nu} of {}", nu.len());
+        }
+        let clean: Vec<f64> = nu.iter().map(|v| if v.is_finite() { *v } else { 0.0 }).collect();
+        flow.set_sa_nu_tilde(&clean).map_err(|e| format!("setting nu-tilde: {e}"))?;
+    }
+    // A flow that never stepped holds the derived fields (eddy viscosity, cell velocity, ...) unset: one CPU step fills
+    // them so the restart file is whole (the step moves the state by one step, the device's run is unchanged).
+    if for_save {
+        flow.step().map_err(|e| format!("settling step of the mirrored flow: {e}"))?;
+        let bad =
+            (0..flow.grid().len()).filter(|c| flow.moments(*c).is_some_and(|(r, u)| !r.is_finite() || !u.iter().all(|v| v.is_finite()))).count();
+        let bad_sa = flow.spalart_allmaras().map(|s| s.nu_tilde().iter().filter(|v| !v.is_finite()).count()).unwrap_or(0);
+        println!("mirror for save: non-finite cells after the settling step: moments {bad}, nu-tilde {bad_sa}");
+    }
+    Ok(())
+}
+
+/// The GPU's memory in use now (`nvidia-smi`), printed with a label; the number in MiB or None.
+fn device_memory(label: &str) -> Option<f64> {
+    let out =
+        std::process::Command::new("nvidia-smi").args(["--query-gpu=memory.used,memory.total", "--format=csv,noheader,nounits"]).output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    println!("device memory {label} (used, total MiB): {text}");
+    text.split(',').next().and_then(|v| v.trim().parse().ok())
+}
+
 /// The step model's parameters (lengths in units of H, inlet speed 1).
 #[derive(Debug, Clone)]
 struct Step {
@@ -381,6 +428,13 @@ impl Step {
         };
         d.initial_velocity = [1.0, 0.0, 0.0];
         d.absorbing = self.absorbing;
+        // `FIELDCRAFT_STEP_INLET_TABLE`: a profile file (`z/H u/U_ref nu_tilde/nu`, as `write_profile` writes it) as
+        // the inlet's tabulated profile: the incoming boundary layer of a full domain on the short one.
+        if let Some(path) = std::env::var_os("FIELDCRAFT_STEP_INLET_TABLE") {
+            let rows = read_inlet_table(std::path::Path::new(&path)).unwrap_or_else(|e| panic!("the inlet table: {e}"));
+            d.faces.x_min = FaceCondition::Velocity { velocity: [1.0, 0.0, 0.0], profile: fieldcraft_model::Profile::Table };
+            d.inflow_table = Some(fieldcraft_model::InflowTable { axis: fieldcraft_model::fluid_zones::Axis::Z, rows });
+        }
         let strips = self.strips();
         let (y0, y1) = (-h, width + h);
         let mut obstacles: Vec<Obstacle> = strips
@@ -577,16 +631,34 @@ impl Step {
             }
             samples = kept;
         }
+        let mut device: Option<Box<dyn Backend>> = match DEVICE.get() {
+            Some(make) => Some(make(&flow)?),
+            None => None,
+        };
+        let mut peak_device = 0.0f64;
+        if let Some(d) = device.as_ref() {
+            println!("stepping on the device: {}", d.name());
+            peak_device = peak_device.max(device_memory("at the start").unwrap_or(0.0));
+        }
         while steps < self.max_steps && rule.is_none() {
             steps += 1;
-            flow.step().map_err(|e| format!("step {steps}: {e}"))?;
+            match device.as_mut() {
+                Some(d) => d.advance(1).map_err(|e| format!("step {steps}: {e}"))?,
+                None => flow.step().map_err(|e| format!("step {steps}: {e}"))?,
+            }
             if steps <= startup {
                 if let Some(path) = self.checkpoint.as_ref().filter(|_| steps.is_multiple_of(CHECKPOINT_STEPS)) {
+                    if let Some(d) = device.as_mut() {
+                        mirror(&mut flow, d.as_mut(), true)?;
+                    }
                     save(path, &mut flow, steps, &samples, Some(&window));
                 }
                 continue;
             }
-            let forces = flow.forces();
+            let forces: Vec<[f64; 3]> = match device.as_mut() {
+                Some(d) => d.forces().map_err(|e| format!("step {steps}: {e}"))?,
+                None => flow.forces().to_vec(),
+            };
             for (s, g) in groups.iter().enumerate() {
                 interval[s] += g.iter().map(|&g| forces.get(g).map_or(f64::NAN, |f| f[0])).sum::<f64>() / areas[s];
             }
@@ -602,6 +674,12 @@ impl Step {
                 ));
             }
             interval.iter_mut().for_each(|v| *v = 0.0);
+            if let Some(d) = device.as_mut() {
+                mirror(&mut flow, d.as_mut(), false)?;
+                if steps.is_multiple_of(CHECKPOINT_STEPS) {
+                    peak_device = peak_device.max(device_memory(&format!("at step {steps}")).unwrap_or(0.0));
+                }
+            }
             let rhos: Vec<f64> = (0..4.min(nx))
                 .flat_map(|i| (0..nz).flat_map(move |k| (0..ny).map(move |j| [i, j, k])))
                 .filter_map(|c| flow.moments(grid.index(c)).map(|m| m.0 - 1.0))
@@ -622,6 +700,11 @@ impl Step {
             }
         }
         // The end of the run is saved too, so a run that stops between two checkpoints leaves its field.
+        if let Some(d) = device.as_mut() {
+            mirror(&mut flow, d.as_mut(), true)?;
+            peak_device = peak_device.max(device_memory("at the end").unwrap_or(0.0));
+            println!("device memory peak over the run's readings: {peak_device:.0} MiB");
+        }
         if let Some(path) = self.checkpoint.as_ref() {
             save(path, &mut flow, steps, &samples, Some(&window));
         }
@@ -1461,6 +1544,20 @@ pub(crate) fn built_sa_step() -> (Flow, String) {
     (flow, format!("{step:?}"))
 }
 
+/// A small short-domain SA-DDES step in T3's zone (`cells_per_h` per H, `span` H across), built: what the device's
+/// zone-mask parity test steps on the CPU and on the device side by side.
+#[allow(dead_code)]
+pub(crate) fn built_zone_step(cells_per_h: usize, span: f64) -> (Flow, String) {
+    let Turbulence::SpalartAllmaras { prandtl, wall_model, inflow_ratio, .. } = sa_rans() else { panic!("sa_rans is Spalart–Allmaras") };
+    let h = 1.0 / cells_per_h as f64;
+    let zone = fieldcraft_model::DdesZone { min: [-1.0, -1.0, -h], max: [12.0, span + 1.0, 3.0] };
+    let ddes =
+        Turbulence::SpalartAllmaras { prandtl, wall_model, inflow_ratio, ddes: Some(fieldcraft_model::Ddes { c_des: 0.65, zone: Some(zone) }) };
+    let step = Step { cells_per_h, upstream: 4.0 + 2.0 / cells_per_h as f64, ..sa_step_in(ddes, true, span) };
+    let (flow, _, _) = step.build();
+    (flow, format!("{step:?}"))
+}
+
 /// The SA run's model: on Han's on-node wall with the model's own law, or with Spalding's with
 /// `FIELDCRAFT_WALL_LAW=spalding` ([`study_wall_law`]; the law is printed).
 fn sa_rans() -> Turbulence {
@@ -1604,6 +1701,21 @@ fn write_profile(path: &std::path::Path, flow: &Flow, step: &Step) -> Result<(),
     std::fs::write(path, text).map_err(|e| format!("{}: {e}", path.display()))
 }
 
+/// The rows `[z, u/U_ref, nu_tilde/nu]` of a profile file ([`write_profile`]): comment lines skipped.
+fn read_inlet_table(path: &std::path::Path) -> Result<Vec<[f64; 3]>, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut rows = Vec::new();
+    for line in text.lines().filter(|l| !l.trim().is_empty() && !l.starts_with('#')) {
+        let v: Vec<f64> = line.split_whitespace().filter_map(|w| w.parse().ok()).collect();
+        let [z, u, t] = v[..] else { return Err(format!("{}: `{line}` is not three numbers", path.display())) };
+        rows.push([z, u, t]);
+    }
+    if rows.is_empty() {
+        return Err(format!("{}: no rows", path.display()));
+    }
+    Ok(rows)
+}
+
 /// The gate reading from the flow field: x_r is the wall (y = 0) value of the least-squares line
 /// through the u = 0 crossings of rows 2, 3 and 4 (row 1, the wall-modelled row, reads long on
 /// every grid and is reported beside it). No variant is picked by its nearness to the experiment.
@@ -1726,7 +1838,7 @@ fn a_restart_files_readings() {
 /// `FIELDCRAFT_THREADS=5 cargo test --release -p fieldcraft-lbm --test ddes_backstep sa_rans_on_han_s_wall -- --ignored --nocapture`.
 #[test]
 #[ignore = "hours: tests/oracle/ddes-backstep-driver-seegmiller/README.md"]
-fn sa_rans_on_han_s_wall_reattaches_where_measured() {
+pub(crate) fn sa_rans_on_han_s_wall_reattaches_where_measured() {
     let sa = sa_rans();
     let steps = std::env::var("FIELDCRAFT_STEP_MAX_STEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(400_000);
     let checkpoint = std::env::var_os("FIELDCRAFT_STEP_CHECKPOINT").map(std::path::PathBuf::from);
@@ -1959,7 +2071,7 @@ fn restart_x_r(step: &Step, file: &std::path::Path) -> Result<f64, String> {
 /// `FIELDCRAFT_STEP_RESTART=<copy> FIELDCRAFT_STEP_CELLS_PER_H=24 cargo test --release -p fieldcraft-lbm --test ddes_backstep t1s -- --ignored --nocapture`.
 #[test]
 #[ignore = "hours: the short step from T1's field, FIELDCRAFT_STEP_RESTART"]
-fn t1s_the_short_step_from_t1s_field_reattaches_with_t1() {
+pub(crate) fn t1s_the_short_step_from_t1s_field_reattaches_with_t1() {
     let file = std::path::PathBuf::from(std::env::var("FIELDCRAFT_STEP_RESTART").expect("FIELDCRAFT_STEP_RESTART"));
     let sa = sa_rans();
     let t1 = sa_step_in(sa, false, 0.0);
@@ -1988,7 +2100,7 @@ fn t1s_the_short_step_from_t1s_field_reattaches_with_t1() {
 /// `FIELDCRAFT_STEP_RESTART=<copy> FIELDCRAFT_STEP_CELLS_PER_H=24 FIELDCRAFT_STEP_SPAN=4 cargo test --release -p fieldcraft-lbm --test ddes_backstep t2 -- --ignored --nocapture`.
 #[test]
 #[ignore = "hours: the extruded short step from T1s's field, FIELDCRAFT_STEP_RESTART"]
-fn t2_the_extruded_short_step_keeps_t1s_reattachment() {
+pub(crate) fn t2_the_extruded_short_step_keeps_t1s_reattachment() {
     let file = std::path::PathBuf::from(std::env::var("FIELDCRAFT_STEP_RESTART").expect("FIELDCRAFT_STEP_RESTART"));
     let span: f64 = std::env::var("FIELDCRAFT_STEP_SPAN").ok().and_then(|v| v.parse().ok()).unwrap_or(4.0);
     let sa = sa_rans();
@@ -2066,7 +2178,7 @@ fn a_restart_writes_its_profile() {
 /// `FIELDCRAFT_STEP_RESTART=<copy> FIELDCRAFT_STEP_CELLS_PER_H=24 FIELDCRAFT_STEP_SPAN=4 cargo test --release -p fieldcraft-lbm --test ddes_backstep t3 -- --ignored --nocapture`.
 #[test]
 #[ignore = "hours: the DDES study from T2's restart, FIELDCRAFT_STEP_RESTART"]
-fn t3_ddes_in_the_zone_from_t2s_field_reports_x_r_with_its_error() {
+pub(crate) fn t3_ddes_in_the_zone_from_t2s_field_reports_x_r_with_its_error() {
     let file = std::path::PathBuf::from(std::env::var("FIELDCRAFT_STEP_RESTART").expect("FIELDCRAFT_STEP_RESTART"));
     let span: f64 = std::env::var("FIELDCRAFT_STEP_SPAN").ok().and_then(|v| v.parse().ok()).unwrap_or(4.0);
     let checkpoint = std::env::var_os("FIELDCRAFT_STEP_CHECKPOINT").map(std::path::PathBuf::from);
