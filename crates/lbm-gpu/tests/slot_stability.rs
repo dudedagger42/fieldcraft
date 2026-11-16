@@ -917,7 +917,9 @@ fn slotted_channel_stability() {
                 // times the duct's fluid cross-section at x 0.4; 1 within about 2 % or the share is untrusted.
                 if let Some(w) = split_avg {
                     let section = (0..nz).flat_map(|k| (0..ny).map(move |j| (j, k))).filter(|&(j, k)| fluid[grid.index([at(0.4), j, k])]).count();
-                    let force = w.tangential[0].abs() + w.normal[0].abs();
+                    // the force along the flow is the SUM of the tangential and normal parts (signed): |t| + |n| counts a reverse-flow
+                    // (negative) tangential part twice
+                    let force = (w.tangential[0] + w.normal[0]).abs();
                     // the momentum balance of the same two planes: the force on the plates = the drop of the section sums of p + rho u_x^2
                     let mom = |i: usize| -> f64 {
                         let i = i.min(nx.saturating_sub(1));
@@ -936,7 +938,9 @@ fn slotted_channel_stability() {
                     let drop_m = mom(i0) - mom(i1);
                     let closure = force / drop_m.abs().max(1e-300);
                     println!(
-                        "CLOSURE wall force / [drop of the static pressure x section + the momentum flux difference] = {closure:.4} (force {force:.4e}; sum over the {section} fluid cells of p + rho u_x^2: planes x {:.3} m and x {:.3} m, drop {drop_m:.4e}){}",
+                        "CLOSURE wall force / [drop of the static pressure x section + the momentum flux difference] = {closure:.4} (force {force:.4e} = |tangential {:+.4e} + normal {:+.4e}| along the flow, all tracked links; sum over the {section} fluid cells of p + rho u_x^2: planes x {:.3} m and x {:.3} m, drop {drop_m:.4e}){}",
+                        w.tangential[0],
+                        w.normal[0],
                         dx * (i0 as f64 + 0.5) - ext_up,
                         dx * (i1 as f64 + 0.5) - ext_up,
                         if (closure - 1.0).abs() > 0.02 { "  UNTRUSTED: not within 2 % of 1" } else { "" }
