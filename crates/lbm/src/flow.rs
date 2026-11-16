@@ -890,6 +890,11 @@ impl Flow {
                             w *= 4.0 * s * (1.0 - s);
                         }
                     }
+                    if profile == Profile::Table
+                        && let Some(t) = &domain.inflow_table
+                    {
+                        w = t.at(grid.centre(grid.index(ijk)).get(t.axis.index()).copied().unwrap_or(0.0)).0;
+                    }
                     w
                 };
                 let is_wall = |ijk: [usize; 3], t: usize, up: bool| -> bool {
@@ -1282,6 +1287,8 @@ impl Flow {
         // otherwise the first in `BoxFace::ALL` order (x_min, x_max, y_min, …). Its populations
         // from outside the other faces keep the placeholder, the bounce-back of its own.
         let mut open = Vec::new();
+        // The cells of a tabulated inlet and their inflow ν̃/ν, for the Spalart–Allmaras model.
+        let mut table_inflow: Vec<(usize, f64)> = Vec::new();
         let mut taken = filled(n, false, "open cells")?;
         let velocity_first = |f: &BoxFace| !matches!(domain.faces.get(*f), FaceCondition::Velocity { .. });
         let mut faces = BoxFace::ALL;
@@ -1322,6 +1329,13 @@ impl Flow {
                                     let s = (ijk[t] as f64 + 0.5) / grid.cells[t] as f64;
                                     scale *= 4.0 * s * (1.0 - s);
                                 }
+                            }
+                            if profile == Profile::Table
+                                && let Some(t) = &domain.inflow_table
+                            {
+                                let (factor, ratio) = t.at(grid.centre(cell).get(t.axis.index()).copied().unwrap_or(0.0));
+                                scale = factor;
+                                table_inflow.push((cell, ratio));
                             }
                             if profile == Profile::Radial {
                                 let [x, y, z] = grid.centre(cell);
@@ -1670,7 +1684,10 @@ impl Flow {
                 let caps = crate::Limits { max_cells: crate::Limits::MAX_ADDRESSABLE_CELLS, ..crate::Limits::default() };
                 let distance = crate::distance::WallDistance::new(&grid, mask, &surface, periodic, &caps)?;
                 let inflow = sa.inflow_ratio * nu;
-                let field = SaField::new(sides, mask.to_vec(), inflow, inflow)?;
+                let mut field = SaField::new(sides, mask.to_vec(), inflow, inflow)?;
+                if !table_inflow.is_empty() {
+                    field.set_inflow_cells(table_inflow.iter().map(|&(cell, ratio)| (cell, ratio * nu)).collect())?;
+                }
                 let law = if on_node { Some(node_law) } else { (setup.wall_model == Some(WallModel::Musker)).then_some(crate::sa::WallLaw::Musker) };
 
                 let ddes = match sa.c_des {

@@ -365,6 +365,9 @@ pub struct SaField {
     sides: Vec<[Side; 6]>,
     fluid: Vec<bool>,
     inflow: f64,
+    /// Cells whose inflow ν̃ is their own (a tabulated inlet), sorted by cell; every other inflow
+    /// cell reads `inflow`.
+    inflow_cells: Vec<(u32, f64)>,
     /// Scratch of [`SaField::advance`], kept for its capacity: each cell's transport rate and
     /// coefficient sum, and the next sub-step's ν̃.
     rates: Vec<(f64, f64)>,
@@ -402,7 +405,7 @@ impl SaField {
         }
         let rates = crate::flow::filled(n, (0.0, 0.0), "Spalart–Allmaras rates")?;
         let next = crate::flow::filled(n, 0.0, "Spalart–Allmaras ν̃")?;
-        Ok(SaField { nu_tilde, sides, fluid, inflow, rates, next })
+        Ok(SaField { nu_tilde, sides, fluid, inflow, inflow_cells: Vec::new(), rates, next })
     }
 
     /// A field on a box of `dims` cells (x fastest), `fluid` per cell, each box face of `faces`
@@ -462,6 +465,34 @@ impl SaField {
         self.inflow
     }
 
+    /// Give cells their own inflow ν̃ (a tabulated inlet: `(cell, ν̃)`), which they read at their
+    /// inflow faces instead of [`SaField::inflow`]. Refused unless every cell is in the field and
+    /// listed once, and every value is finite and not negative.
+    pub fn set_inflow_cells(&mut self, mut cells: Vec<(usize, f64)>) -> crate::Result<()> {
+        cells.sort_by_key(|c| c.0);
+        let n = self.fluid.len();
+        if cells.iter().any(|&(c, v)| c >= n || !(v.is_finite() && v >= 0.0)) || cells.windows(2).any(|w| w[0].0 == w[1].0) {
+            return Err(crate::Error::Invalid(
+                "Spalart–Allmaras: the inflow ν̃ of a cell must be finite, not negative and given once, for a cell of the field".into(),
+            ));
+        }
+        self.inflow_cells = cells.into_iter().filter_map(|(c, v)| u32::try_from(c).ok().map(|c| (c, v))).collect();
+        Ok(())
+    }
+
+    /// The cells with their own inflow ν̃, sorted by cell.
+    pub fn inflow_cells(&self) -> &[(u32, f64)] {
+        &self.inflow_cells
+    }
+
+    /// ν̃ at the inflow face of cell `c`.
+    fn inflow_at(&self, c: usize) -> f64 {
+        u32::try_from(c)
+            .ok()
+            .and_then(|c| self.inflow_cells.binary_search_by_key(&c, |e| e.0).ok().and_then(|k| self.inflow_cells.get(k)))
+            .map_or(self.inflow, |e| e.1)
+    }
+
     /// Set ν̃ per cell (a checkpoint, a test); refused unless one finite value per cell.
     pub fn set_nu_tilde(&mut self, values: &[f64]) -> crate::Result<()> {
         if values.len() != self.nu_tilde.len() || values.iter().any(|v| !v.is_finite()) {
@@ -499,7 +530,8 @@ impl SaField {
             + self.sides.capacity() * size_of::<[Side; 6]>()
             + self.fluid.capacity()
             + self.rates.capacity() * size_of::<(f64, f64)>()
-            + self.next.capacity() * size_of::<f64>()) as u64
+            + self.next.capacity() * size_of::<f64>()
+            + self.inflow_cells.capacity() * size_of::<(u32, f64)>()) as u64
     }
 
     /// Save or restore ν̃ (the faces, fluid cells and inflow value are fixed by the setup and
@@ -508,6 +540,15 @@ impl SaField {
         crate::checkpoint::fixed(a, self.inflow.to_bits())?;
         let n = self.fluid.len();
         crate::checkpoint::doubles(a, &mut self.nu_tilde, n)?;
+        // A tabulated inlet's cells and values, only when there is one (a run without a table
+        // writes the file it always did).
+        if !self.inflow_cells.is_empty() {
+            let digest = self
+                .inflow_cells
+                .iter()
+                .fold(self.inflow_cells.len() as u64, |h, &(c, v)| h.rotate_left(7) ^ u64::from(c).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ v.to_bits());
+            crate::checkpoint::fixed(a, digest)?;
+        }
         if self.nu_tilde.iter().zip(&self.fluid).any(|(v, &f)| !v.is_finite() || (!f && *v != 0.0)) {
             return Err(crate::Error::Invalid("checkpoint Spalart–Allmaras ν̃ is not finite, or not 0 outside the fluid".into()));
         }
@@ -547,8 +588,9 @@ impl SaField {
                     (Some(0.0), 0.0, 0.5 * (eta_c + nu) / SIGMA)
                 }
                 Side::Inflow => {
-                    slopes[a][k % 2] = Some(2.0 * (self.inflow - v));
-                    (Some(self.inflow), uc[a] * sign, 2.0 * diffusivity(self.inflow, nu) / SIGMA)
+                    let inflow = self.inflow_at(c);
+                    slopes[a][k % 2] = Some(2.0 * (inflow - v));
+                    (Some(inflow), uc[a] * sign, 2.0 * diffusivity(inflow, nu) / SIGMA)
                 }
                 Side::Open => (None, uc[a] * sign, 0.0),
             };
