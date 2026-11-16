@@ -58,6 +58,7 @@ Han, Ooka & Kikumoto's wall-function bounce, as their paper sets it up:
 | `turbulence.wall_model` | `"musker"` | Malaspinas & Sagaut: rebuild the cells next to no-slip walls from Musker's profile. |
 | | `"spalding_bounce"` | Han, Ooka & Kikumoto's eq. 14, on-node: the fluid cells next to a wall (the outermost cell layer at a no-slip box face, the fluid layer next to an obstacle) are the wall. At edges, corners and plate ends, eq. 14 runs on the link pairs whose fluid side is whole and the other links bounce back; where a wall meets an inlet, outlet or slip face, that face's cell keeps its own rule. No moving walls or heat; obstacles, edges and corners run on the CPU only. |
 | | `"spalart_allmaras_bounce"` | The same on-node wall with the Spalart–Allmaras model's own constant-stress law instead of Spalding's; `"spalart_allmaras"` turbulence only (see [Turbulence](turbulence.md)). |
+| | `"spalding_bounce_surface"`, `"spalart_allmaras_bounce_surface"` | The same laws on a wall half a cell outside the outermost cells, read at the second open cell. |
 | | `"spalding_bounce_halfway"` | Disabled because its wall-row checkerboard grows. Files preserve this selection when loaded, but solves refuse it at setup. Select a supported treatment explicitly; the on-node variant changes the wall location. |
 | | omitted | The bounce-back alone. |
 | `turbulence.van_driest` | 26 or omit | Van Driest's damping. Han, Ooka & Kikumoto use it with their wall model; Malaspinas & Sagaut's model replaces it, so don't combine the two. |
