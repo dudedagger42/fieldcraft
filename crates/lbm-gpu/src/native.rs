@@ -965,6 +965,11 @@ impl GpuFlow {
         let mut node_links: Vec<(u32, u32)> = Vec::new();
         if let Some(nodes) = flow.wall_nodes() {
             let links = flow.links();
+            if nodes.law() != fieldcraft_lbm::sa::WallLaw::Spalding {
+                return Err(Error::Invalid(
+                    "not supported yet on the GPU: the Spalart–Allmaras wall law (`wall_model: \"spalart_allmaras_bounce\"`); solve on the CPU (`backend: \"cpu\"`) or use `spalding_bounce`".into(),
+                ));
+            }
             // `node_bounce` is eq. 14 on a plane box face only. A node at an obstacle, an edge or a
             // corner runs the CPU's link pairs (`bounce::on_links`), which the device hasn't got.
             if let Some(w) = nodes.nodes().iter().find(|w| !w.flat || w.group as usize >= BoxFace::ALL.len()) {
