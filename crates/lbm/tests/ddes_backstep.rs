@@ -241,29 +241,54 @@ const STEADY_BLOCKS: usize = 5;
 const STEADY_X_R: f64 = 1e-5;
 const STEADY_SHEAR: f64 = 1e-4;
 
-/// The steady rule for a run on the device (f32 noise, ruled 2026-11-16: f64 keeps [`STEADY_X_R`] and [`STEADY_SHEAR`]),
-/// over the last [`F32_BLOCKS`] blocks: the x_r and each floor strip's block-mean shear have (a) no trend: the
-/// least-squares slope times the blocks is under twice the scatter about the fitted line, and (b) a scatter under a cap:
-/// 5e-5 of x_r, and 5e-4 of the largest strip's shear (provisional).
+/// The steady rule for a run on the device (f32 noise; ruled 2026-11-16, revised the same day). The floor shear is the f64
+/// rule exactly: over the last [`STEADY_BLOCKS`] blocks every strip's block mean agrees within [`STEADY_SHEAR`] of the
+/// largest strip. x_r passes by either branch: the f64 test (the last [`STEADY_BLOCKS`] blocks within [`STEADY_X_R`]
+/// relative) or the noise-floor test over the last [`F32_BLOCKS`] blocks (the least-squares drift, slope × blocks, under
+/// twice the scatter about the fitted line, and the scatter under [`F32_X_R_SCATTER`] of x_r). No trend term on the shear.
 const F32_BLOCKS: usize = 10;
 const F32_X_R_SCATTER: f64 = 5e-5;
-const F32_SHEAR_SCATTER: f64 = 5e-4;
 
-/// What the f32 floor measured over the last blocks, and whether it holds.
+/// What the rule measured, and how it passed.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct F32Floor {
-    /// x_r: the fitted change over the blocks (slope × blocks), in H; the scatter about the line, in H and relative.
-    x_r_trend: f64,
+    /// x_r over the last [`STEADY_BLOCKS`] blocks: max − min over |mean| (the f64 test's number).
+    x_r_spread: f64,
+    /// x_r over the last [`F32_BLOCKS`] blocks: the fitted drift in H (slope × blocks), the scatter about the line in H
+    /// and relative to x_r (NaN with fewer blocks).
+    x_r_drift: f64,
     x_r_scatter: f64,
     x_r_scatter_rel: f64,
-    /// The largest of the strips' trend-over-scatter ratio (|slope × blocks| / scatter), and of their scatter relative
-    /// to the largest block-mean shear of any strip.
-    shear_trend_ratio: f64,
-    shear_scatter_rel: f64,
-    /// The largest strip's fitted change over the blocks, relative to the largest block-mean shear of any strip.
-    shear_trend_rel: f64,
-    /// All three tests hold.
-    pub(crate) ok: bool,
+    /// The worst strip's change over the last [`STEADY_BLOCKS`] blocks, relative to the largest strip (the f64 test's number).
+    shear_spread: f64,
+    /// x_r passed by the f64 test, by the noise-floor test, and the shear passed.
+    x_r_f64: bool,
+    x_r_noise: bool,
+    shear_ok: bool,
+}
+
+impl F32Floor {
+    /// The run is settled: the shear passed and x_r passed by either branch.
+    pub(crate) fn ok(&self) -> bool {
+        self.shear_ok && (self.x_r_f64 || self.x_r_noise)
+    }
+
+    /// "settled" (x_r by the f64 test), "settled (f32 floor)" (by the noise-floor test only) or "capped".
+    pub(crate) fn verdict(&self) -> &'static str {
+        match (self.shear_ok, self.x_r_f64, self.x_r_noise) {
+            (true, true, _) => "settled",
+            (true, false, true) => "settled (f32 floor)",
+            _ => "capped",
+        }
+    }
+
+    /// The numbers, every time.
+    pub(crate) fn describe(&self) -> String {
+        format!(
+            "x_r: last {STEADY_BLOCKS} blocks spread {:.1e} (f64 test < {STEADY_X_R:.0e}: {}); last {F32_BLOCKS} blocks drift {:+.2e} H, scatter {:.2e} H = {:.1e} of x_r (noise-floor test: drift < 2 x scatter and scatter < {F32_X_R_SCATTER:.0e}: {}); worst strip's change over the last {STEADY_BLOCKS} blocks {:.1e} of the largest (< {STEADY_SHEAR:.0e}: {})",
+            self.x_r_spread, self.x_r_f64, self.x_r_drift, self.x_r_scatter, self.x_r_scatter_rel, self.x_r_noise, self.shear_spread, self.shear_ok
+        )
+    }
 }
 
 /// Slope × n and the standard deviation about the least-squares line of `values` (n − 2 degrees of freedom).
@@ -281,31 +306,25 @@ fn line_fit(values: &[f64]) -> Option<(f64, f64)> {
     Some((slope * nf, (ssr / (nf - 2.0)).sqrt()))
 }
 
-/// The f32 floor over the last [`F32_BLOCKS`] of `recent` (oldest first); none for fewer blocks.
+/// The rule over `recent` (oldest first); none for fewer than [`STEADY_BLOCKS`] blocks.
 fn f32_floor(recent: &[(f64, Vec<f64>)]) -> Option<F32Floor> {
-    let window = recent.get(recent.len().checked_sub(F32_BLOCKS)?..)?;
-    let strips = window.first()?.1.len();
-    if window.iter().any(|(_, t)| t.len() != strips) {
-        return None;
-    }
-    let x_r: Vec<f64> = window.iter().map(|(x, _)| *x).collect();
-    let (x_r_trend, x_r_scatter) = line_fit(&x_r)?;
-    let x_r_scatter_rel = x_r_scatter / (x_r.iter().sum::<f64>() / x_r.len() as f64).abs();
-    let scale = window.iter().flat_map(|(_, t)| t).fold(0.0, |a: f64, v| a.max(v.abs()));
-    let (mut shear_trend_ratio, mut shear_scatter_rel, mut shear_trend_rel) = (0.0f64, 0.0f64, 0.0f64);
-    let mut trend_ok = x_r_trend.abs() <= 2.0 * x_r_scatter;
-    for s in 0..strips {
-        let v: Vec<f64> = window.iter().filter_map(|(_, t)| t.get(s).copied()).collect();
-        let (trend, scatter) = line_fit(&v)?;
-        trend_ok &= trend.abs() <= 2.0 * scatter;
-        if scatter > 0.0 {
-            shear_trend_ratio = shear_trend_ratio.max(trend.abs() / scatter);
-        }
-        shear_scatter_rel = shear_scatter_rel.max(scatter / scale);
-        shear_trend_rel = shear_trend_rel.max(trend.abs() / scale);
-    }
-    let ok = trend_ok && x_r_scatter_rel < F32_X_R_SCATTER && shear_scatter_rel < F32_SHEAR_SCATTER;
-    Some(F32Floor { x_r_trend, x_r_scatter, x_r_scatter_rel, shear_trend_ratio, shear_scatter_rel, shear_trend_rel, ok })
+    let (x_r_spread, shear_spread) = steady_spreads(recent)?;
+    let noise = recent.len().checked_sub(F32_BLOCKS).and_then(|from| {
+        let x_r: Vec<f64> = recent.get(from..)?.iter().map(|(x, _)| *x).collect();
+        let (drift, scatter) = line_fit(&x_r)?;
+        Some((drift, scatter, scatter / (x_r.iter().sum::<f64>() / x_r.len() as f64).abs()))
+    });
+    let (x_r_drift, x_r_scatter, x_r_scatter_rel) = noise.unwrap_or((f64::NAN, f64::NAN, f64::NAN));
+    Some(F32Floor {
+        x_r_spread,
+        x_r_drift,
+        x_r_scatter,
+        x_r_scatter_rel,
+        shear_spread,
+        x_r_f64: x_r_spread < STEADY_X_R,
+        x_r_noise: noise.is_some_and(|(d, sc, rel)| d.abs() < 2.0 * sc && rel < F32_X_R_SCATTER),
+        shear_ok: shear_spread < STEADY_SHEAR,
+    })
 }
 
 /// max − min of `values`.
@@ -692,7 +711,7 @@ impl Step {
             );
             if steady_run {
                 if DEVICE.get().is_some() {
-                    f32_floor(recent).filter(|f| f.ok).map(Settled::F32Floor)
+                    f32_floor(recent).filter(|f| f.ok()).map(Settled::F32Floor)
                 } else {
                     steady(recent).map(|(x_r, spread)| Settled::Steady { block: shear.blocks(), x_r, shear: spread })
                 }
@@ -834,15 +853,7 @@ impl Step {
         }
         if rule.is_none() {
             if let Some(f) = f32_floor(&recent) {
-                println!(
-                    "capped (f32 floor {}): over the last {F32_BLOCKS} blocks x_r changes {:+.2e} H (scatter {:.2e} H = {:.1e}, cap {F32_X_R_SCATTER:.0e}); floor shear largest trend over scatter {:.2}, scatter {:.1e} of the largest strip (cap {F32_SHEAR_SCATTER:.0e})",
-                    if f.ok { "holds" } else { "not met" },
-                    f.x_r_trend,
-                    f.x_r_scatter,
-                    f.x_r_scatter_rel,
-                    f.shear_trend_ratio,
-                    f.shear_scatter_rel
-                );
+                println!("{} (the run reached its step cap): {}", f.verdict(), f.describe());
             }
             match steady_spreads(&recent) {
                 Some((x_r, shear)) => println!(
@@ -1063,7 +1074,7 @@ impl FloorRows {
 
     /// What the rows hold, one line per row: the columns behind the step with no sample, with a non-finite sum, and
     /// the first such station.
-    fn describe(&self) -> Vec<String> {
+    pub(crate) fn describe(&self) -> Vec<String> {
         let nx = self.x.len();
         (0..FLOOR_ROWS)
             .map(|n| {
@@ -1432,10 +1443,7 @@ fn report(step: &Step, r: &Run) -> Score {
             r.steps
         ),
         Some(Settled::Blocks) => println!("{} steps, settled by the Blocks acceptance", r.steps),
-        Some(Settled::F32Floor(f)) => println!(
-            "{} steps, settled (f32 floor): over the last {F32_BLOCKS} blocks x_r changes {:+.2e} H along the fitted line (scatter {:.2e} H = {:.1e} of x_r, cap {F32_X_R_SCATTER:.0e}); floor shear: largest trend over scatter {:.2}, largest scatter {:.1e} of the largest strip (cap {F32_SHEAR_SCATTER:.0e})",
-            r.steps, f.x_r_trend, f.x_r_scatter, f.x_r_scatter_rel, f.shear_trend_ratio, f.shear_scatter_rel
-        ),
+        Some(Settled::F32Floor(f)) => println!("{} steps, {}: {}", r.steps, f.verdict(), f.describe()),
         None => println!("{} steps, not settled", r.steps),
     }
     println!(
