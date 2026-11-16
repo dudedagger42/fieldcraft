@@ -284,6 +284,7 @@ impl Quantities for FluidDomain {
             free_surface,
             absorbing,
             radial_inflow,
+            inflow_table,
             moving_wall_ramp,
         } = self;
         each(min, Q::Length, f);
@@ -373,6 +374,11 @@ impl Quantities for FluidDomain {
             each(axis_point, Q::Length, f);
             for [radius, _factor] in table {
                 f(Q::Length, radius);
+            }
+        }
+        if let Some(InflowTable { axis: _, rows }) = inflow_table {
+            for row in rows {
+                f(Q::Length, &mut row[0]);
             }
         }
         if let Some(t) = moving_wall_ramp {

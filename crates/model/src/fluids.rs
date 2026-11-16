@@ -121,6 +121,10 @@ pub enum Profile {
     /// its axis, scaled so the mean over the cells it reaches is 1: the given velocity is the
     /// bulk velocity. A fully developed pipe flow needs it.
     Radial,
+    /// The velocity times the domain's [`InflowTable`] factor at each cell's coordinate along the
+    /// table's axis (uniform across the other direction of the face), and with the
+    /// Spalart–Allmaras model its ν̃ from the same table.
+    Table,
 }
 
 /// What a [`RadialInflow`]'s factors are scaled to.
@@ -140,6 +144,65 @@ pub enum RadialScale {
 impl RadialScale {
     fn is_fed(&self) -> bool {
         *self == RadialScale::Fed
+    }
+}
+
+/// The most rows an [`InflowTable`] holds.
+pub const MAX_INFLOW_ROWS: usize = 4096;
+
+/// A tabulated inlet profile for the velocity faces with [`Profile::Table`]: rows
+/// `[coordinate, factor, ν̃/ν]` along one axis of the domain (the wall-normal coordinate of a
+/// boundary layer), uniform across the face's other direction. A cell's velocity is the face's
+/// `velocity` times the factor at the coordinate of its centre, linear between rows and held at
+/// the end rows beyond them; with the Spalart–Allmaras model its inflow ν̃ is ν times the third
+/// column, interpolated the same way (a model without it ignores the column). The axis cannot be
+/// the face's own normal. A table holding one factor and one ratio reproduces a uniform inlet with
+/// that ν̃/ν. It is evaluated once at setup into per-cell values that the CPU and the GPU both read.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InflowTable {
+    /// The axis the rows' coordinate runs along.
+    pub axis: crate::fluid_zones::Axis,
+    /// `[coordinate, factor, ν̃/ν]`: coordinates strictly increasing, factors 0 or more, ratios 0 to 100.
+    pub rows: Vec<[f64; 3]>,
+}
+
+impl InflowTable {
+    /// Check the numbers: finite, sorted, sized.
+    pub fn validate(&self) -> Result<()> {
+        if !(1..=MAX_INFLOW_ROWS).contains(&self.rows.len()) {
+            return Err(Error::Invalid(format!("the inflow table needs 1 to {MAX_INFLOW_ROWS} rows, not {}", self.rows.len())));
+        }
+        let mut last = None;
+        for (k, [x, f, r]) in self.rows.iter().enumerate() {
+            finite("inflow table coordinate", *x)?;
+            finite("inflow table factor", *f)?;
+            finite("inflow table ν̃/ν", *r)?;
+            if *f < 0.0 || !(0.0..=100.0).contains(r) || last.is_some_and(|l| *x <= l) {
+                return Err(Error::Invalid(format!(
+                    "inflow table row {k} ([{x}, {f}, {r}]): coordinates must increase, factors must be 0 or more and ν̃/ν from 0 to 100"
+                )));
+            }
+            last = Some(*x);
+        }
+        if !self.rows.iter().any(|r| r[1] > 0.0) {
+            return Err(Error::Invalid("the inflow table has no factor above 0".into()));
+        }
+        Ok(())
+    }
+
+    /// `(factor, ν̃/ν)` at coordinate `x`: linear between rows, the end rows beyond them (a
+    /// not-finite `x` reads the first row).
+    pub fn at(&self, x: f64) -> (f64, f64) {
+        let at = if x.is_finite() { self.rows.partition_point(|r| r[0] <= x) } else { 0 };
+        match (at.checked_sub(1).and_then(|i| self.rows.get(i)), self.rows.get(at)) {
+            (Some(a), Some(b)) if b[0] > a[0] => {
+                let t = (x - a[0]) / (b[0] - a[0]);
+                (a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t)
+            }
+            (Some(a), _) | (None, Some(a)) => (a[1], a[2]),
+            (None, None) => (0.0, 0.0),
+        }
     }
 }
 
@@ -941,6 +1004,9 @@ pub struct FluidDomain {
     /// The table the velocity faces with `"profile": "radial"` read ([`RadialInflow`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub radial_inflow: Option<RadialInflow>,
+    /// The table the velocity faces with `"profile": "table"` read ([`InflowTable`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inflow_table: Option<InflowTable>,
     /// How long every moving wall takes to reach its velocity from rest (a time): box faces and
     /// obstacle faces alike move at `r(t) u_w` with `r = ½ (1 − cos(π t / T))` until `T`, then at
     /// `u_w`. `None` or 0 for the full velocity from the first step.
@@ -1063,6 +1129,23 @@ impl FluidDomain {
                 return Err(Error::Invalid("the domain has a `radial_inflow` table but no velocity face with the profile `radial`".into()));
             }
             (None, false) => {}
+        }
+        let table_faces: Vec<BoxFace> =
+            BoxFace::ALL.into_iter().filter(|f| matches!(self.faces.get(*f), FaceCondition::Velocity { profile: Profile::Table, .. })).collect();
+        match (&self.inflow_table, table_faces.is_empty()) {
+            (Some(t), false) => {
+                t.validate().map_err(|e| context("inflow table", "settings", e))?;
+                if let Some(f) = table_faces.iter().find(|f| f.axis() == t.axis.index()) {
+                    return Err(Error::Invalid(format!(
+                        "the inflow table runs along {}, the normal of its face {}: give an axis across the face",
+                        t.axis.name(),
+                        f.name()
+                    )));
+                }
+            }
+            (None, false) => return Err(Error::Invalid("a velocity face has the profile `table` but the domain has no `inflow_table`".into())),
+            (Some(_), true) => return Err(Error::Invalid("the domain has an `inflow_table` but no velocity face with the profile `table`".into())),
+            (None, true) => {}
         }
         if let Some(t) = self.moving_wall_ramp {
             nonnegative("moving wall ramp", t)?;
@@ -1237,6 +1320,7 @@ mod tests {
             free_surface: None,
             absorbing: None,
             radial_inflow: None,
+            inflow_table: None,
             moving_wall_ramp: None,
         }
     }
@@ -1317,6 +1401,61 @@ mod tests {
         unused.radial_inflow = Some(RadialInflow::power_law([0.0, 1.0, 0.5], 0.4, 7.0, 64).unwrap());
         let e = m.replace_fluid_domain("Flow", unused).unwrap_err().to_string();
         assert!(e.contains("radial_inflow") && e.contains("radial"), "{e}");
+    }
+
+    /// An inflow table interpolates linearly and holds its end rows beyond them, and bad tables
+    /// are refused with the row named (hostile numbers included).
+    #[test]
+    fn an_inflow_table_interpolates_and_is_checked() {
+        use crate::fluid_zones::Axis;
+        let t = InflowTable { axis: Axis::Z, rows: vec![[0.1, 0.5, 3.0], [0.3, 1.0, 5.0], [0.5, 1.5, 7.0]] };
+        t.validate().unwrap();
+        for (at, want) in [(0.0, (0.5, 3.0)), (0.1, (0.5, 3.0)), (0.2, (0.75, 4.0)), (0.5, (1.5, 7.0)), (9.0, (1.5, 7.0)), (f64::NAN, (0.5, 3.0))] {
+            let got = t.at(at);
+            assert!((got.0 - want.0).abs() < 1e-12 && (got.1 - want.1).abs() < 1e-12, "{at}: {got:?}");
+        }
+        let constant = InflowTable { axis: Axis::Y, rows: vec![[0.0, 1.0, 3.0]] };
+        constant.validate().unwrap();
+        assert_eq!(constant.at(-5.0), (1.0, 3.0));
+        assert_eq!(constant.at(5.0), (1.0, 3.0));
+        let bad = |rows: Vec<[f64; 3]>| InflowTable { axis: Axis::Z, rows }.validate().unwrap_err().to_string();
+        assert!(bad(vec![]).contains("1 to"));
+        assert!(bad(vec![[0.0, 1.0, 3.0], [0.0, 1.0, 3.0]]).contains("row 1"));
+        assert!(bad(vec![[0.0, -1.0, 3.0]]).contains("row 0"));
+        assert!(bad(vec![[0.0, 1.0, -1.0]]).contains("row 0") && bad(vec![[0.0, 1.0, 101.0]]).contains("row 0"));
+        assert!(bad(vec![[0.0, 0.0, 3.0]]).contains("no factor above 0"));
+        assert!(bad(vec![[f64::NAN, 1.0, 3.0]]).contains("finite") && bad(vec![[0.0, f64::INFINITY, 3.0]]).contains("finite"));
+        assert!(bad(vec![[0.0, 1.0, f64::NAN]]).contains("finite"));
+        assert!(bad((0..=MAX_INFLOW_ROWS).map(|k| [k as f64, 1.0, 3.0]).collect()).contains("1 to"));
+        // An unchecked table with a repeated coordinate does not divide by zero.
+        let unchecked = InflowTable { axis: Axis::Z, rows: vec![[0.0, 1.0, 3.0], [0.5, 2.0, 3.0], [0.5, 3.0, 3.0]] };
+        assert!((0..=20).all(|k| {
+            let (f, r) = unchecked.at(k as f64 * 0.05);
+            f.is_finite() && r.is_finite()
+        }));
+    }
+
+    /// The table profile and the table go together, and the table's axis is across its face.
+    #[test]
+    fn the_table_profile_needs_its_table_and_an_axis_across_its_face() {
+        use crate::fluid_zones::Axis;
+        let mut m = Model::default();
+        m.add_material("Water", water()).unwrap();
+        let mut d = channel();
+        d.faces.x_min = FaceCondition::Velocity { velocity: [1.0, 0.0, 0.0], profile: Profile::Table };
+        let e = m.add_fluid_domain("Flow", d.clone()).unwrap_err().to_string();
+        assert!(e.contains("inflow_table"), "{e}");
+        d.inflow_table = Some(InflowTable { axis: Axis::X, rows: vec![[0.0, 1.0, 3.0]] });
+        let e = m.add_fluid_domain("Flow", d.clone()).unwrap_err().to_string();
+        assert!(e.contains("normal"), "{e}");
+        d.inflow_table = Some(InflowTable { axis: Axis::Z, rows: vec![[0.0, 1.0, 3.0], [1.0, 2.0, 3.0]] });
+        m.add_fluid_domain("Flow", d.clone()).unwrap();
+        let json = serde_json::to_string(&d).unwrap();
+        assert_eq!(serde_json::from_str::<FluidDomain>(&json).unwrap(), d);
+        let mut unused = channel();
+        unused.inflow_table = d.inflow_table.clone();
+        let e = m.replace_fluid_domain("Flow", unused).unwrap_err().to_string();
+        assert!(e.contains("inflow_table") && e.contains("table"), "{e}");
     }
 
     /// A Cross-WLF melt's viscosity depends on the temperature: its domain needs heat, and the
