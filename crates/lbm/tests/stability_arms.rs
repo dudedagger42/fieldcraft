@@ -7,8 +7,8 @@
 //! 1. regularised, linear;  2. MRT, linear;  3. regularised, linear with every link of q > ½
 //! forced to half-way (the diagnostic switch of `flow.rs`);  4. regularised, half-way walls.
 //! Also quadratic and HRR (σ 0.95) rows, for the earlier scan. Stable = all steps ran; otherwise
-//! the step at which a step returned an error. K is the mean kinetic energy per fluid cell over
-//! the fluid cells, u·u/2 in lattice units, at the last sampled step, and `row` is the row (index
+//! the step at which a step returned an error. mean_ke is the mean kinetic energy per fluid cell over
+//! the fluid cells (not the slot's loss coefficient K), u·u/2 in lattice units, at the last sampled step, and `row` is the row (index
 //! across the channel) of the largest |u| at the last sampled step (every 25 steps), the best
 //! guess where the growth starts. Nothing is asserted; the table is the result
 //! (`--ignored --nocapture`, `SCAN_TAU` adds τ − ½ values, `SCAN_STEPS` sets the steps).
@@ -143,9 +143,9 @@ fn the_stability_arms() {
             let row: Vec<String> = taus
                 .iter()
                 .map(|&t| match run(arm, t, q, steps) {
-                    Outcome::Stable { peak, k, row } => format!("{t:.1e}: stable (peak {peak:.4}, K {k:.3e}, row {row})"),
+                    Outcome::Stable { peak, k, row } => format!("{t:.1e}: stable (peak {peak:.4}, mean_ke {k:.3e}, row {row})"),
                     Outcome::Blew { step, peak, k, row, message } => {
-                        format!("{t:.1e}: BLEW at step {step} ({message}; last sample peak {peak:.3e}, K {k:.3e}, row {row})")
+                        format!("{t:.1e}: BLEW at step {step} ({message}; last sample peak {peak:.3e}, mean_ke {k:.3e}, row {row})")
                     }
                     Outcome::Refused(e) => format!("{t:.1e}: refused ({e})"),
                 })
