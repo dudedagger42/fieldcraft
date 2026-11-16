@@ -987,11 +987,6 @@ impl GpuFlow {
         for (cell, flag) in fluid_u32.iter_mut().enumerate() {
             *flag = u32::from(flow.is_fluid(cell));
         }
-        if sa_faces.is_some() && flow.ddes_zone().is_some() {
-            return Err(Error::Invalid(
-                "not supported yet: DDES zone on the GPU (the device would run DDES in every cell); solve on the CPU (`backend: \"cpu\"`)".into(),
-            ));
-        }
         let zones = crate::zones::append(flow, &mut fluid_u32)?;
         if sa_faces.is_some() && zones.zones > 0 {
             return Err(Error::Invalid(
@@ -1574,9 +1569,13 @@ impl GpuFlow {
                 let nu_tilde = storage("lbm sa nu_tilde", &bytes_f32(&v));
                 drop(v);
                 let mut cell = filled(4 * n, 0.0f32, "Spalart–Allmaras wall distances")?;
-                for (out, d) in cell.as_chunks_mut::<4>().0.iter_mut().zip(distance) {
-                    out[1] = *d as f32;
-                    out[2] = *d as f32;
+                // DDES's zone: the cells outside it carry a negative wall distance (lbm.wgsl `sa_prepare`).
+                let zone = flow.ddes_zone();
+                for (k, (out, d)) in cell.as_chunks_mut::<4>().0.iter_mut().zip(distance).enumerate() {
+                    let outside = zone.is_some_and(|z| !z.get(k).copied().unwrap_or(false));
+                    let d = *d as f32;
+                    out[1] = if outside { -d } else { d };
+                    out[2] = d;
                 }
                 let sa_cell = storage("lbm sa cells", &bytes_f32(&cell));
                 (nu_tilde, empty("lbm sa rates", 8 * n as u64), sa_cell)
@@ -1790,7 +1789,8 @@ impl GpuFlow {
         if self.sa.is_none() {
             return Ok(None);
         }
-        self.sa_cell(1)
+        // The sign marks the cells outside DDES's zone: the distance itself is the magnitude.
+        Ok(self.sa_cell(1)?.map(|v| v.into_iter().map(f64::abs).collect()))
     }
 
     /// With DDES, each cell's length d̃ of the last step (lattice units, 0 outside the fluid), as
