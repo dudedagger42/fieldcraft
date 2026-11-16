@@ -249,6 +249,11 @@ fn slotted_channel_stability() {
                 Ok(n) => println!("SPLIT tracking {n} plate wall links for the friction share"),
                 Err(e) => println!("SPLIT not tracked: {e}"),
             }
+            // the flat throat faces only: a throat face's normal is exactly along z; the rounded edges' normals are not
+            match cpu.track_wall_split_where(&obstacles, &["PlateLow", "PlateHigh"], |_, n| n[2].abs() > 0.999999) {
+                Ok(n) => println!("SPLIT tracking {n} links on the flat throat faces (normal along z) for the flat-face share"),
+                Err(e) => println!("SPLIT flat faces not tracked: {e}"),
+            }
         }
     }
     let n = cpu.grid().len();
@@ -602,6 +607,7 @@ fn slotted_channel_stability() {
         let n_avg = env("SPLIT_STEPS", 200.0) as usize;
         let (mut ft, mut fnn) = ([0.0f64; 3], [0.0f64; 3]);
         let mut counted = 0usize;
+        let (mut kt, mut kn) = ([0.0f64; 3], [0.0f64; 3]);
         for _ in 0..n_avg {
             if Backend::advance(&mut cpu, 1).is_err() {
                 break;
@@ -612,11 +618,24 @@ fn slotted_channel_stability() {
                     fnn[a] += w.normal[a];
                 }
                 counted += 1;
+                if let Some(k) = cpu.wall_split_kept() {
+                    for a in 0..3 {
+                        kt[a] += k.tangential[a];
+                        kn[a] += k.normal[a];
+                    }
+                }
             }
         }
         if counted > 0 {
             let avg = fieldcraft_lbm::flow::WallSplit { normal: fnn.map(|v| v / counted as f64), tangential: ft.map(|v| v / counted as f64) };
             split_avg = Some(avg);
+            let flat = fieldcraft_lbm::flow::WallSplit { normal: kn.map(|v| v / counted as f64), tangential: kt.map(|v| v / counted as f64) };
+            println!(
+                "FRICTION flat throat faces only (the lower bound, exact): tangential/(tangential+normal) {:.4} (tangential {:+.4e}, normal {:+.4e})",
+                flat.friction_share([1.0, 0.0, 0.0]).unwrap_or(f64::NAN),
+                flat.tangential[0],
+                flat.normal[0]
+            );
             // Fable's definition: tangential over tangential plus normal, over every tracked wall link of the plates, along the flow
             friction = format!(
                 "friction share along the flow, all plate wall links: tangential/(tangential+normal) {:.4} (tangential {:+.4e}, normal {:+.4e} lattice force per step, mean of {counted} steps after the run)",
