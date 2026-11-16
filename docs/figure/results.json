@@ -1,0 +1,97 @@
+{
+ "develop_commit": "707f4938",
+ "our_commit": "386375b1",
+ "our_branch": "up/b-mass-r5",
+ "backend": "CPU f64",
+ "panel_a": {
+  "axis": 5,
+  "cases": [
+   {
+    "label": "Turbulent channel|SA wall law|HRR sigma 0.95|Re_tau 182 at 10 cells, -1.03 %|[Re_tau values and cells to be confirmed]|(DNS, Lee and Moser 2015)|bar set after the result",
+    "bar": 1,
+    "reproduced": false,
+    "source": "Re_tau 182 at 10 cells per half-height (-1.03 %), Re_tau 543 at 20 cells (-1.37 %), Re_tau 1000 at 50 and 80 cells (-1.17, -1.70 %); the oracle case expected values; only the first is drawn: the other three (-1.37, -1.17, -1.70) wait for the Re_tau and cell labels to be confirmed from the run logs. The 1 % bar was fixed after the results",
+    "points": [
+     {"grid": "single", "value": -1.03}
+    ]
+   },
+   {
+    "label": "Flat-plate friction|SA wall law|HRR sigma 0.99|Re_theta 4000 to 13000|±5 %, our gate, against|Kármán–Schoenherr as stated on|the NASA TMR 2DZP page",
+    "note": "+3.67 % at Re_theta 4000;|+0.18, −0.59, −0.72, −0.63 %|from 6000 to 13000",
+    "bar": 5,
+    "reproduced": false,
+    "source": "NASA Turbulence Modeling Resource, 2D zero pressure gradient flat plate validation case: c_f = 1/(17.08 L^2 + 25.11 L + 6.012), L = log10 Re_theta, compared over 4000 < Re_theta < 13000. The 5 % is our own gate, fixed before any plate result; it is not a stated accuracy of the correlation: the TMR page gives the formula and the range and states no accuracy",
+    "points": [
+     {"grid": "single", "value": 3.67},
+     {"grid": "single", "value": 0.18},
+     {"grid": "single", "value": -0.59},
+     {"grid": "single", "value": -0.72},
+     {"grid": "single", "value": -0.63}
+    ]
+   },
+   {
+    "label": "Laminar square duct|(exact series)|TRT 0.65|8 and 16 cells",
+    "bar": 1,
+    "reproduced": false,
+    "source": "flow rate against the exact series, Spark run b10 (byte-identical at the four re-cut heads)",
+    "points": [
+     {"grid": "coarse", "value": 1.4020},
+     {"grid": "fine", "value": 0.3671}
+    ]
+   },
+   {
+    "label": "Backward-facing step|HRR sigma 0.99|reattachment length|(Driver and Seegmiller 1985)|24 and 48 cells per H|not gated",
+    "bar": null,
+    "reproduced": false,
+    "source": "6.26 +/- 0.10 step heights measured; not gated. 5.835 H at 24 cells (floor shear) and 5.875 H at 48 cells (first-row crossing, which matches floor shear to 0.002 H at 24 cells): -6.8 % and -6.2 %",
+    "points": [
+     {"grid": "coarse", "value": -6.8},
+     {"grid": "fine", "value": -6.2}
+    ]
+   }
+  ]
+ },
+ "panel_b": {
+  "axis": 5,
+  "bar": 1,
+  "groups": [
+   {
+    "label": "26.57 deg|8 cells|TRT 0.65",
+    "reproduced": false,
+    "series": [
+     {"name": "develop, linear", "values": [-0.6799, -1.0669, -1.3132]},
+     {"name": "ours, quadratic", "values": [0.2001, 0.3503, 0.5443]},
+     {"name": "ours, quadratic + mass correction", "values": [-0.1126, -0.1856, -0.2212]}
+    ]
+   },
+   {
+    "label": "26.57 deg|16 cells|TRT 0.65",
+    "reproduced": false,
+    "series": [
+     {"name": "develop, linear", "values": [-0.1215, -0.2819, -0.2489]},
+     {"name": "ours, quadratic", "values": [0.0476, 0.0943, 0.1560]},
+     {"name": "ours, quadratic + mass correction", "values": [-0.0796, -0.1691, -0.1236]}
+    ]
+   },
+   {
+    "label": "45 deg|8 cells|TRT 0.65",
+    "reproduced": false,
+    "series": [
+     {"name": "develop, linear", "values": [-2.2069, -1.3923, 1.6006]},
+     {"name": "ours, quadratic", "values": [0.2307, 0.0219, 0.3308]},
+     {"name": "ours, quadratic + mass correction", "values": [0.2308, 0.0118, 0.3291]}
+    ]
+   },
+   {
+    "label": "45 deg|16 cells|TRT 0.65",
+    "reproduced": false,
+    "series": [
+     {"name": "develop, linear", "values": [-0.9315, -0.8985, 0.3072]},
+     {"name": "ours, quadratic", "values": [0.0537, 0.0545, 0.0151]},
+     {"name": "ours, quadratic + mass correction", "values": [0.0533, 0.0538, 0.0143]}
+    ]
+   }
+  ],
+  "source": "develop 707f4938 (frozen values) and our rows rerun at up/b-mass-r5 386375b1 on the laptop CPU (interpolated_rotated --include-ignored --nocapture, 2026-11-16), the stack re-cut onto develop e2e6a60e: CPU f64, TRT, relaxation time 0.65, no turbulence model, 10 240 steps, lattice viscosity 0.05, exact mean speed 0.02; wall offsets 0 / 0.33 / 0.67 cell (26.57 deg) and 0 / 0.25 / 0.5 cell (45 deg); flow rate against exact, percent"
+ }
+}
