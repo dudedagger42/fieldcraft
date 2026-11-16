@@ -330,13 +330,29 @@ fn slotted_channel_stability() {
     };
     let (mut done, mut cpu_ok, mut gpu_ok) = (0u64, use_cpu, use_gpu);
     // SERIES=1: the series' reporting (settle rule, self-stop, DIAG4). SETTLE=1: stop when K is settled (STEPS is the cap); the rule: windows of
-    // WIN steps (2000), a least-squares line through the last third of the windows drifts less than 0.2 % over that third and the last three
-    // windows are within 0.5 % of each other (at least 6 windows). SELFSTOP=v (0.1): stop when the wall-normal speed of any wall cell passes v.
+    // WIN steps (2000), a least-squares line through the last third of the windows drifts less than 0.05 % over that third and the last three
+    // windows are within 0.1 % of each other (at least 6 windows, and not before MIN_LEN steps). SELFSTOP=v (0.1): stop when the wall-normal speed of any wall cell passes v.
     let series = env("SERIES", 0.0) > 0.5;
     let settle = env("SETTLE", if series { 1.0 } else { 0.0 }) > 0.5;
     let win_steps = env("WIN", 2000.0) as u64;
     let selfstop = env("SELFSTOP", 0.1);
+    // the slope test may fire only after MIN_LEN steps (default 6,250 x SLOT_CELLS): 37.5k at 6 cells, 50k at 8, 75k at 12, 100k at 16
+    let min_len = env("MIN_LEN", 6250.0 * cells) as u64;
     let mut stop: Option<String> = None;
+    // the mean density of the fluid cells before the first step (the initial field), for the density line
+    let rho_step0 = match Backend::fields(&mut cpu) {
+        Ok(f) => {
+            let (mut sum, mut n) = (0.0, 0usize);
+            for c in 0..f.density.len() {
+                if Backend::is_fluid(&cpu, c) {
+                    sum += f.density[c];
+                    n += 1;
+                }
+            }
+            sum / n.max(1) as f64
+        }
+        Err(_) => f64::NAN,
+    };
     // the last settle window the rule read (from step, to step), reported per run
     let mut settle_window: Option<(u64, u64)> = None;
     let (mut worst_u, mut worst_r) = (0.0f64, 0.0f64);
@@ -561,7 +577,7 @@ fn slotted_channel_stability() {
         // the settle rule on the plate's pressure drop (K is dp over a constant)
         if settle && stop.is_none() && win_steps > 0 {
             let nwin = (done / win_steps) as usize;
-            if nwin >= 6 && done % win_steps == 0 {
+            if nwin >= 6 && done >= min_len && done % win_steps == 0 {
                 let mean = |k: usize| {
                     let v: Vec<f64> = (if sc.is_empty() { &sg } else { &sc })
                         .iter()
@@ -587,7 +603,7 @@ fn slotted_channel_stability() {
                     100.0 * spread
                 );
                 settle_window = Some((done - third as u64 * win_steps, done));
-                if drift < 2e-3 && spread < 5e-3 {
+                if drift < 5e-4 && spread < 1e-3 {
                     println!("EVENT SETTLED at step {done}");
                     stop = Some("settled".into());
                 }
@@ -662,11 +678,15 @@ fn slotted_channel_stability() {
             let avg = fieldcraft_lbm::flow::WallSplit { normal: fnn.map(|v| v / counted as f64), tangential: ft.map(|v| v / counted as f64) };
             split_avg = Some(avg);
             let flat = fieldcraft_lbm::flow::WallSplit { normal: kn.map(|v| v / counted as f64), tangential: kt.map(|v| v / counted as f64) };
+            // The flat faces' own normal force has no component along the flow (their normals are along z), so a share of the flat links
+            // alone is 1 by construction: the lower bound is their tangential force over the total wall force of ALL links along the flow.
+            let total_all = (avg.tangential[0] + avg.normal[0]).abs();
             println!(
-                "FRICTION flat throat faces only (the lower bound, exact): tangential/(tangential+normal) {:.4} (tangential {:+.4e}, normal {:+.4e})",
-                flat.friction_share([1.0, 0.0, 0.0]).unwrap_or(f64::NAN),
+                "FRICTION flat throat faces only (exact friction, the lower bound): |F_t flat| / |F_t + F_n all links| {:.4} (flat tangential {:+.4e}, flat normal along the flow {:+.4e}, all-links total {:+.4e})",
+                if total_all > 0.0 { flat.tangential[0].abs() / total_all } else { f64::NAN },
                 flat.tangential[0],
-                flat.normal[0]
+                flat.normal[0],
+                avg.tangential[0] + avg.normal[0]
             );
             // Fable's definition: tangential over tangential plus normal, over every tracked wall link of the plates, along the flow
             friction = format!(
@@ -684,9 +704,10 @@ fn slotted_channel_stability() {
     let run_samples = if sc.is_empty() { &sg } else { &sc };
     let host = std::env::var("COMPUTERNAME").or_else(|_| std::env::var("HOSTNAME")).unwrap_or_else(|_| "unknown".into());
     println!(
-        "RUN ended after {steps} of {steps_cap} steps: {}; settle window {}; host {host}; mean density start {:.5} middle {:.5} end {:.5}",
+        "RUN ended after {steps} of {steps_cap} steps: {}; settle window {}; host {host}; mean density at step 0 {rho_step0:.5}, first sample (step {}) {:.5}, middle {:.5}, end {:.5}",
         stop.as_deref().unwrap_or(if cpu_ok || gpu_ok { "reached the cap" } else { "blew up or stopped" }),
         settle_window.map_or("none read".to_string(), |(a, b)| format!("steps {a} to {b} (the last third of the windows the rule read)")),
+        run_samples.first().map_or(0, |x| x.0),
         run_samples.first().map_or(f64::NAN, |x| x.4),
         run_samples.get(run_samples.len() / 2).map_or(f64::NAN, |x| x.4),
         run_samples.last().map_or(f64::NAN, |x| x.4)
@@ -712,11 +733,18 @@ fn slotted_channel_stability() {
             um / u_in
         ))
     };
+    // K as the mean over the last third of the run (the window stated): the number to quote
+    for (name, v) in [("CPU", &sc), ("GPU", &sg)] {
+        let lo = steps - steps / 3;
+        if let Some(l) = win(v, lo, steps) {
+            println!("KLAST {name} mean over the last third of the run, {l}");
+        }
+    }
     let (h, q) = (steps / 2, steps / 4);
     for (name, v) in [("CPU", &sc), ("GPU", &sg)] {
         for (lo, hi) in [(h, steps), (h, h + q), (h + q, steps)] {
             if let Some(l) = win(v, lo, hi) {
-                println!("AVG {name} {l}");
+                println!("AVG {name} (half-run and quarter averages, not the quoted K: see KLAST) {l}");
             }
         }
     }
@@ -886,6 +914,25 @@ fn slotted_channel_stability() {
                     let drop = (up - p_tot(at(1.0))).abs() * section as f64;
                     let force = w.tangential[0].abs() + w.normal[0].abs();
                     let closure = force / drop.max(1e-300);
+                    // the momentum balance of the same two planes: the force on the plates = the drop of the section sums of p + rho u_x^2
+                    let mom = |i: usize| -> f64 {
+                        let i = i.min(nx.saturating_sub(1));
+                        let mut sum = 0.0;
+                        for k in 0..nz {
+                            for j in 0..ny {
+                                let c = grid.index([i, j, k]);
+                                if fluid[c] {
+                                    sum += (fl.density[c] - 1.0) / 3.0 + fl.density[c] * fl.velocity[c][0] * fl.velocity[c][0];
+                                }
+                            }
+                        }
+                        sum
+                    };
+                    let drop_m = mom(at(0.4)) - mom(at(1.0));
+                    println!(
+                        "CLOSURE_MOMENTUM (|F_t.d| + |F_n.d|) / (drop of the section sum of p + rho u_x^2, x 0.4 to 1.0) = {:.4} (force {force:.4e}, momentum drop {drop_m:.4e})",
+                        force / drop_m.abs().max(1e-300)
+                    );
                     println!(
                         "CLOSURE (|F_t.d| + |F_n.d|) / (total-pressure drop x section) = {closure:.4} (force {force:.4e}, drop {:.4e} x {section} cells){}",
                         (up - p_tot(at(1.0))).abs(),
