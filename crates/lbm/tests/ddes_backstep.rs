@@ -665,12 +665,13 @@ impl Step {
             furthest_crossing(&floor_x, &floor_of(&mean), PRIMARY_BEYOND).map(|(x, _)| x)
         };
         let readings = Readings::of(&floor_x, &floor_of(&mean), &window.floor);
-        println!("{readings}");
+        let partial = if rule.is_some() { "" } else { "partial (the run stopped unsettled, at its step cap): " };
+        println!("{partial}{readings}");
         let stresses = window.layer.stresses();
         for s in &stresses {
             match s {
-                Ok(s) => println!("resolved against modelled shear stress, {s}"),
-                Err(why) => println!("resolved against modelled shear stress: none ({why})"),
+                Ok(s) => println!("{partial}resolved against modelled shear stress, {s}"),
+                Err(why) => println!("{partial}resolved against modelled shear stress: none ({why})"),
             }
         }
         let cf: Vec<(f64, f64)> = strips.iter().zip(&mean).map(|(s, t)| (0.5 * (s.x.0 + s.x.1), t / q)).collect();
@@ -2060,7 +2061,8 @@ fn a_restart_writes_its_profile() {
 /// 95 % half-width and half-window drift under 1 %, `Blocks::acceptance`), at most 300 H/U in all.
 /// H/U is `FIELDCRAFT_STEP_CELLS_PER_H` over the lattice speed, in steps. Prints `timing:` (cells,
 /// wall time, peak memory), the M cell updates/s, the steps, and x_r with its batch-means error.
-/// `FIELDCRAFT_STEP_CHECKPOINT` is T3's own restart file, resumed when it exists.
+/// `FIELDCRAFT_STEP_CHECKPOINT` is T3's own restart file, resumed when it exists; `FIELDCRAFT_STEP_MAX_STEPS` is the step cap
+/// (600 H/U by default), and a run that reaches it unsettled prints its readings marked "partial".
 /// `FIELDCRAFT_STEP_RESTART=<copy> FIELDCRAFT_STEP_CELLS_PER_H=24 FIELDCRAFT_STEP_SPAN=4 cargo test --release -p fieldcraft-lbm --test ddes_backstep t3 -- --ignored --nocapture`.
 #[test]
 #[ignore = "hours: the DDES study from T2's restart, FIELDCRAFT_STEP_RESTART"]
@@ -2080,8 +2082,10 @@ fn t3_ddes_in_the_zone_from_t2s_field_reports_x_r_with_its_error() {
     let base = sa_step_in(ddes, true, span);
     let h_over_u = (base.cells_per_h as f64 / base.lattice_velocity).round() as u64;
     let flow_through = ((base.upstream + base.downstream) / h / base.lattice_velocity) as u64;
+    // The cap: 600 H/U, or `FIELDCRAFT_STEP_MAX_STEPS` steps.
+    let max_steps = std::env::var("FIELDCRAFT_STEP_MAX_STEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(600 * h_over_u);
     let t3 = Step {
-        max_steps: 300 * h_over_u,
+        max_steps,
         sample: 100,
         // A block is 30 H/U at least, for the error bar only: no block is refused.
         block: (30 * h_over_u).div_ceil(100) as usize,
@@ -2089,7 +2093,12 @@ fn t3_ddes_in_the_zone_from_t2s_field_reports_x_r_with_its_error() {
         checkpoint,
         ..base
     };
-    println!("T3: DDES zone {:?} to {:?} (H), C_DES 0.65; H/U = {h_over_u} steps, discard 50 H/U, cap 300 H/U", zone.min, zone.max);
+    println!(
+        "T3: DDES zone {:?} to {:?} (H), C_DES 0.65; H/U = {h_over_u} steps, discard 50 H/U, cap {max_steps} steps = {:.0} H/U",
+        zone.min,
+        zone.max,
+        max_steps as f64 / h_over_u as f64
+    );
     // The source flow goes before the target is built: the two never coexist (see [`Field`]).
     let field = snapshot(&from).unwrap_or_else(|e| panic!("T3: {e}"));
     drop(from);
