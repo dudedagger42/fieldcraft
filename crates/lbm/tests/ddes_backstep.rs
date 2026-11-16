@@ -589,6 +589,10 @@ impl Step {
                 save(path, &mut flow, steps, &samples);
             }
         }
+        // The end of the run is saved too, so a run that stops between two checkpoints leaves its field.
+        if let Some(path) = self.checkpoint.as_ref() {
+            save(path, &mut flow, steps, &samples);
+        }
         println!(
             "{} fluid cells, {steps} steps: {:.1} M cell updates/s",
             flow.fluid_cells(),
@@ -1453,7 +1457,8 @@ fn t2_the_extruded_short_step_keeps_t1s_reattachment() {
     load(&file, &mut flat);
     let x_flat = wall_reading(&flat, &t1s);
     let h_over_u = (t1s.cells_per_h as f64 / t1s.lattice_velocity).round() as u64;
-    let t2 = Step { max_steps: 20 * h_over_u, sample: 100, block: 10, startup: 0.0, ..sa_step_in(sa, true, span) };
+    let checkpoint = std::env::var_os("FIELDCRAFT_STEP_CHECKPOINT").map(std::path::PathBuf::from);
+    let t2 = Step { max_steps: 20 * h_over_u, sample: 100, block: 10, startup: 0.0, checkpoint, ..sa_step_in(sa, true, span) };
     let run = t2.try_run_from(Some(&|flow: &mut Flow| transfer(&flat, flow))).unwrap_or_else(|e| panic!("T2: {e}"));
     println!("T2 (span {span} H, {} steps = 20 H/U): x_r (gated shear) {:?}; T1s from its field {x_flat:?}", run.steps, run.x_r);
 }
