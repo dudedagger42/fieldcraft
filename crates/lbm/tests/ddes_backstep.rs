@@ -50,7 +50,7 @@ use common::cases::*;
 use common::*;
 use fieldcraft_lbm::backend::Backend;
 use fieldcraft_lbm::statistics::Blocks;
-use fieldcraft_lbm::{Flow, Limits, Obstacle};
+use fieldcraft_lbm::{Flow, Grid, Limits, Obstacle};
 use fieldcraft_model::{AbsorbingLayer, BoxFaces, Collision, FaceCondition, HrrSigma, Outflow, Procedure, Turbulence, WallModel};
 
 /// The step model's parameters (lengths in units of H, inlet speed 1).
@@ -220,6 +220,10 @@ fn steady(recent: &[(f64, Vec<f64>)]) -> Option<(f64, f64)> {
 
 /// Lengths within this of each other are equal (grid coordinates are sums of cell sizes).
 const LENGTH_TOLERANCE: f64 = 1e-9;
+
+/// What sets a built flow's field before the run: it is consumed by the call, so what it carries
+/// (a [`Field`]) is freed before the first step allocates the streaming targets.
+type Init = Box<dyn FnOnce(&mut Flow) -> Result<(), String>>;
 
 impl Step {
     fn spacing(&self) -> f64 {
@@ -445,11 +449,14 @@ impl Step {
 
     /// [`Step::try_run`] starting from the field `init` sets (a settled field from another
     /// grid, [`transfer`]) instead of the uniform one; a restart file still takes precedence.
-    fn try_run_from(&self, init: Option<&dyn Fn(&mut Flow) -> Result<(), String>>) -> Result<Run, String> {
+    fn try_run_from(&self, init: Option<Init>) -> Result<Run, String> {
         let (mut flow, strips, _) = self.build();
         if let Some(init) = init {
             init(&mut flow)?;
         }
+        // What the flow holds, and the process's high-water mark, once built and set: the peak a
+        // source field carried in would show here, before the first step allocates the targets.
+        println!("memory after setup: flow arrays {:.2} GB, peak {}", flow.heap_bytes() as f64 / 1e9, peak_memory());
         let grid = *flow.grid();
         let h = self.spacing();
         let [nx, ny, nz] = grid.cells;
@@ -624,13 +631,14 @@ impl Step {
             flow.fluid_cells() as f64 * steps as f64 / clock.elapsed().as_secs_f64() / 1e6
         );
         println!(
-            "timing: grid {:?} = {} cells ({} fluid), {} cells per H, span {} H, wall time {:.0} s for {steps} steps, peak memory {}",
+            "timing: grid {:?} = {} cells ({} fluid), {} cells per H, span {} H, wall time {:.0} s for {steps} steps, flow arrays {:.2} GB, peak memory {}",
             grid.cells,
             grid.cells.iter().product::<usize>(),
             flow.fluid_cells(),
             self.cells_per_h,
             self.span,
             clock.elapsed().as_secs_f64(),
+            flow.heap_bytes() as f64 / 1e9,
             peak_memory()
         );
         match settle_point(&history) {
@@ -1509,29 +1517,51 @@ fn peak_memory() -> String {
         .unwrap_or_else(|| "n/a".to_string())
 }
 
-/// A settled field from `from` (built from `from_step`) set in `to`: every fluid cell of `to` takes
-/// the density, velocity and ν̃ of the cell of `from` at the same x and z (the span: the source cell
-/// at the same index along y modulo its own, so a 2D field is extruded). The two grids share H, the
-/// step's position and the floor; their x and z offsets are whole cells. Equilibrium populations
-/// at that state, so the non-equilibrium part is rebuilt in a few steps. Cells of `to` outside
-/// `from` (a longer outlet) take the nearest column. Refused for a ν̃ the source does not have.
-fn transfer(from: &Flow, to: &mut Flow) -> Result<(), String> {
-    let (gf, gt) = (*from.grid(), *to.grid());
+/// A settled flow's field as `transfer` needs it: its grid and, per cell, ρ, u and ν̃ (ρ NaN in a
+/// solid cell), 40 bytes a cell. A flow holds hundreds of bytes a cell (two sets of populations,
+/// the model's arrays), so a run that carries a field into a new flow takes it with [`snapshot`]
+/// and drops the source before building the target: the two flows never coexist, which they did
+/// when `transfer` read the source flow itself, and the peak memory was twice the flow's.
+struct Field {
+    grid: Grid,
+    cells: Vec<[f64; 5]>,
+}
+
+/// The field of `from` ([`Field`]). Refused for a flow without a Spalart–Allmaras ν̃.
+fn snapshot(from: &Flow) -> Result<Field, String> {
+    let nu = from.spalart_allmaras().map(|f| f.nu_tilde()).ok_or("the source flow has no Spalart–Allmaras field")?;
+    let cells = (0..from.grid().len())
+        .map(|c| {
+            let (rho, u) = from.moments(c).unwrap_or((f64::NAN, [0.0; 3]));
+            [rho, u[0], u[1], u[2], nu.get(c).copied().unwrap_or(0.0)]
+        })
+        .collect();
+    Ok(Field { grid: *from.grid(), cells })
+}
+
+/// A settled field set in `to`: every fluid cell of `to` takes the density, velocity and ν̃ of the
+/// cell of `from` at the same x and z (the span: the source cell at the same index along y modulo
+/// its own, so a 2D field is extruded). The two grids share H, the step's position and the floor;
+/// their x and z offsets are whole cells. Equilibrium populations at that state, so the
+/// non-equilibrium part is rebuilt in a few steps. Cells of `to` outside `from` (a longer outlet)
+/// take the nearest column.
+fn transfer(from: &Field, to: &mut Flow) -> Result<(), String> {
+    let (gf, gt) = (from.grid, *to.grid());
     if (gf.spacing - gt.spacing).abs() > LENGTH_TOLERANCE * gf.spacing {
         return Err(format!("the grids' spacings differ: {} and {}", gf.spacing, gt.spacing));
     }
     let cells = |a: f64, b: f64| ((a - b) / gf.spacing).round() as i64;
     let (dx, dz) = (cells(gt.origin[0], gf.origin[0]), cells(gt.origin[2], gf.origin[2]));
-    let nu = from.spalart_allmaras().map(|f| f.nu_tilde().to_vec()).ok_or("the source flow has no Spalart–Allmaras field")?;
     let source = |c: usize| -> Option<usize> {
         let [i, j, k] = gt.coords(c);
         let (i, k) = (i as i64 + dx, k as i64 + dz);
         let clamp = |v: i64, n: usize| v.clamp(0, n as i64 - 1) as usize;
         Some(gf.index([clamp(i, gf.cells[0]), j % gf.cells[1], clamp(k, gf.cells[2])]))
     };
-    let state = |c: usize| source(c).and_then(|s| from.moments(s)).unwrap_or((1.0, [0.0; 3]));
+    let at = |c: usize| source(c).and_then(|s| from.cells.get(s));
+    let state = |c: usize| at(c).filter(|v| v[0].is_finite()).map_or((1.0, [0.0; 3]), |v| (v[0], [v[1], v[2], v[3]]));
     to.set_equilibrium(state);
-    let values: Vec<f64> = (0..gt.len()).map(|c| source(c).and_then(|s| nu.get(s).copied()).unwrap_or(0.0)).collect();
+    let values: Vec<f64> = (0..gt.len()).map(|c| at(c).map_or(0.0, |v| v[4])).collect();
     to.set_sa_nu_tilde(&values).map_err(|e| format!("setting ν̃: {e}"))
 }
 
@@ -1938,7 +1968,9 @@ fn t1s_the_short_step_from_t1s_field_reattaches_with_t1() {
     let checkpoint = std::env::var_os("FIELDCRAFT_STEP_CHECKPOINT").map(std::path::PathBuf::from);
     let steps = std::env::var("FIELDCRAFT_STEP_MAX_STEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(400_000);
     let short = Step { max_steps: steps, checkpoint, startup: 0.5, ..sa_step_in(sa, true, 0.0) };
-    let run = short.try_run_from(Some(&|flow: &mut Flow| transfer(&full, flow))).unwrap_or_else(|e| panic!("T1s: {e}"));
+    let field = snapshot(&full).unwrap_or_else(|e| panic!("T1s: {e}"));
+    drop(full);
+    let run = short.try_run_from(Some(Box::new(move |flow: &mut Flow| transfer(&field, flow)))).unwrap_or_else(|e| panic!("T1s: {e}"));
     let x_s = run.x_r.as_ref().map_or(f64::NAN, |x| *x);
     println!(
         "T1s x_r {x_s:.4} H against T1 {x_t1:.4} H: {:+.2} % (gate 0.5 %: {}); settled {}",
@@ -1966,7 +1998,9 @@ fn t2_the_extruded_short_step_keeps_t1s_reattachment() {
     let h_over_u = (t1s.cells_per_h as f64 / t1s.lattice_velocity).round() as u64;
     let checkpoint = std::env::var_os("FIELDCRAFT_STEP_CHECKPOINT").map(std::path::PathBuf::from);
     let t2 = Step { max_steps: 20 * h_over_u, sample: 100, block: 10, startup: 0.0, checkpoint, ..sa_step_in(sa, true, span) };
-    let run = t2.try_run_from(Some(&|flow: &mut Flow| transfer(&flat, flow))).unwrap_or_else(|e| panic!("T2: {e}"));
+    let field = snapshot(&flat).unwrap_or_else(|e| panic!("T2: {e}"));
+    drop(flat);
+    let run = t2.try_run_from(Some(Box::new(move |flow: &mut Flow| transfer(&field, flow)))).unwrap_or_else(|e| panic!("T2: {e}"));
     println!("T2 (span {span} H, {} steps = 20 H/U): x_r (gated shear) {:?}; T1s from its field {x_flat:?}", run.steps, run.x_r);
 }
 
@@ -1982,7 +2016,12 @@ fn a_field_carries_from_the_full_step_to_the_short_extruded_one() {
     let (mut full, _, _) = base.build();
     full.set_equilibrium(|c| (1.0 + 1e-3 * (c % 7) as f64, [0.02, 0.0, 0.0]));
     let (mut to, _, _) = short.build();
-    transfer(&full, &mut to).unwrap();
+    let field = snapshot(&full).unwrap();
+    // What a run keeps while the target is built is a small part of a flow: this is what stands in the
+    // way of the target's peak being twice the source's (a built flow here holds a few hundred bytes a cell).
+    let kept = (field.cells.len() * std::mem::size_of::<[f64; 5]>()) as f64;
+    assert!(kept < 0.2 * full.heap_bytes() as f64, "{kept} bytes of {}", full.heap_bytes());
+    transfer(&field, &mut to).unwrap();
     let (gf, gt) = (*full.grid(), *to.grid());
     let (dx, dz) = (((gt.origin[0] - gf.origin[0]) / gf.spacing).round() as usize, ((gt.origin[2] - gf.origin[2]) / gf.spacing).round() as usize);
     let mut checked = 0;
@@ -2051,7 +2090,10 @@ fn t3_ddes_in_the_zone_from_t2s_field_reports_x_r_with_its_error() {
         ..base
     };
     println!("T3: DDES zone {:?} to {:?} (H), C_DES 0.65; H/U = {h_over_u} steps, discard 50 H/U, cap 300 H/U", zone.min, zone.max);
-    let run = t3.try_run_from(Some(&|flow: &mut Flow| transfer(&from, flow))).unwrap_or_else(|e| panic!("T3: {e}"));
+    // The source flow goes before the target is built: the two never coexist (see [`Field`]).
+    let field = snapshot(&from).unwrap_or_else(|e| panic!("T3: {e}"));
+    drop(from);
+    let run = t3.try_run_from(Some(Box::new(move |flow: &mut Flow| transfer(&field, flow)))).unwrap_or_else(|e| panic!("T3: {e}"));
     let a = run.reattachment.acceptance();
     println!(
         "T3 x_r {:?} H (mean-shear reading); mean of {} block reattachments {:.4} H, 95 % half-width {:?} (relative {:?}), half-window drift {:?}; {} steps = {:.1} H/U, settled {} ({:?}), {} blocks refused, {} censored
