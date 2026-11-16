@@ -659,6 +659,8 @@ pub struct Flow {
     /// Diagnostic: the wall links' momentum exchange split into wall-normal and tangential parts
     /// ([`Flow::track_wall_split`]).
     wall_split: Option<WallSplitState>,
+    /// The same for the links a filter keeps ([`Flow::track_wall_split_where`]).
+    wall_split_kept: Option<WallSplitState>,
     groups: Vec<Group>,
     /// Per direction, the index offset of the neighbour a population streams from.
     offset: [isize; Q],
@@ -1788,6 +1790,7 @@ impl Flow {
             acceleration: setup.acceleration,
             forces: vec![[0.0; 3]; groups.len()],
             wall_split: None,
+            wall_split_kept: None,
             groups,
             offset,
             fluid_cells,
@@ -2341,35 +2344,55 @@ impl Flow {
     /// tracked. Not counted: the wall model's and the on-node bounce's shares (their momentum is
     /// tangential by construction). Read only: the flow itself is not changed.
     pub fn track_wall_split(&mut self, obstacles: &[Obstacle], bodies: &[&str]) -> Result<usize> {
+        let (state, tracked) = self.split_state(obstacles, bodies, &|_, _| true);
+        self.wall_split = Some(state);
+        Ok(tracked)
+    }
+
+    /// As [`Flow::track_wall_split`] into a second, filtered tracker (read with
+    /// [`Flow::wall_split_kept`]; the first one is unchanged, so both can run at once): a link counts
+    /// only where `keep(hit, normal)` says so, from the point where its segment meets the surface and
+    /// the surface's unit normal there.
+    pub fn track_wall_split_where(&mut self, obstacles: &[Obstacle], bodies: &[&str], keep: impl Fn([f64; 3], [f64; 3]) -> bool) -> Result<usize> {
+        let (state, tracked) = self.split_state(obstacles, bodies, &keep);
+        self.wall_split_kept = Some(state);
+        Ok(tracked)
+    }
+
+    fn split_state(&self, obstacles: &[Obstacle], bodies: &[&str], keep: &dyn Fn([f64; 3], [f64; 3]) -> bool) -> (WallSplitState, usize) {
         let h = self.grid.spacing;
-        let trees: Vec<(Option<TriangleTree>, bool)> =
-            obstacles.iter().map(|o| (Some(TriangleTree::new(&o.surface)), bodies.contains(&o.body.as_str()))).collect();
+        let trees: Vec<(TriangleTree, bool)> = obstacles.iter().map(|o| (TriangleTree::new(&o.surface), bodies.contains(&o.body.as_str()))).collect();
         let mut normals = vec![[0.0; 3]; self.links.len()];
         let mut tracked = 0usize;
         for (i, link) in self.links.iter().enumerate() {
             let Rule::Bounce { group, .. } = link.rule else { continue };
             let Some(body) = self.groups.get(group as usize).and_then(|g| g.body.as_deref()) else { continue };
             let Some(k) = obstacles.iter().position(|o| o.body == body) else { continue };
-            let Some((Some(tree), true)) = trees.get(k).map(|t| (t.0.as_ref(), t.1)) else { continue };
+            let Some((tree, true)) = trees.get(k).map(|t| (&t.0, t.1)) else { continue };
             let (p0, cq) = (self.grid.centre(link.cell as usize), c(link.q as usize));
             let p1 = [0, 1, 2].map(|a| p0[a] - cq[a] * h);
             let t = tree.first_hit(p0, p1).unwrap_or(0.5);
             let hit = [0, 1, 2].map(|a| p0[a] + t * (p1[a] - p0[a]));
             if let Some((_, n)) = tree.nearest_surface(hit)
+                && keep(hit, n)
                 && let Some(slot) = normals.get_mut(i)
             {
                 *slot = n;
                 tracked += 1;
             }
         }
-        self.wall_split = Some(WallSplitState { normals, last: WallSplit::default() });
-        Ok(tracked)
+        (WallSplitState { normals, last: WallSplit::default() }, tracked)
     }
 
     /// The tracked links' momentum exchange at the last step, split into its wall-normal and
     /// tangential parts (lattice units: force per step), or `None` before [`Flow::track_wall_split`].
     pub fn wall_split(&self) -> Option<WallSplit> {
         self.wall_split.as_ref().map(|s| s.last)
+    }
+
+    /// The filtered tracker's split at the last step ([`Flow::track_wall_split_where`]).
+    pub fn wall_split_kept(&self) -> Option<WallSplit> {
+        self.wall_split_kept.as_ref().map(|s| s.last)
     }
 
     /// Obstacles that cover no cell centre.
@@ -3633,31 +3656,35 @@ impl Flow {
             }
         }
         // The tracked links' exchange split by the wall normal (a diagnostic, [`Flow::track_wall_split`]).
-        if let Some(split) = &mut self.wall_split {
-            split.last = WallSplit::default();
-            let mut add = |link: usize, q: usize, amount: f64| {
-                let Some(n) = split.normals.get(link).copied().filter(|n| *n != [0.0; 3]) else { return };
-                let cq = c(q);
-                // The force of the link: -c_q times what it exchanged.
-                let f = [-cq[0] * amount, -cq[1] * amount, -cq[2] * amount];
-                let fn_ = f[0] * n[0] + f[1] * n[1] + f[2] * n[2];
-                for a in 0..3 {
-                    split.last.normal[a] += fn_ * n[a];
-                    split.last.tangential[a] += f[a] - fn_ * n[a];
-                }
-            };
+        if self.wall_split.is_some() || self.wall_split_kept.is_some() {
+            // What each link exchanged this step: its index, direction and the amount along -c_q.
+            let mut exchanged: Vec<(usize, usize, f64)> = Vec::new();
             for (i, link) in self.links.iter().enumerate() {
                 if let Rule::Bounce { du, .. } = link.rule {
                     let (cell, q) = (link.cell as usize, link.q as usize);
                     let out = self.f[opposite(q) * s + cell];
-                    add(i, q, out + out + du * self.wall_ramp);
+                    exchanged.push((i, q, out + out + du * self.wall_ramp));
                 }
             }
             if let Some(ip) = &self.interpolated {
                 for e in ip.entries() {
                     let (cell, q) = (e.cell as usize, usize::from(e.dir));
                     if let Some(v) = crate::interpolated::Interpolated::incoming(e, &self.f, s) {
-                        add(e.link as usize, q, v - self.f[opposite(q) * s + cell]);
+                        exchanged.push((e.link as usize, q, v - self.f[opposite(q) * s + cell]));
+                    }
+                }
+            }
+            for split in [self.wall_split.as_mut(), self.wall_split_kept.as_mut()].into_iter().flatten() {
+                split.last = WallSplit::default();
+                for &(link, q, amount) in &exchanged {
+                    let Some(n) = split.normals.get(link).copied().filter(|n| *n != [0.0; 3]) else { continue };
+                    let cq = c(q);
+                    // The force of the link: -c_q times what it exchanged.
+                    let f = [-cq[0] * amount, -cq[1] * amount, -cq[2] * amount];
+                    let fn_ = f[0] * n[0] + f[1] * n[1] + f[2] * n[2];
+                    for a in 0..3 {
+                        split.last.normal[a] += fn_ * n[a];
+                        split.last.tangential[a] += f[a] - fn_ * n[a];
                     }
                 }
             }
@@ -3979,6 +4006,7 @@ impl crate::backend::Backend for Flow {
             surface,
             interpolated: _,
             wall_split: _,
+            wall_split_kept: _,
             force_half_way_above: _,
         } = self;
         let n = *n;

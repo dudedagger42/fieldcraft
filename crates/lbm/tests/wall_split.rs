@@ -38,6 +38,10 @@ fn channel(q: f64, steps: u64) -> (fieldcraft_lbm::Flow, f64, usize) {
     flow.interpolate_walls_with(&setup, &obstacles, WallOrder::Linear).unwrap();
     let tracked = flow.track_wall_split(&obstacles, &["Floor", "Roof"]).unwrap();
     assert!(tracked > 0);
+    // The filtered tracker keeps the floor's links only (the hit lies below the channel's mid-plane).
+    let mid = 0.5 * (height - 1.0) + 0.5;
+    let floor = flow.track_wall_split_where(&obstacles, &["Floor", "Roof"], |hit, _| hit[1] < mid).unwrap();
+    assert!(floor > 0 && floor < tracked);
     for _ in 0..steps {
         flow.step().unwrap();
     }
@@ -91,4 +95,14 @@ fn fluid_at_rest_under_gravity_presses_on_the_floor_and_does_not_rub() {
     println!("normal y {:.4e}, weight {weight:.4e}, tangential {:?}", split.normal[1], split.tangential);
     assert!((split.normal[1].abs() / weight - 1.0).abs() < 5e-2, "{} against {weight}", split.normal[1]);
     assert!(split.tangential.iter().all(|v| v.abs() < 1e-3 * weight));
+}
+
+/// A second tracker with a filter runs beside the first: the floor alone carries half the friction
+/// of the symmetric channel, and the first tracker's total is the one the other tests check.
+#[test]
+fn a_filtered_tracker_runs_beside_the_first() {
+    let (flow, _, _) = channel(0.75, 6000);
+    let (all, floor) = (flow.wall_split().unwrap(), flow.wall_split_kept().unwrap());
+    println!("friction: all {:.6e}, floor {:.6e}", all.tangential[0], floor.tangential[0]);
+    assert!((floor.tangential[0] / all.tangential[0] - 0.5).abs() < 1e-3);
 }
