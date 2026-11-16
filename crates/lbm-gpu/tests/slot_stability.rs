@@ -298,8 +298,13 @@ fn slotted_channel_stability() {
         println!(
             "SLOT wall-to-wall {width:.4} m; open cells across the slot in each of the {layers} plate layers (face layers first and last): {counts:?}"
         );
+        // With ROUND the rounded corners widen the layers at each end (radius r = ROUND * slot width cells): only the layers beyond them
+        // must be exact.
+        let skip = if round > 0.0 { (round * slot_w).ceil() as usize + 1 } else { 1 };
+        let all_rounded = round > 0.0 && counts.len() <= 2 * skip;
+        let interior = if counts.len() > 2 * skip { &counts[skip..counts.len() - skip] } else { interior };
         assert!(
-            swept || (!interior.is_empty() && interior.iter().all(|&c| c as f64 == cells)),
+            swept || all_rounded || (!interior.is_empty() && interior.iter().all(|&c| c as f64 == cells)),
             "the slot is not {cells} cells wall to wall in every interior plate layer: {counts:?}"
         );
     }
@@ -731,6 +736,7 @@ fn slotted_channel_stability() {
         println!("DIAG4 source: {source} fields at step {done}");
         {
             let sec = |i: usize| -> (usize, f64, f64, f64, f64) {
+                let i = i.min(nx.saturating_sub(1));
                 // open cells, total, mean density, mean u_x over open cells (lattice), max |u| (lattice)
                 let (mut open, mut rho, mut ux, mut um) = (0usize, 0.0, 0.0, 0.0f64);
                 for k in 0..nz {
@@ -832,6 +838,7 @@ fn slotted_channel_stability() {
             // mean over the fluid cells of the section) at x 0.4, less the same at the downstream plane, over 0.5 u_nom^2.
             {
                 let p_tot = |i: usize| -> f64 {
+                    let i = i.min(nx.saturating_sub(1));
                     let (mut n, mut s) = (0usize, 0.0);
                     for k in 0..nz {
                         for j in 0..ny {
