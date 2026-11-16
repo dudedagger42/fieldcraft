@@ -23,6 +23,51 @@ fn env(k: &str, d: f64) -> f64 {
     std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
 }
 
+/// The faces of a [`rounded_plate`]: the two ends in y and the side wall.
+const ROUND_FACES: [&str; 3] = ["y_min", "y_max", "wall"];
+
+/// A plate across the slot as an extruded convex polygon: the box x in `x`, z in `z`, extruded over `y`, with its two corners on the
+/// slot side (the top of the lower plate, the bottom of the upper one) rounded by radius `r` (16 chords per corner).
+fn rounded_plate(x: [f64; 2], z: [f64; 2], y: [f64; 2], r: f64, slot_above: bool) -> fieldcraft_mesh::surface::BoundarySurface {
+    let m = 16usize;
+    // The polygon counter-clockwise in (x, z): start at the far corner, go round. For a plate whose slot side is the top (slot_above),
+    // the rounded corners are (x1, z1) and (x0, z1); otherwise (x0, z0) and (x1, z0).
+    let (z_far, z_slot) = if slot_above { (z[0], z[1]) } else { (z[1], z[0]) };
+    let s = if slot_above { 1.0 } else { -1.0 };
+    let mut poly: Vec<[f64; 2]> = vec![[x[0], z_far], [x[1], z_far]];
+    // The arc at x1 (centre (x1 - r, z_slot - s r)), from the side wall up to the slot face.
+    for k in 0..=m {
+        let a = 0.5 * std::f64::consts::PI * k as f64 / m as f64;
+        poly.push([x[1] - r + r * a.cos(), z_slot - s * r + s * r * a.sin()]);
+    }
+    // The arc at x0 (centre (x0 + r, z_slot - s r)), from the slot face down to the side wall.
+    for k in 0..=m {
+        let a = 0.5 * std::f64::consts::PI * (1.0 + k as f64 / m as f64);
+        poly.push([x[0] + r + r * a.cos(), z_slot - s * r + s * r * a.sin()]);
+    }
+    if !slot_above {
+        poly.reverse();
+    }
+    let n = poly.len();
+    let mut positions: Vec<[f64; 3]> = poly.iter().map(|p| [p[0], y[0], p[1]]).collect();
+    positions.extend(poly.iter().map(|p| [p[0], y[1], p[1]]));
+    let (mut tris, mut tags) = (Vec::new(), Vec::new());
+    for k in 1..n as u32 - 1 {
+        tris.push([0, k, k + 1]);
+        tags.push(0);
+        tris.push([n as u32, n as u32 + k, n as u32 + k + 1]);
+        tags.push(1);
+    }
+    for k in 0..n as u32 {
+        let k1 = (k + 1) % n as u32;
+        tris.push([k, k1, n as u32 + k1]);
+        tris.push([k, n as u32 + k1, n as u32 + k]);
+        tags.extend([2, 2]);
+    }
+    let centre = [0.5 * (x[0] + x[1]), 0.5 * (y[0] + y[1]), 0.5 * (z[0] + z[1])];
+    surface(positions, tris, tags, move |c, _| [c[0] - centre[0], c[1] - centre[1], c[2] - centre[2]])
+}
+
 #[test]
 #[ignore = "local: GPU run, approved per run"]
 fn slotted_channel_stability() {
@@ -101,6 +146,16 @@ fn slotted_channel_stability() {
         obstacle("PlateLow", cuboid([0.6, y0, z0], [x_hi, y1, 0.4]), &CUBOID_FACES),
         obstacle("PlateHigh", cuboid([0.6, y0, z_hi], [x_hi, y1, 1.0 + 1.0]), &CUBOID_FACES),
     ];
+    // ROUND (the slot edges' radius over the slot width, 0: sharp): the two plates' slot-side corners are quarter cylinders (tessellated
+    // in 16 chords each); at most half the plate's thickness. Needs the exact plate (LAW=none).
+    let round = env("ROUND", 0.0);
+    if round > 0.0 {
+        assert!(exact, "ROUND needs the exact plate (LAW=none, or a *_surface law)");
+        let r = round * slot_w * dx;
+        assert!(r <= 0.5 * plate_t + 1e-12, "the radius {r} m is more than half the plate's {plate_t} m thickness");
+        obstacles[0] = obstacle("PlateLow", rounded_plate([0.6, x_hi], [z0, 0.4], [y0, y1], r, true), &ROUND_FACES);
+        obstacles[1] = obstacle("PlateHigh", rounded_plate([0.6, x_hi], [z_hi, 2.0], [y0, y1], r, false), &ROUND_FACES);
+    }
     if slabs {
         let (a, b) = (-ext_up - 1.0, 3.0 + ext_dn);
         obstacles.push(obstacle("SlabYLow", cuboid([a, -1.0, -1.0], [b, 0.0, 2.0]), &CUBOID_FACES));
@@ -120,6 +175,8 @@ fn slotted_channel_stability() {
         Ok("none") => None,
         _ => Some(Turbulence::SpalartAllmaras { prandtl: 0.9, wall_model, inflow_ratio: 3.0, ddes: None }),
     };
+    // COLLISION: hrr (default, sigma 0.95) or mrt.
+    let mrt = std::env::var("COLLISION").is_ok_and(|v| v == "mrt");
     let p = Procedure::Fluid {
         domain: "Flow".into(),
         end_time: None,
@@ -127,8 +184,8 @@ fn slotted_channel_stability() {
         time_step: Some(dt),
         frames: 2,
         magic: None,
-        sigma: Some(HrrSigma::Value(0.95)),
-        collision: Some(Collision::Hrr),
+        sigma: if mrt { None } else { Some(HrrSigma::Value(0.95)) },
+        collision: Some(if mrt { Collision::Mrt } else { Collision::Hrr }),
         turbulence: sa,
         steady: None,
     };
@@ -145,6 +202,29 @@ fn slotted_channel_stability() {
         }
     };
     let mut cpu = fieldcraft_lbm::Flow::new(&setup, &obstacles).unwrap();
+    // INTERP=1: the plates' links interpolate where the surface crosses them (QUAD=1 quadratic, else linear), MASSFIX 0 off, 1 local,
+    // 2 spread (default 2); CPU only. FORCE_HALF_ABOVE=q (0 off): every link of q above it keeps the half-way rule (a diagnostic of where
+    // an instability lives, not a scheme; needs the library switch).
+    if env("INTERP", 0.0) > 0.5 {
+        let order =
+            if env("QUAD", 0.0) > 0.5 { fieldcraft_lbm::interpolated::WallOrder::Quadratic } else { fieldcraft_lbm::interpolated::WallOrder::Linear };
+        let above = env("FORCE_HALF_ABOVE", 0.0);
+        if above > 0.0 {
+            cpu.force_half_way_above(Some(above));
+            println!("WALLS every link of q above {above} keeps half way (diagnostic)");
+        }
+        let r = cpu.interpolate_walls_with(&setup, &obstacles, order).unwrap_or_else(|e| panic!("interpolated walls refused: {e}"));
+        let fix = match env("MASSFIX", 2.0) as u32 {
+            0 => fieldcraft_lbm::interpolated::MassFix::Off,
+            1 => fieldcraft_lbm::interpolated::MassFix::Local,
+            _ => fieldcraft_lbm::interpolated::MassFix::Spread,
+        };
+        cpu.set_wall_mass_correction(fix).unwrap_or_else(|e| panic!("{e}"));
+        println!(
+            "WALLS interpolated ({order:?}, mass fix {fix:?}): {} links, {} interpolated ({} quadratic), {} half way, {} without a second node, {} without a surface",
+            r.links, r.interpolated, r.quadratic, r.half_way, r.no_second_node, r.no_surface
+        );
+    }
     let n = cpu.grid().len();
     let [nx, ny, nz] = cpu.grid().cells;
     let scale = setup.velocity_scale();
