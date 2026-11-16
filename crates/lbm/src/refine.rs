@@ -1106,7 +1106,8 @@ mod tests {
             free_surface: None,
             absorbing: None,
             moving_wall_ramp: None,
-            radial_inflow: None, inflow_table: None,
+            radial_inflow: None,
+            inflow_table: None,
         };
         m.add_fluid_domain("Flow", d).unwrap();
         let p = Procedure::Fluid {
