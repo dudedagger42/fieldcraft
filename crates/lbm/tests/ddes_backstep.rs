@@ -255,6 +255,12 @@ fn spread(values: &[f64], scale: f64) -> f64 {
 /// oldest first: the x_r and largest shear spread when the last `STEADY_BLOCKS` blocks pass, else
 /// `None` (fewer blocks, a value that is not finite, or a spread over its tolerance).
 fn steady(recent: &[(f64, Vec<f64>)]) -> Option<(f64, f64)> {
+    steady_spreads(recent).filter(|(x_r, shear)| *x_r < STEADY_X_R && *shear < STEADY_SHEAR)
+}
+
+/// The two spreads the steady rule tests over the last `STEADY_BLOCKS` blocks (x_r relative, floor shear against the
+/// floor's scale), whether or not they pass; none for fewer blocks or a value that is not finite.
+fn steady_spreads(recent: &[(f64, Vec<f64>)]) -> Option<(f64, f64)> {
     let window = recent.get(recent.len().checked_sub(STEADY_BLOCKS)?..)?;
     let strips = window.first()?.1.len();
     if window.iter().any(|(x, t)| !x.is_finite() || t.len() != strips || t.iter().any(|v| !v.is_finite())) {
@@ -264,7 +270,7 @@ fn steady(recent: &[(f64, Vec<f64>)]) -> Option<(f64, f64)> {
     let x_r = spread(&x_r, (x_r.iter().sum::<f64>() / x_r.len() as f64).abs());
     let scale = window.iter().flat_map(|(_, t)| t).fold(0.0, |a: f64, v| a.max(v.abs()));
     let shear = (0..strips).map(|s| spread(&window.iter().filter_map(|(_, t)| t.get(s).copied()).collect::<Vec<f64>>(), scale)).fold(0.0, f64::max);
-    (x_r < STEADY_X_R && shear < STEADY_SHEAR).then_some((x_r, shear))
+    Some((x_r, shear))
 }
 
 /// Lengths within this of each other are equal (grid coordinates are sums of cell sizes).
@@ -752,6 +758,18 @@ impl Step {
         let readings = Readings::of(&floor_x, &floor_of(&mean), &window.floor);
         for line in window.floor.describe() {
             println!("{line}");
+        }
+        if rule.is_none() {
+            match steady_spreads(&recent) {
+                Some((x_r, shear)) => println!(
+                    "capped: x_r spread {x_r:.1e} over the last {STEADY_BLOCKS} blocks (rule < {STEADY_X_R:.0e}: {}), floor shear spread {shear:.1e} (rule < {STEADY_SHEAR:.0e}: {})",
+                    if x_r < STEADY_X_R { "met" } else { "not met" },
+                    if shear < STEADY_SHEAR { "met" } else { "not met" }
+                ),
+                None => println!(
+                    "capped: the steady rule's spreads are not available (fewer than {STEADY_BLOCKS} whole blocks, or a block with a non-finite value)"
+                ),
+            }
         }
         let partial = if rule.is_some() { "" } else { "partial (the run stopped unsettled, at its step cap): " };
         println!("{partial}{readings}");
