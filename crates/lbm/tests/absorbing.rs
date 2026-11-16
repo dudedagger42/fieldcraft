@@ -92,13 +92,14 @@ fn open_box_with(collision: Collision, outflow: Outflow, turbulence: Option<Turb
 /// - TRT with a convective outlet;
 /// - Smagorinsky on Han's on-node wall with TRT, whose floor nodes meet the inlet and outlet.
 ///
-/// The last was re-pinned when the inlet cell on Han's node row took the wall's velocity.
+/// The last was re-pinned when the inlet cell on Han's node row took the wall's velocity; the MRT
+/// one when a velocity inlet's non-equilibrium began to be projected under MRT.
 #[test]
 fn open_faces_without_a_layer_are_pinned_bit_for_bit() {
     let han = Turbulence::Smagorinsky { constant: 0.1, prandtl: 0.9, van_driest: None, wall_model: Some(WallModel::SpaldingBounce) };
     let cases: [(&str, Collision, Outflow, Option<Turbulence>, u64); 4] = [
         ("laminar trt uniform", Collision::Trt, Outflow::Uniform, None, 0x2d98_aaea_28a4_8d4a),
-        ("laminar mrt uniform", Collision::Mrt, Outflow::Uniform, None, 0x8588_26fd_d1fa_8def),
+        ("laminar mrt uniform", Collision::Mrt, Outflow::Uniform, None, 0x8609_1779_d3ed_163d),
         ("laminar trt convective", Collision::Trt, Outflow::Convective, None, 0x0fdb_4d11_38e7_26f3),
         ("han trt uniform", Collision::Trt, Outflow::Uniform, Some(han), 0xc08a_af58_6724_f84b),
     ];
