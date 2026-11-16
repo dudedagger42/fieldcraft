@@ -19,6 +19,7 @@ struct Arm {
     collision: Collision,
     interpolate: bool,
     forced: bool,
+    extrapolated: bool,
 }
 
 fn run(arm: Arm, tau_minus_half: f64, q: f64, steps: usize) -> String {
@@ -51,6 +52,7 @@ fn run(arm: Arm, tau_minus_half: f64, q: f64, steps: usize) -> String {
         return "refused".into();
     };
     if arm.interpolate {
+        flow.extrapolate_above_half(arm.extrapolated);
         if arm.forced {
             flow.force_half_way_above(Some(0.5));
         }
@@ -104,13 +106,30 @@ fn the_s1_arms_on_the_aligned_channel() {
     };
     let steps = std::env::var("SCAN_STEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(20_000usize);
     let arms = [
-        Arm { name: "arm 1: regularised, linear", collision: Collision::Regularized, interpolate: true, forced: false },
-        Arm { name: "arm 2: MRT, linear", collision: Collision::Mrt, interpolate: true, forced: false },
-        Arm { name: "arm 3: regularised, linear, q>1/2 half-way", collision: Collision::Regularized, interpolate: true, forced: true },
-        Arm { name: "arm 4: regularised, half-way walls", collision: Collision::Regularized, interpolate: false, forced: false },
+        Arm { name: "arm 1: regularised, linear", collision: Collision::Regularized, interpolate: true, forced: false, extrapolated: false },
+        Arm { name: "arm 2: MRT, linear", collision: Collision::Mrt, interpolate: true, forced: false, extrapolated: false },
+        Arm {
+            name: "arm 3: regularised, linear, q>1/2 half-way",
+            collision: Collision::Regularized,
+            interpolate: true,
+            forced: true,
+            extrapolated: false,
+        },
+        Arm { name: "arm 4: regularised, half-way walls", collision: Collision::Regularized, interpolate: false, forced: false, extrapolated: false },
+        Arm {
+            name: "arm 5: regularised, linear, q>1/2 extrapolated",
+            collision: Collision::Regularized,
+            interpolate: true,
+            forced: false,
+            extrapolated: true,
+        },
     ];
+    let qs: Vec<f64> = match std::env::var("SCAN_Q") {
+        Ok(v) => v.split(',').filter_map(|t| t.trim().parse::<f64>().ok()).collect(),
+        Err(_) => vec![0.75, 0.25],
+    };
     for arm in arms {
-        for q in [0.75, 0.25] {
+        for &q in &qs {
             for &t in &taus {
                 println!("{} q {q} tau-1/2 {t:.2e}: {}", arm.name, run(arm, t, q, steps));
             }

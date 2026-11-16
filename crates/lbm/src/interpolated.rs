@@ -304,7 +304,8 @@ impl Interpolated {
     pub(crate) fn incoming(entry: &Entry, f: &[f64], stride: usize) -> Option<f64> {
         let into = f.get(opposite(usize::from(entry.dir)) * stride + entry.cell as usize).copied()?;
         let q = entry.wall;
-        if q < 0.5 {
+        // order 3: a diagnostic, the `q < 1/2` formula extrapolated to `q > 1/2`.
+        if q < 0.5 || entry.order == 3 {
             let back = f.get(opposite(usize::from(entry.dir)) * stride + entry.behind as usize).copied()?;
             if entry.order == 2 {
                 let back2 = f.get(opposite(usize::from(entry.dir)) * stride + entry.behind2 as usize).copied()?;

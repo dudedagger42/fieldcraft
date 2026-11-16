@@ -611,6 +611,8 @@ pub struct Flow {
     wall_bounce: bool,
     /// Diagnostic only (stability studies): links whose fraction `q` is above this keep the half-way rule.
     force_half_way_above: Option<f64>,
+    /// Diagnostic only: links with `q > ½` use the `q < ½` formula, extrapolated.
+    extrapolate_above_half: bool,
     /// Han et al.'s on-node wall-function bounce (`spalding_bounce`): its boundary nodes.
     nodes: Option<WallNodes>,
     /// The inlet cells the on-node wall law's corner rule made wall cells.
@@ -1721,6 +1723,7 @@ impl Flow {
             wall_model: setup.wall_model == Some(WallModel::Musker),
             wall_bounce: setup.wall_model == Some(WallModel::SpaldingBounceHalfway),
             force_half_way_above: None,
+            extrapolate_above_half: false,
             nodes: on_node.then(|| {
                 let mut node_list = node_list;
                 if surface_model {
@@ -2059,6 +2062,13 @@ impl Flow {
         self.force_half_way_above = q_min;
     }
 
+    /// A diagnostic for stability studies, never a scheme: when the walls are interpolated afterwards
+    /// (linear rule), links with `q > ½` use the formula of `q < ½`, `2q f*_i(x) + (1 - 2q) f*_i(x - c_i)`,
+    /// extrapolated (a coefficient outside 0 to 1). Call it before `interpolate_walls`.
+    pub fn extrapolate_above_half(&mut self, on: bool) {
+        self.extrapolate_above_half = on;
+    }
+
     /// [`Flow::interpolate_walls`] with the rule's order: linear, or quadratic where three fluid nodes lie in line.
     pub fn interpolate_walls_with(
         &mut self,
@@ -2172,6 +2182,9 @@ impl Flow {
                 }
             } else {
                 match behind {
+                    Some(b) if self.extrapolate_above_half && !quadratic => {
+                        Entry { link: index as u32, cell: link.cell, dir: link.q, wall: t, behind: b, behind2: u32::MAX, order: 3 }
+                    }
                     Some(b) if quadratic => {
                         Entry { link: index as u32, cell: link.cell, dir: link.q, wall: t, behind: b, behind2: u32::MAX, order: 2 }
                     }
@@ -3878,6 +3891,7 @@ impl crate::backend::Backend for Flow {
             surface,
             interpolated: _,
             force_half_way_above: _,
+            extrapolate_above_half: _,
         } = self;
         let n = *n;
         fixed(a, n as u64)?;
