@@ -2425,6 +2425,12 @@ impl Flow {
         self.sa.as_ref().and_then(|s| s.ddes.as_ref()).map(|d| d.c_des)
     }
 
+    /// With DDES in a zone, the cells it acts in (one flag per grid cell, [`crate::ddes::zone_mask`]); none without a
+    /// zone (every cell) or without DDES.
+    pub fn ddes_zone(&self) -> Option<&[bool]> {
+        self.sa.as_ref().and_then(|s| s.ddes.as_ref()).and_then(|d| d.zone.as_deref())
+    }
+
     /// With DDES, each cell's length d̃ of the last step (lattice units; 0 outside the fluid).
     pub fn ddes_length(&self) -> Option<&[f64]> {
         self.sa.as_ref().and_then(|s| s.ddes.as_ref()).map(|d| d.length.as_slice())
