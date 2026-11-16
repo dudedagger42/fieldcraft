@@ -98,7 +98,7 @@ fn slotted_channel_stability() {
         d.faces.z_min = FaceCondition::Slip {};
     }
     d.faces.x_min = FaceCondition::Velocity {
-        velocity: [0.1, 0.02, 0.0],
+        velocity: [0.1, env("INLET_VY", 0.02), 0.0],
         profile: if std::env::var("INLET").is_ok_and(|v| v == "uniform") { Profile::Uniform } else { Profile::Parabolic },
     };
     d.faces.x_max = FaceCondition::Pressure { pressure: 0.0, outflow: Outflow::Uniform };
