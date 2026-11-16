@@ -176,7 +176,7 @@ fn cell_buffers(aa: bool, thermal: bool, gradients: bool, sa: bool) -> Vec<CellB
     }
     if sa {
         v.push(buffer("lbm sa nu_tilde", "Spalart–Allmaras ν̃", 4, 1));
-        v.push(buffer("lbm sa rates", "Spalart–Allmaras rates", 8, 1));
+        v.push(buffer("lbm sa rates", "Spalart–Allmaras rates", 16, 1));
         v.push(buffer("lbm sa cells", "Spalart–Allmaras cell data", 16, 1));
     }
     if thermal {
@@ -1574,7 +1574,18 @@ impl GpuFlow {
                     out[2] = *d as f32;
                 }
                 let sa_cell = storage("lbm sa cells", &bytes_f32(&cell));
-                (nu_tilde, empty("lbm sa rates", 8 * n as u64), sa_cell)
+                // Each cell's rate and coefficient (written by the kernel), its own inflow ν̃ (a
+                // tabulated inlet; below 0: the face value) and a spare.
+                let mut rates = filled(4 * n, 0.0f32, "Spalart–Allmaras rates")?;
+                for out in rates.as_chunks_mut::<4>().0.iter_mut() {
+                    out[2] = -1.0;
+                }
+                for &(c, v) in field.inflow_cells() {
+                    if let Some(out) = rates.as_chunks_mut::<4>().0.get_mut(c as usize) {
+                        out[2] = v as f32;
+                    }
+                }
+                (nu_tilde, storage("lbm sa rates", &bytes_f32(&rates)), sa_cell)
             }
             _ => (empty("lbm sa nu_tilde", 16), empty("lbm sa rates", 16), empty("lbm sa cells", 16)),
         };
@@ -2465,7 +2476,7 @@ mod tests {
         let e = check_cell_buffers(226_050_911, None, &cell_buffers(true, false, false, false)).unwrap_err().to_string();
         assert!(e.contains("226050911 cells") && e.contains("`lbm f`") && e.contains("holds 226050910 cells"), "{e}");
         // Each other buffer is refused by itself, at exactly its size.
-        for (b, per_cell) in [("lbm moments", 16u64), ("lbm gradient velocities", 12), ("lbm sa rates", 8), ("lbm sa cells", 16), ("lbm t", 28)] {
+        for (b, per_cell) in [("lbm moments", 16u64), ("lbm gradient velocities", 12), ("lbm sa rates", 16), ("lbm sa cells", 16), ("lbm t", 28)] {
             let one: Vec<_> = cell_buffers(true, true, true, true).into_iter().filter(|x| x.name == b).collect();
             assert_eq!(one.len(), 1, "{b}");
             assert!(check_cell_buffers(100, Some(100 * per_cell), &one).is_ok(), "{b}");

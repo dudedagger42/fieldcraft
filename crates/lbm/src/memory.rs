@@ -59,11 +59,11 @@ const DDES: u64 = F64;
 /// momentum, and its damped populations before they are stored.
 const ABSORBING: u64 = 4 + F64 + 4 * F64 + Q as u64 * F64;
 /// Per cell with the Spalart–Allmaras model on the device: ν̃, its transport rate and
-/// coefficient sum, and the vorticity, wall distance, destruction length and DDES's f_d
+/// coefficient sum with the cell's own inflow ν̃ and a spare (four values), and the vorticity, wall distance, destruction length and DDES's f_d
 /// (lbm-gpu's `nu_tilde`, `sa_rate`, `sa_cell`); while preparing, the distance and the initial ν̃
-/// staged as f32 (the four `sa_cell` values and ν̃).
-pub const DEVICE_SA: u64 = 7 * F32;
-const DEVICE_SA_STAGING: u64 = 5 * F32;
+/// staged as f32 (the four `sa_cell` values, the four rate values and ν̃).
+pub const DEVICE_SA: u64 = 9 * F32;
+const DEVICE_SA_STAGING: u64 = 9 * F32;
 /// Per cell with fans or porous zones, and with conducting obstacles: an index.
 const INDEX: u64 = 4;
 /// Per cell with a free surface: its kind, its mass and fill level, whether it is populated,
