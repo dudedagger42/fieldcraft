@@ -10,7 +10,7 @@
 //!
 //! `cargo test --release -p fieldcraft-lbm --test wall_mrt_inlet -- --ignored --nocapture wall_mrt_inlet`
 //! Environment: `STEPS` (20000), `TAU_MINUS_HALF` (1.8e-4), `LAYER` (1; 0 runs without the absorbing layer), `LENGTH` (160
-//! cells), `HEIGHT` (16 cells), `SIGMA` (0.95), `ULAT` (0.014).
+//! cells), `HEIGHT` (16 cells), `SIGMA` (0.95), `ULAT` (0.014), `HEIGHT2` (the gap past column `STRIP`, default HEIGHT), `STRIP` (33), `UNIFORM`, `EVERY` (10, the sampling interval), `SHOW` (1000, the pair gap list), `INIT` (1, the initial velocity as a share of ULAT), `ARMS` (1: the three-arm strip study).
 
 mod common;
 
@@ -36,27 +36,31 @@ fn plane(flow: &fieldcraft_lbm::Flow, i: usize) -> f64 {
     sum
 }
 
-fn run(wall_mrt: bool, tau_minus_half: f64, steps: u64) -> String {
+/// One arm: `sigma1` (the wall-layer sigma = 1 study knob, 0 off), `wall_mrt`. The channel is the gap between two plates that start at
+/// the inlet face: `h` cells high for the first `strip` columns (the strip: solid below, one more plate above), then `h2` cells high
+/// (the region it opens into). Returns the report line.
+fn run(sigma1: u8, wall_mrt: bool, tau_minus_half: f64, steps: u64) -> String {
     let nu = tau_minus_half / 3.0;
     let u = env("ULAT", 0.014);
-    // the channel is the gap between two plates (solid cells) that start at the inlet face, as the slot's plates do: its wall cells
-    // touch the inlet face; z is the wall-normal axis, y (4 cells) is periodic
-    let (nx, ny, h) = (env("LENGTH", 160.0) as usize, 4usize, env("HEIGHT", 16.0) as usize);
-    let nz = h + 16;
+    let (nx, ny) = (env("LENGTH", 160.0) as usize, 4usize);
+    let (h, h2, strip) = (env("HEIGHT", 16.0) as usize, env("HEIGHT2", env("HEIGHT", 16.0)) as usize, env("STRIP", 33.0));
+    let (gap_lo, nz) = (8.0, h.max(h2) + 16);
     let mut d = domain([0.0; 3], [nx as f64, ny as f64, nz as f64], 1.0);
     d.faces.y_min = FaceCondition::Periodic {};
     d.faces.y_max = FaceCondition::Periodic {};
     d.faces.z_min = FaceCondition::Slip {};
     d.faces.z_max = FaceCondition::Slip {};
-    d.obstacles = vec!["PlateLow".into(), "PlateHigh".into()];
+    d.obstacles = vec!["PlateLow".into(), "PlateHigh".into(), "PlateHigh2".into()];
     let (xl, xh, yl, yh) = (-2.0, nx as f64 + 2.0, -2.0, ny as f64 + 2.0);
     let obstacles = vec![
-        obstacle("PlateLow", cuboid([xl, yl, -2.0], [xh, yh, 8.0]), &CUBOID_FACES),
-        obstacle("PlateHigh", cuboid([xl, yl, 8.0 + h as f64], [xh, yh, nz as f64 + 2.0]), &CUBOID_FACES),
+        obstacle("PlateLow", cuboid([xl, yl, -2.0], [xh, yh, gap_lo]), &CUBOID_FACES),
+        obstacle("PlateHigh", cuboid([xl, yl, gap_lo + h as f64], [strip, yh, nz as f64 + 2.0]), &CUBOID_FACES),
+        obstacle("PlateHigh2", cuboid([strip, yl, gap_lo + h2 as f64], [xh, yh, nz as f64 + 2.0]), &CUBOID_FACES),
     ];
-    d.faces.x_min = FaceCondition::Velocity { velocity: [u, 0.0, 0.0], profile: Profile::Parabolic };
+    let uniform = env("UNIFORM", 0.0) > 0.5;
+    d.faces.x_min = FaceCondition::Velocity { velocity: [u, 0.0, 0.0], profile: if uniform { Profile::Uniform } else { Profile::Parabolic } };
     d.faces.x_max = FaceCondition::Pressure { pressure: 0.0, outflow: Outflow::Uniform };
-    d.initial_velocity = [u, 0.0, 0.0];
+    d.initial_velocity = [u * env("INIT", 1.0), 0.0, 0.0];
     if env("LAYER", 1.0) > 0.5 {
         d.absorbing = Some(AbsorbingLayer { thickness: None, strength: None, filter_time: None });
     }
@@ -67,27 +71,51 @@ fn run(wall_mrt: bool, tau_minus_half: f64, steps: u64) -> String {
     }
     let (_, mut flow) = prepare(&model(1.0, nu, d, p), &obstacles);
     flow.set_wall_layer_mrt(wall_mrt);
+    flow.set_wall_layer_sigma_one(sigma1);
     let (a, b) = (nx / 4, 3 * nx / 4);
-    let mut done = 0u64;
-    let mut stop = String::new();
-    let mut peak = 0.0f64;
-    let mut worst_rho = 0.0f64;
+    let (mut done, mut stop) = (0u64, String::new());
+    let (mut peak, mut worst_rho, mut worst_cell) = (0.0f64, 0.0f64, [0usize; 3]);
+    let mut pair: Vec<String> = Vec::new();
+    let mut last = String::new();
+    let every = env("EVERY", 10.0) as u64;
+    let show = env("SHOW", 1000.0) as u64;
+    let g = *flow.grid();
     for s in 0..steps {
         if let Err(e) = flow.step() {
             stop = format!(" STOPPED at step {s}: {e}");
             break;
         }
         done = s + 1;
-        if done % 250 == 0 || done == steps {
+        if done % every == 0 || done == steps {
             peak = 0.0;
             worst_rho = 0.0;
-            for c in 0..flow.grid().len() {
-                if flow.is_fluid(c)
-                    && let Some((rho, v)) = flow.moments(c)
-                {
-                    peak = peak.max((v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt());
-                    worst_rho = worst_rho.max((rho - 1.0).abs());
+            let mut pair_gap = 0.0f64;
+            for c in 0..g.len() {
+                if !flow.is_fluid(c) {
+                    continue;
                 }
+                if let Some((rho, v)) = flow.moments(c) {
+                    peak = peak.max((v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt());
+                    if (rho - 1.0).abs() > worst_rho {
+                        worst_rho = (rho - 1.0).abs();
+                        worst_cell = g.coords(c);
+                    }
+                    // the 2 dx pair: this cell's density against the mean of its two x neighbours (fluid ones only)
+                    let p = g.coords(c);
+                    if p[0] >= 1 && p[0] + 1 < nx {
+                        let (l, r) = (g.index([p[0] - 1, p[1], p[2]]), g.index([p[0] + 1, p[1], p[2]]));
+                        if flow.is_fluid(l)
+                            && flow.is_fluid(r)
+                            && let (Some((rl, _)), Some((rr, _))) = (flow.moments(l), flow.moments(r))
+                        {
+                            pair_gap = pair_gap.max((rho - 0.5 * (rl + rr)).abs());
+                        }
+                    }
+                }
+            }
+            last = format!("last sample step {done}: peak speed {peak:.4}, largest |rho-1| {worst_rho:.3e} at cell {worst_cell:?}, 2dx pair {pair_gap:.2e}");
+            if done % show == 0 {
+                pair.push(format!("{done}:{pair_gap:.2e}"));
             }
             if !peak.is_finite() || peak > 0.5 {
                 stop = format!(" RUNAWAY at step {done}: peak speed {peak}");
@@ -97,20 +125,21 @@ fn run(wall_mrt: bool, tau_minus_half: f64, steps: u64) -> String {
     }
     let (fa, fb) = (plane(&flow, a), plane(&flow, b));
     format!(
-        "WALLMRT-INLET wall_mrt {wall_mrt} tau-1/2 {tau_minus_half:e} sigma {} layer {} steps {done} of {steps}{stop}: peak speed {peak:.4}, largest |rho-1| {worst_rho:.3e}, flux at x={a} {fa:.6}, at x={b} {fb:.6}, ratio {:.6} (within 1e-3: {})",
-        env("SIGMA", 0.95),
-        env("LAYER", 1.0),
+        "WALLMRT-STRIP sigma1 {sigma1} wall_mrt {wall_mrt} u {u} {} gap {h}->{h2} strip {strip} tau-1/2 {tau_minus_half:e} steps {done} of {steps}{stop}: {last}; flux at x={a} {fa:.6}, at x={b} {fb:.6}, ratio {:.6}; 2dx pair gap (step:max |rho - mean of x neighbours|) {}",
+        if uniform { "uniform" } else { "parabolic" },
         fb / fa,
-        ((fb / fa) - 1.0).abs() < 1e-3
+        pair.join(" ")
     )
 }
 
 #[test]
-#[ignore = "print-only study: reads STEPS, TAU_MINUS_HALF, LAYER, LENGTH, HEIGHT, SIGMA"]
+#[ignore = "print-only study: reads STEPS, TAU_MINUS_HALF, LAYER, LENGTH, HEIGHT, HEIGHT2, STRIP, UNIFORM, SIGMA, ULAT, EVERY, ARMS"]
 fn wall_mrt_inlet() {
     let steps = env("STEPS", 20_000.0) as u64;
     let tau = env("TAU_MINUS_HALF", 1.8e-4);
-    for wall_mrt in [false, true] {
-        println!("{}", run(wall_mrt, tau, steps));
+    // ARMS: 0 = off and WALL_MRT (default, test 4), 1 = off, WALL_SIGMA1 = 1 and WALL_MRT (the strip study's three arms)
+    let arms: &[(u8, bool)] = if env("ARMS", 0.0) > 0.5 { &[(0, false), (1, false), (0, true)] } else { &[(0, false), (0, true)] };
+    for &(s1, mrt) in arms {
+        println!("{}", run(s1, mrt, tau, steps));
     }
 }
