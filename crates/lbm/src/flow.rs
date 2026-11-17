@@ -708,6 +708,9 @@ pub struct Flow {
     wall_layer_bulk: f64,
     /// A study (off): the wall layer collides with the two-relaxation-time MRT scheme instead of the regularised one.
     wall_layer_mrt: bool,
+    /// The wall-layer MRT's floor on τ − ½ (0: none), absolute and as a ratio to the fluid's own, see `set_wall_tau_floor`.
+    wall_tau_floor: f64,
+    wall_tau_floor_k: f64,
     /// Whether σ is dynamic (set per cell from the subgrid model, [`crate::hrr`]), and then its
     /// smallest and mean value over the fluid cells in the last collision.
     dynamic: bool,
@@ -1832,6 +1835,8 @@ impl Flow {
             wall_layer_sigma_one: 0,
             wall_layer_bulk: 0.0,
             wall_layer_mrt: false,
+            wall_tau_floor: 0.0,
+            wall_tau_floor_k: 0.0,
             dynamic: setup.dynamic_sigma,
             sigma_stats: None,
             gradient_u: if setup.collision == Collision::Hrr || setup.vreman > 0.0 || setup.spalart_allmaras.is_some() {
@@ -2537,6 +2542,25 @@ impl Flow {
     /// of the flow keeps the regularised collision.
     pub fn set_wall_layer_mrt(&mut self, on: bool) {
         self.wall_layer_mrt = on;
+    }
+
+    /// A study (off by default, bit-identical off), used with [`Flow::set_wall_layer_mrt`]: a floor on τ − ½ of the wall layer's MRT
+    /// stresses, so those cells relax no faster than `floor` allows (a larger viscosity there). A value that is not finite or not
+    /// positive switches it off.
+    pub fn set_wall_tau_floor(&mut self, floor: f64) {
+        self.wall_tau_floor = if floor.is_finite() && floor > 0.0 { floor } else { 0.0 };
+    }
+
+    /// The same floor as a ratio `k` to the run's own τ − ½ (the fluid's): the layer's τ − ½ is at least `k` times the fluid's.
+    /// With both set the larger floor applies. Not finite or not positive switches it off.
+    pub fn set_wall_tau_floor_ratio(&mut self, k: f64) {
+        self.wall_tau_floor_k = if k.is_finite() && k > 0.0 { k } else { 0.0 };
+    }
+
+    /// The wall layer's floor on τ − ½ in lattice units ([`Flow::set_wall_tau_floor`], [`Flow::set_wall_tau_floor_ratio`]; 0 when off).
+    pub fn wall_tau_floor(&self) -> f64 {
+        let own = if self.omega_plus > 0.0 { 1.0 / self.omega_plus - 0.5 } else { 0.0 };
+        self.wall_tau_floor.max(self.wall_tau_floor_k * own)
     }
 
     /// The wall's distance from the cell centre the wall-aware gradient uses, in cells (default 0.5, half way): for studies.
@@ -3350,6 +3374,7 @@ impl Flow {
         let wall_gap = self.wall_gap;
         let wall_layer_sigma_one = self.wall_layer_sigma_one;
         let (wall_bulk, wall_mrt) = (self.wall_layer_bulk, self.wall_layer_mrt);
+        let wall_tau_floor = self.wall_tau_floor();
         // The wall layer of the two remedy studies: fluid cells with a solid axis neighbour (empty when neither is on).
         let layer: Vec<bool> = if (wall_bulk > 0.0 || wall_mrt) && regularized {
             let solid = |c: usize| !self.fluid.get(c).copied().unwrap_or(true);
@@ -3510,7 +3535,10 @@ impl Flow {
                 let in_layer = layer.get(b * block + i).copied().unwrap_or(false);
                 // The MRT study: the wall layer relaxes with MRT, at the rate the MRT branch below would use.
                 if regularized && wall_mrt && in_layer {
-                    let rate = wall_rate.or(explicit).unwrap_or(wp);
+                    let mut rate = wall_rate.or(explicit).unwrap_or(wp);
+                    if wall_tau_floor > 0.0 {
+                        rate = rate.min(1.0 / (0.5 + wall_tau_floor));
+                    }
                     if turbulent {
                         eddy(from_rate(rate));
                     }
@@ -4154,6 +4182,8 @@ impl crate::backend::Backend for Flow {
             wall_layer_sigma_one: _,
             wall_layer_bulk: _,
             wall_layer_mrt: _,
+            wall_tau_floor: _,
+            wall_tau_floor_k: _,
             dynamic,
             sigma_stats,
             periodic,

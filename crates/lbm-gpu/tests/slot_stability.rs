@@ -227,6 +227,16 @@ fn slotted_channel_stability() {
     let wall_mrt = env("WALL_MRT", 0.0) > 0.5;
     cpu.set_wall_layer_mrt(wall_mrt);
     println!("CASE WALL_MRT {wall_mrt}");
+    // WALL_TAU_FLOOR_K (default 0, off; CPU only, bit-identical off): with WALL_MRT, the wall layer's MRT stresses relax with tau - 1/2 at least K times the run's own;
+    // WALL_TAU_FLOOR gives the floor in absolute lattice units (the larger applies).
+    cpu.set_wall_tau_floor_ratio(env("WALL_TAU_FLOOR_K", 0.0));
+    cpu.set_wall_tau_floor(env("WALL_TAU_FLOOR", 0.0));
+    println!(
+        "CASE WALL_TAU_FLOOR_K {} WALL_TAU_FLOOR {} (effective floor on tau - 1/2: {:e})",
+        env("WALL_TAU_FLOOR_K", 0.0),
+        env("WALL_TAU_FLOOR", 0.0),
+        cpu.wall_tau_floor()
+    );
     // INTERP=1: the plates' links interpolate where the surface crosses them (QUAD=1 quadratic, else linear), MASSFIX 0 off, 1 local,
     // 2 spread (default 2); CPU only. FORCE_HALF_ABOVE=q (0 off): every link of q above it keeps the half-way rule (a diagnostic of where
     // an instability lives, not a scheme; needs the library switch).
@@ -504,11 +514,7 @@ fn slotted_channel_stability() {
                                 }
                             }
                         }
-                        if t.is_empty() {
-                            "open interior".to_string()
-                        } else {
-                            t.join("+")
-                        }
+                        if t.is_empty() { "open interior".to_string() } else { t.join("+") }
                     };
                     println!(
                         "diag step {done}: max|u| {um:.4} at {im:?} (x {:.3} m; touches {}); max|rho-1| {dr:.4} at {ir:?} (touches {})",
@@ -719,7 +725,9 @@ fn slotted_channel_stability() {
         }
     }
     println!("FRICTION {friction}");
-    println!("PENDING wall mass correction not yet taken back, per fluid cell, sampled at the end of each {chunk}-step chunk: largest |value| {pend_max:.3e}, last {pend_last:+.3e} (a settled run above about 1e-6 is distorted)");
+    println!(
+        "PENDING wall mass correction not yet taken back, per fluid cell, sampled at the end of each {chunk}-step chunk: largest |value| {pend_max:.3e}, last {pend_last:+.3e} (a settled run above about 1e-6 is distorted)"
+    );
     let steps_cap = steps;
     let steps = done;
     // the samples of the backend that ran (the CPU's, or the device's when CPU=0)
@@ -748,7 +756,12 @@ fn slotted_channel_stability() {
             let kmin = ks.iter().cloned().fold(f64::MAX, f64::min);
             println!(
                 "KJUMP-BACK {}; K over all windows from {kmin:.3} to {kmax:.3}",
-                jump.map_or("none".to_string(), |i| format!("at the window ending step {}: K {:.3} -> {:.3}", (i as u64 + 2) * win_steps, ks[i], ks[i + 1]))
+                jump.map_or("none".to_string(), |i| format!(
+                    "at the window ending step {}: K {:.3} -> {:.3}",
+                    (i as u64 + 2) * win_steps,
+                    ks[i],
+                    ks[i + 1]
+                ))
             );
         }
     }
