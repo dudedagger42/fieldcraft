@@ -339,6 +339,16 @@ fn range_after(hist: &[(u64, f64)], from: u64) -> f64 {
     v.iter().cloned().fold(f64::NEG_INFINITY, f64::max) - v.iter().cloned().fold(f64::INFINITY, f64::min)
 }
 
+/// The cross-section's secondary flow: the largest in-plane speed (y and z components combined) and the largest axial speed |u_x|,
+/// over the fluid cells, in lattice units.
+fn secondary_flow(flow: &mut fieldcraft_lbm::Flow, fluid: &[bool]) -> (f64, f64) {
+    let f = Backend::fields(flow).expect("fields");
+    (0..fluid.len()).filter(|&c| fluid[c]).fold((0.0f64, 0.0f64), |(p, a), c| {
+        let u = f.velocity[c];
+        (p.max((u[1] * u[1] + u[2] * u[2]).sqrt()), a.max(u[0].abs()))
+    })
+}
+
 fn flow_rate(flow: &mut fieldcraft_lbm::Flow, fluid: &[bool], along: f64, reference: f64) -> (f64, f64) {
     let f = Backend::fields(flow).expect("fields");
     let sum: f64 = (0..fluid.len()).filter(|&c| fluid[c]).map(|c| f.velocity[c][0]).sum();
@@ -430,6 +440,9 @@ fn product_rows() {
             let mut settled = false;
             let mut drift_last_third = f64::NAN;
             let mut rho = rho0;
+            // PRODUCT-SECONDARY: the in-plane speed over the peak axial speed every `SECONDARY_EVERY` steps (0: off)
+            let (secondary_every, mut next_secondary) = (env("SECONDARY_EVERY", 0.0) as u64, 0u64);
+            let mut secondary_hist: Vec<String> = Vec::new();
             // a quarter of the diffusion time of the cross-section, w^2 / nu in lattice units (the departure detector ignores the spin-up before it)
             let quarter = (w as f64 * w as f64 * 3.0 / tau_mh / 4.0) as u64;
             let mut along_hist: Vec<(u64, f64)> = Vec::new();
@@ -453,6 +466,11 @@ fn product_rows() {
                 rho = r;
                 hist.push((done, rate));
                 along_hist.push((done, along_duct_max(&mut flow, &fluid)));
+                if secondary_every > 0 && done >= next_secondary {
+                    let (inplane, axial) = secondary_flow(&mut flow, &fluid);
+                    secondary_hist.push(format!("{done}:{:.3e}/{axial:.4}={:.3e}", inplane, inplane / axial.max(1e-30)));
+                    next_secondary = done + secondary_every;
+                }
                 if pocket.is_some() {
                     let (all, inside, finite) = speeds(&mut flow, &fluid, w);
                     pocket_max = pocket_max.max(inside);
@@ -490,6 +508,12 @@ fn product_rows() {
             let every = (hist.len() / 40).max(1);
             let series: Vec<String> = hist.iter().step_by(every).map(|(st, r)| format!("{st}:{:+.4}", 100.0 * r)).collect();
             println!("PRODUCT-HISTORY collision {label} tau-1/2 {tau_mh:e} case {name} cells {w}: {}", series.join(" "));
+            if !secondary_hist.is_empty() {
+                println!(
+                    "PRODUCT-SECONDARY collision {label} tau-1/2 {tau_mh:e} case {name} cells {w} (step:in-plane max / axial max = ratio): {}",
+                    secondary_hist.join(" ")
+                );
+            }
             let along_series: Vec<String> = along_hist.iter().step_by(every).map(|(st, a)| format!("{st}:{a:.3e}")).collect();
             println!("PRODUCT-ALONG collision {label} tau-1/2 {tau_mh:e} case {name} cells {w}: {}", along_series.join(" "));
             let along_max = along_hist.last().map_or(f64::NAN, |a| a.1);
