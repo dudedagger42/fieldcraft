@@ -1806,43 +1806,18 @@ fn collide_trt_rate(cell: u32, lid: u32, xyz: vec3<i32>, fq: ptr<function, array
     f[post_index(0u, cell, xyz)] = out0;
 }
 
-// Moment k's polynomial at direction q (fieldcraft_lbm::mrt: d'Humières et al. 2002's D3Q19
-// basis).
-fn mrt_row(k: u32, q: u32) -> f32 {
-    let c = c_of(q);
-    let x = c.x;
-    let y = c.y;
-    let z = c.z;
-    let c2 = x * x + y * y + z * z;
-    var v = 0;
-    switch k {
-        case 0u: { v = 1; }
-        case 1u: { v = 19 * c2 - 30; }
-        case 2u: { v = (21 * c2 * c2 - 53 * c2 + 24) / 2; }
-        case 3u: { v = x; }
-        case 4u: { v = (5 * c2 - 9) * x; }
-        case 5u: { v = y; }
-        case 6u: { v = (5 * c2 - 9) * y; }
-        case 7u: { v = z; }
-        case 8u: { v = (5 * c2 - 9) * z; }
-        case 9u: { v = 3 * x * x - c2; }
-        case 10u: { v = (3 * c2 - 5) * (3 * x * x - c2); }
-        case 11u: { v = y * y - z * z; }
-        case 12u: { v = (3 * c2 - 5) * (y * y - z * z); }
-        case 13u: { v = x * y; }
-        case 14u: { v = y * z; }
-        case 15u: { v = x * z; }
-        case 16u: { v = (y * y - z * z) * x; }
-        case 17u: { v = (z * z - x * x) * y; }
-        default: { v = (x * x - y * y) * z; }
-    }
-    return f32(v);
-}
+const MRT_EE_FIXED: array<f32, 100> = array<f32, 100>(1.24736842, -0.205263158, -0.205263158, -0.205263158, -0.105263158, -0.105263158, -0.105263158, -0.105263158, -0.105263158, -0.105263158, -0.102631579, 0.920292398, -0.0130409357, -0.0130409357, -0.28748538, -0.28748538, -0.28748538, -0.28748538, 0.179181287, 0.179181287, -0.102631579, -0.0130409357, 0.920292398, -0.0130409357, -0.28748538, -0.28748538, 0.179181287, 0.179181287, -0.28748538, -0.28748538, -0.102631579, -0.0130409357, -0.0130409357, 0.920292398, 0.179181287, 0.179181287, -0.28748538, -0.28748538, -0.28748538, -0.28748538, -0.0526315789, -0.28748538, -0.28748538, 0.179181287, 0.230292398, 0.230292398, -0.00304093567, -0.00304093567, -0.00304093567, -0.00304093567, -0.0526315789, -0.28748538, -0.28748538, 0.179181287, 0.230292398, 0.230292398, -0.00304093567, -0.00304093567, -0.00304093567, -0.00304093567, -0.0526315789, -0.28748538, 0.179181287, -0.28748538, -0.00304093567, -0.00304093567, 0.230292398, 0.230292398, -0.00304093567, -0.00304093567, -0.0526315789, -0.28748538, 0.179181287, -0.28748538, -0.00304093567, -0.00304093567, 0.230292398, 0.230292398, -0.00304093567, -0.00304093567, -0.0526315789, 0.179181287, -0.28748538, -0.28748538, -0.00304093567, -0.00304093567, -0.00304093567, -0.00304093567, 0.230292398, 0.230292398, -0.0526315789, 0.179181287, -0.28748538, -0.28748538, -0.00304093567, -0.00304093567, -0.00304093567, -0.00304093567, 0.230292398, 0.230292398);
+const MRT_EE_STRESS: array<f32, 100> = array<f32, 100>(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.222222222, -0.111111111, -0.111111111, 0.111111111, 0.111111111, 0.111111111, 0.111111111, -0.222222222, -0.222222222, 0.0, -0.111111111, 0.222222222, -0.111111111, 0.111111111, 0.111111111, -0.222222222, -0.222222222, 0.111111111, 0.111111111, 0.0, -0.111111111, -0.111111111, 0.222222222, -0.222222222, -0.222222222, 0.111111111, 0.111111111, 0.111111111, 0.111111111, 0.0, 0.111111111, 0.111111111, -0.222222222, 0.722222222, -0.277777778, -0.111111111, -0.111111111, -0.111111111, -0.111111111, 0.0, 0.111111111, 0.111111111, -0.222222222, -0.277777778, 0.722222222, -0.111111111, -0.111111111, -0.111111111, -0.111111111, 0.0, 0.111111111, -0.222222222, 0.111111111, -0.111111111, -0.111111111, 0.722222222, -0.277777778, -0.111111111, -0.111111111, 0.0, 0.111111111, -0.222222222, 0.111111111, -0.111111111, -0.111111111, -0.277777778, 0.722222222, -0.111111111, -0.111111111, 0.0, -0.222222222, 0.111111111, 0.111111111, -0.111111111, -0.111111111, -0.111111111, -0.111111111, 0.722222222, -0.277777778, 0.0, -0.222222222, 0.111111111, 0.111111111, -0.111111111, -0.111111111, -0.111111111, -0.111111111, -0.277777778, 0.722222222);
+const MRT_OO: array<f32, 81> = array<f32, 81>(0.96, 0.0, 0.0, -0.24, -0.24, -0.24, -0.24, 0.0, 0.0, 0.0, 0.96, 0.0, -0.24, 0.24, 0.0, 0.0, -0.24, -0.24, 0.0, 0.0, 0.96, 0.0, 0.0, -0.24, 0.24, -0.24, 0.24, -0.24, -0.24, 0.0, 1.11, 0.0, -0.435, -0.435, -0.435, -0.435, -0.24, 0.24, 0.0, 0.0, 1.11, -0.435, -0.435, 0.435, 0.435, -0.24, 0.0, -0.24, -0.435, -0.435, 1.11, 0.0, -0.435, 0.435, -0.24, 0.0, 0.24, -0.435, -0.435, 0.0, 1.11, 0.435, -0.435, 0.0, -0.24, -0.24, -0.435, 0.435, -0.435, 0.435, 1.11, 0.0, 0.0, -0.24, 0.24, -0.435, 0.435, 0.435, -0.435, 0.0, 1.11);
 
-// The D3Q19 multiple-relaxation-time collision with Guo forcing (fieldcraft_lbm::mrt), in the
-// populations' deviations from the weights: the moments of the deviations relax towards the
-// equilibrium moments less those of the weights (ρ = 1 at rest: 1, −11 and 3 in the first three),
-// the stresses at the cell's own rate (Smagorinsky's model or the wall model) or the fluid's.
+// The D3Q19 multiple-relaxation-time collision with Guo forcing (fieldcraft_lbm::mrt) as constant matrices. With A = M⁻¹ S M
+// (S the relaxation rates of d'Humières et al. 2002's basis, the stresses' at the cell's rate ω) the moment-space update
+// f* = f + Σ_k r_k [−s_k (m_k − eq_k) + (1 − s_k/2) mf_k] / |r_k|² is f* = f + F − A (f − f_eq + F/2), F the Guo source of the
+// populations: the moments need not be formed. A is split into the even and odd parts of the directions (the rest population
+// and the nine opposite pairs), the rate-ω stress modes apart: A_even = MRT_EE_FIXED + ω MRT_EE_STRESS (10 × 10, rows and
+// columns the rest and the pairs q = 1, 3, ...; the columns carry the 2 of a pair's two directions), A_odd = MRT_OO (9 × 9).
+// Computed in exact rational arithmetic and rounded once (9 digits); tests/mrt_tables.rs replays this update in f64 against
+// fieldcraft_lbm::mrt::collide. The equilibria are the second-order ones, whose moments are the basis's (e, ε, j, q, p, π, m = 0).
 fn collide_mrt(cell: u32, lid: u32, xyz: vec3<i32>, fq: ptr<function, array<f32, 19>>, drho: f32, rho: f32, u: vec3<f32>, force: vec3<f32>, forced: bool, g: Gradient) {
     var omega = params.omega_plus;
     if turbulent() {
@@ -1859,64 +1834,57 @@ fn collide_mrt(cell: u32, lid: u32, xyz: vec3<i32>, fq: ptr<function, array<f32,
         record_eddy(cell, lid, omega, u);
     }
     let uu = dot(u, u);
-    let pxx = rho * (2.0 * u.x * u.x - u.y * u.y - u.z * u.z);
-    let pww = rho * (u.y * u.y - u.z * u.z);
-    var eq: array<f32, 19>;
-    eq[0] = drho;
-    eq[1] = -11.0 * drho + 19.0 * rho * uu;
-    eq[2] = 3.0 * drho - 5.5 * rho * uu;
-    eq[3] = rho * u.x;
-    eq[4] = -2.0 / 3.0 * rho * u.x;
-    eq[5] = rho * u.y;
-    eq[6] = -2.0 / 3.0 * rho * u.y;
-    eq[7] = rho * u.z;
-    eq[8] = -2.0 / 3.0 * rho * u.z;
-    eq[9] = pxx;
-    eq[10] = -0.5 * pxx;
-    eq[11] = pww;
-    eq[12] = -0.5 * pww;
-    eq[13] = rho * u.x * u.y;
-    eq[14] = rho * u.y * u.z;
-    eq[15] = rho * u.x * u.z;
-    eq[16] = 0.0;
-    eq[17] = 0.0;
-    eq[18] = 0.0;
-    var source: array<f32, 19>;
-    for (var q = 0u; q < Q; q = q + 1u) {
-        source[q] = 0.0;
+    let uf = dot(u, force);
+    // The pairs' even and odd parts of f − f_eq + F/2 and of F; the rest's equilibrium is δρ less the others' (see collide_cell, #776).
+    var e: array<f32, 10>;
+    var o: array<f32, 9>;
+    var se: array<f32, 10>;
+    var so: array<f32, 9>;
+    var others = 0.0;
+    for (var p = 0u; p < 9u; p = p + 1u) {
+        let q = 2u * p + 1u;
+        let cv = vec3<f32>(c_of(q));
+        let cu = dot(cv, u);
+        let w = w_of(q);
+        let eq_plus = w * (drho + rho * (4.5 * cu * cu - 1.5 * uu));
+        others = others + 2.0 * eq_plus;
+        let eq_minus = w * rho * 3.0 * cu;
+        var s_plus = 0.0;
+        var s_minus = 0.0;
         if forced {
-            let c = vec3<f32>(c_of(q));
-            source[q] = w_of(q) * dot(3.0 * (c - u) + 9.0 * dot(c, u) * c, force);
+            let cf = dot(cv, force);
+            s_plus = w * (9.0 * cu * cf - 3.0 * uf);
+            s_minus = w * 3.0 * cf;
         }
+        se[p + 1u] = s_plus;
+        so[p] = s_minus;
+        e[p + 1u] = 0.5 * ((*fq)[q] + (*fq)[q + 1u]) - eq_plus + 0.5 * s_plus;
+        o[p] = 0.5 * ((*fq)[q] - (*fq)[q + 1u]) - eq_minus + 0.5 * s_minus;
     }
-    var change: array<f32, 19>;
-    for (var k = 0u; k < Q; k = k + 1u) {
-        var m = 0.0;
-        var mf = 0.0;
-        var norm = 0.0;
-        for (var q = 0u; q < Q; q = q + 1u) {
-            let r = mrt_row(k, q);
-            m = m + r * (*fq)[q];
-            mf = mf + r * source[q];
-            norm = norm + r * r;
+    var s_rest = 0.0;
+    if forced { s_rest = -3.0 * w_of(0u) * uf; }
+    se[0] = s_rest;
+    e[0] = (*fq)[0] - (drho - others) + 0.5 * s_rest;
+    // A (f − f_eq + F/2), the even part for the rest and the pairs, the odd part for the pairs.
+    var ae: array<f32, 10>;
+    for (var r = 0u; r < 10u; r = r + 1u) {
+        var a = 0.0;
+        for (var c = 0u; c < 10u; c = c + 1u) {
+            a = a + (MRT_EE_FIXED[10u * r + c] + omega * MRT_EE_STRESS[10u * r + c]) * e[c];
         }
-        var s = 0.0;
-        switch k {
-            case 1u: { s = 1.19; }
-            case 2u, 10u, 12u: { s = 1.4; }
-            case 4u, 6u, 8u: { s = 1.2; }
-            case 9u, 11u, 13u, 14u, 15u: { s = omega; }
-            case 16u, 17u, 18u: { s = 1.98; }
-            default: { s = 0.0; }
-        }
-        change[k] = (-s * (m - eq[k]) + (1.0 - 0.5 * s) * mf) / norm;
+        ae[r] = a;
     }
-    for (var q = 0u; q < Q; q = q + 1u) {
-        var d = 0.0;
-        for (var k = 0u; k < Q; k = k + 1u) {
-            d = d + mrt_row(k, q) * change[k];
+    f[post_index(0u, cell, xyz)] = (*fq)[0] + se[0] - ae[0];
+    for (var p = 0u; p < 9u; p = p + 1u) {
+        var ao = 0.0;
+        for (var c = 0u; c < 9u; c = c + 1u) {
+            ao = ao + MRT_OO[9u * p + c] * o[c];
         }
-        f[post_index(q, cell, xyz)] = (*fq)[q] + d;
+        let q = 2u * p + 1u;
+        let even = se[p + 1u] - ae[p + 1u];
+        let odd = so[p] - ao;
+        f[post_index(q, cell, xyz)] = (*fq)[q] + even + odd;
+        f[post_index(q + 1u, cell, xyz)] = (*fq)[q + 1u] + even - odd;
     }
 }
 
