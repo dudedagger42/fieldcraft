@@ -10,7 +10,7 @@
 //!
 //! `cargo test --release -p fieldcraft-lbm --test wall_mrt_inlet -- --ignored --nocapture wall_mrt_inlet`
 //! Environment: `STEPS` (20000), `TAU_MINUS_HALF` (1.8e-4), `LAYER` (1; 0 runs without the absorbing layer), `LENGTH` (160
-//! cells), `HEIGHT` (16 cells), `SIGMA` (0.95), `ULAT` (0.014), `HEIGHT2` (the gap past column `STRIP`, default HEIGHT), `STRIP` (33), `UNIFORM`, `EVERY` (10, the sampling interval), `SHOW` (1000, the pair gap list), `INIT` (1, the initial velocity as a share of ULAT), `ARMS` (1: the three-arm strip study).
+//! cells), `HEIGHT` (16 cells), `SIGMA` (0.95), `ULAT` (0.014), `HEIGHT2` (the gap past column `STRIP`, default HEIGHT), `STRIP` (33), `UNIFORM`, `EVERY` (10, the sampling interval), `SHOW` (1000, the pair gap list), `AVG` (2000, the time-mean flux window), `INIT` (1, the initial velocity as a share of ULAT), `ARMS` (1: the three-arm strip study).
 
 mod common;
 
@@ -77,6 +77,9 @@ fn run(sigma1: u8, wall_mrt: bool, tau_minus_half: f64, steps: u64) -> String {
     let (mut peak, mut worst_rho, mut worst_cell) = (0.0f64, 0.0f64, [0usize; 3]);
     let mut pair: Vec<String> = Vec::new();
     let mut last = String::new();
+    // the plane fluxes (x 10 inside the strip, x a and b) averaged over the last AVG steps (every EVERY steps)
+    let avg_steps = env("AVG", 2000.0) as u64;
+    let (mut sum, mut n_avg) = ([0.0f64; 3], 0u64);
     let every = env("EVERY", 10.0) as u64;
     let show = env("SHOW", 1000.0) as u64;
     let g = *flow.grid();
@@ -86,6 +89,12 @@ fn run(sigma1: u8, wall_mrt: bool, tau_minus_half: f64, steps: u64) -> String {
             break;
         }
         done = s + 1;
+        if done % every == 0 && done + avg_steps > steps {
+            for (acc, i) in sum.iter_mut().zip([10usize.min(nx - 1), a, b]) {
+                *acc += plane(&flow, i);
+            }
+            n_avg += 1;
+        }
         if done % every == 0 || done == steps {
             peak = 0.0;
             worst_rho = 0.0;
@@ -113,7 +122,9 @@ fn run(sigma1: u8, wall_mrt: bool, tau_minus_half: f64, steps: u64) -> String {
                     }
                 }
             }
-            last = format!("last sample step {done}: peak speed {peak:.4}, largest |rho-1| {worst_rho:.3e} at cell {worst_cell:?}, 2dx pair {pair_gap:.2e}");
+            last = format!(
+                "last sample step {done}: peak speed {peak:.4}, largest |rho-1| {worst_rho:.3e} at cell {worst_cell:?}, 2dx pair {pair_gap:.2e}"
+            );
             if done % show == 0 {
                 pair.push(format!("{done}:{pair_gap:.2e}"));
             }
@@ -125,9 +136,14 @@ fn run(sigma1: u8, wall_mrt: bool, tau_minus_half: f64, steps: u64) -> String {
     }
     let (fa, fb) = (plane(&flow, a), plane(&flow, b));
     format!(
-        "WALLMRT-STRIP sigma1 {sigma1} wall_mrt {wall_mrt} u {u} {} gap {h}->{h2} strip {strip} tau-1/2 {tau_minus_half:e} steps {done} of {steps}{stop}: {last}; flux at x={a} {fa:.6}, at x={b} {fb:.6}, ratio {:.6}; 2dx pair gap (step:max |rho - mean of x neighbours|) {}",
+        "WALLMRT-STRIP sigma1 {sigma1} wall_mrt {wall_mrt} u {u} {} gap {h}->{h2} strip {strip} tau-1/2 {tau_minus_half:e} steps {done} of {steps}{stop}: {last}; flux at x={a} {fa:.6}, at x={b} {fb:.6}, ratio {:.6}; time-mean flux over the last {n_avg} samples (every {every} steps) at x=10 {:.6}, x={a} {:.6}, x={b} {:.6}, ratio b/a {:.6}, a/inlet {:.6}; 2dx pair gap (step:max |rho - mean of x neighbours|) {}",
         if uniform { "uniform" } else { "parabolic" },
         fb / fa,
+        sum[0] / n_avg.max(1) as f64,
+        sum[1] / n_avg.max(1) as f64,
+        sum[2] / n_avg.max(1) as f64,
+        sum[2] / sum[1],
+        sum[1] / sum[0],
         pair.join(" ")
     )
 }
