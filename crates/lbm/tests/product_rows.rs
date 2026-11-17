@@ -96,6 +96,18 @@ fn first_jump(hist: &[(u64, f64)]) -> Option<u64> {
     })
 }
 
+/// A second jump flag, looking backwards only: the first chunk whose change exceeds 5 times the median of the previous five
+/// changes (at least three before it; floor 1e-6). The next chunk's movement cannot hide it. An extra tag, not part of the verdict.
+fn first_jump_back(hist: &[(u64, f64)]) -> Option<u64> {
+    let d: Vec<f64> = hist.windows(2).map(|w| (w[1].1 - w[0].1).abs()).collect();
+    (3..d.len()).find_map(|i| {
+        let mut prev: Vec<f64> = d[i.saturating_sub(5)..i].to_vec();
+        prev.sort_by(f64::total_cmp);
+        let med = prev.get(prev.len() / 2).copied().unwrap_or(0.0);
+        (d[i] > 1e-6 && d[i] > 5.0 * med).then(|| hist[i + 1].0)
+    })
+}
+
 /// max - min of the flow rate over the history points after `from` (the last third of the run).
 fn range_after(hist: &[(u64, f64)], from: u64) -> f64 {
     let v: Vec<f64> = hist.iter().filter(|(s, _)| *s > from).map(|h| h.1).collect();
@@ -193,6 +205,7 @@ fn product_rows() {
                 "NOT settled"
             };
             let jumps = first_jump(&hist).map_or(String::new(), |j| format!(" [first JUMP at step {j}]"));
+            let jumps = jumps + &first_jump_back(&hist).map_or(String::new(), |j| format!(" [first JUMP-BACK (5x the previous five) at step {j}]"));
             let range = 100.0 * range_after(&hist, done * 2 / 3);
             println!(
                 "PRODUCT collision {label} tau-1/2 {tau_mh:e} U_LAT {} case {name} cells {w} steps {done} (minimum {min_steps}, cap {cap}): flow-rate error {:+.4} % (at 2/3 of the run {:+.4} %), change over the last third {:.4} %, max-min over it {range:.4} % ({status}){jumps}, range under the 1 % bar: {}, mean-density drift {:+.3e} per 10000 steps, largest nu_t/nu {max_ratio:.3e}{}",
