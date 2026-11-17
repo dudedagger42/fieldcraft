@@ -608,6 +608,12 @@ impl ThermalState {
     }
 }
 
+/// The least τ − ½ (τ the symmetric relaxation time, lattice units) at which the walls' mass correction
+/// may be switched on with the regularised and hybrid regularised collisions: below it they blow up
+/// (linear walls below 1.5e-2, quadratic below 4e-2) and between there and this value their flow rate is
+/// distorted (measured on a laminar plane channel, [`crate::wall_mass`]).
+pub const WALL_MASS_MIN_RELAXATION_EXCESS: f64 = 5e-2;
+
 /// The flow state.
 #[derive(Debug, Clone)]
 pub struct Flow {
@@ -1676,11 +1682,20 @@ impl Flow {
 
     /// Switch the mass correction of the interpolated walls on or off (off at the start; see
     /// [`crate::wall_mass`]). Refused without interpolated links. While it is on the flow cannot be
-    /// checkpointed (the mass in flight is state a checkpoint does not carry yet).
+    /// checkpointed (the mass in flight is state a checkpoint does not carry yet). Refused with the
+    /// regularised and hybrid regularised collisions below [`WALL_MASS_MIN_RELAXATION_EXCESS`]: the
+    /// correction destabilises them there (see [`crate::wall_mass`]).
     pub fn set_wall_mass_correction(&mut self, on: bool) -> Result<()> {
         if !on {
             self.wall_mass = None;
             return Ok(());
+        }
+        let excess = 1.0 / self.omega_plus - 0.5;
+        if matches!(self.collision, Collision::Regularized | Collision::Hrr) && (excess < WALL_MASS_MIN_RELAXATION_EXCESS || excess.is_nan()) {
+            return Err(Error::Invalid(format!(
+                "the walls' mass correction is not supported with the {} collision at τ − ½ = {excess:.2e} (below {WALL_MASS_MIN_RELAXATION_EXCESS:.0e}):                  it makes the flow unstable there, with a flow rate that is silently wrong before it blows up;                  use the MRT or TRT collision, or leave the correction off",
+                self.collision.name()
+            )));
         }
         if self.interpolations.is_empty() {
             return Err(Error::Invalid("this flow has no interpolated walls to correct the mass of".into()));

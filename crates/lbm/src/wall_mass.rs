@@ -28,7 +28,19 @@
 //! moving body in a periodic box leaks mass too (4.7e-3 of the mass over a sphere run at a wall speed of
 //! 0.05); the created mass here includes it, and the weights carry no momentum, so the wall's
 //! momentum exchange is left alone.
-
+//!
+//! # Known limits
+//!
+//! Measured on a laminar plane channel (ten cells across, impulsive start, no turbulence model, 80 000
+//! steps, walls cutting the links at q = 0.75): with the correction on, the hybrid recursive regularised
+//! collision (σ 0.95 and 1.0, which is the regularised collision) blows up below τ − ½ = 1.5e-2 with
+//! linear walls and below 4e-2 with quadratic walls, and between there and 5e-2 its velocity is
+//! silently wrong (peaks of two to several times the right value at some relaxation times). At
+//! q = 0.25 the same collisions, and the MRT collision at q = 0.75 and 0.25, run with the correction as
+//! designed. Switching it on with the regularised or the
+//! hybrid regularised collision below τ − ½ = 5e-2 is therefore refused
+//! ([`crate::flow::WALL_MASS_MIN_RELAXATION_EXCESS`]); handing back only part of the pending mass each
+//! step does not cure it (it spreads the distortion and delays the blow-up).
 use crate::flow::{Interpolation, Link, Rule, interpolated_value};
 use crate::lattice::{Q, W, opposite};
 
