@@ -121,18 +121,19 @@ fn recent_jump_back(hist: &[(u64, f64)], n: usize) -> bool {
     (d.len().saturating_sub(n)..d.len()).any(|i| jump_back_at(&d, i))
 }
 
-/// LEFT LAMINAR: a run starts from rest and should approach the answer from one side, so the |flow-rate error| fell, then rose
+/// LEFT LAMINAR: a run starts from rest and should approach the answer from one side, so the |flow-rate error| (from rest, -100 %, as sample 0) fell, then rose
 /// again by more than 0.05 points above its running minimum (the run left the first branch). Returns the step and value
 /// (fraction) of the running minimum, and the step of the chunk where the rise passed the tolerance.
 fn reversed(hist: &[(u64, f64)]) -> Option<(u64, f64, u64)> {
-    let mut min = (0u64, f64::INFINITY);
-    let first = hist.first()?.1.abs();
+    // every run starts from rest (flow rate 0, error -100 %): that is sample 0, so even a first sample that is already the
+    // minimum is followed by a tag if the error then rises
+    let mut min = (0u64, 1.0f64);
     for &(st, r) in hist {
         let a = r.abs();
         if a < min.1 {
             min = (st, a);
         }
-        if min.1 < first && a > min.1 + 5e-4 {
+        if a > min.1 + 5e-4 {
             return Some((min.0, min.1, st));
         }
     }
@@ -269,8 +270,9 @@ fn the_reversal_flag_fires_on_a_second_branch_and_not_on_a_smooth_run() {
     let mut branch = smooth.clone();
     branch.extend((40..60).map(|i| (i * 100, -0.139)));
     assert_eq!(reversed(&branch).map(|m| (m.0, m.2)), Some((3900, 4000)));
-    let rising: Vec<(u64, f64)> = (1..10).map(|i| (i * 100, 0.01 * i as f64)).collect();
-    assert!(reversed(&rising).is_none(), "an error that only grows never decreased first");
+    let rising: Vec<(u64, f64)> = (1..10).map(|i| (i * 16_000, -0.00349 - 0.0334 * (i > 1) as i32 as f64)).collect();
+    assert_eq!(reversed(&rising).map(|m| (m.0, m.2)), Some((16_000, 32_000)), "the first sample is the minimum, then it rises (c8 U0.10)");
+    assert!(reversed(&[(100, -0.5), (200, -0.3), (300, -0.3002)]).is_none(), "a rise under 0.05 points never tags");
 }
 
 #[test]
