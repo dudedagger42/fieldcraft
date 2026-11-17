@@ -1050,3 +1050,42 @@ fn oracle_turbulent_channel_wall_law_on_the_half_way_wall() {
     }
     assert!(failures.is_empty(), "{failures:?}");
 }
+
+/// Scratch, print-only: the oracle case's rows at Re_tau 182.088 with 10 cells and 543.496 with 20 cells per half-height at the
+/// hybrid collision's sigma values in `SIGMAS` (default "0.95,1.0"), the oracle test's own set-up otherwise. One line per run.
+#[test]
+#[ignore = "scratch: the sigma comparison, a minute on the CPU"]
+fn scratch_channel_rows_at_sigma() {
+    let sigmas: Vec<f64> = std::env::var("SIGMAS").unwrap_or_else(|_| "0.95,1.0".into()).split(',').filter_map(|v| v.trim().parse().ok()).collect();
+    let rows: [(&str, f64, usize, f64, f64); 2] = [
+        ("re180_n10", LEE_MOSER_180_RE_TAU, 10, LEE_MOSER_180_BULK, LEE_MOSER_180_CF),
+        ("re543_n20", LEE_MOSER_550_RE_TAU, 20, LEE_MOSER_550_BULK, LEE_MOSER_550_CF),
+    ];
+    for &sigma in &sigmas {
+        for (name, re_tau, cells, bulk, cf_ref) in rows {
+            let r = Channel {
+                re_tau,
+                cells,
+                bulk_guess: bulk,
+                lattice_bulk: 0.1,
+                collision: Collision::Hrr,
+                sigma: Some(sigma),
+                turbulence: Some(sa(WallModel::SpalartAllmarasBounceSurface)),
+                on_node: false,
+                slabs: true,
+                max_steps: 3_000_000,
+                sample: 100,
+                settling: GATED,
+            }
+            .run();
+            let tau_mh = 3.0 * 0.1 * cells as f64 / (re_tau * bulk);
+            println!(
+                "SIGMA-ROW {name}: collision HRR sigma {sigma} Re_tau {re_tau} cells per half-height {cells} tau-1/2 {tau_mh:.4e} (computed): cf {:.9e} error {:+.4} % steps {} settled {}",
+                r.carried,
+                100.0 * (r.carried / cf_ref - 1.0),
+                r.steps,
+                r.settled
+            );
+        }
+    }
+}
