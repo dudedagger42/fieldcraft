@@ -107,7 +107,7 @@ fn pocket(tau_minus_half: f64, sigma: f64) -> Result<Case, String> {
 /// The driven slit bed: a slit 2 wide and 30 deep cut into the upper wall of the channel, a floor two layers thick (the slit's x = 4 row one
 /// layer lower), wedge side walls above z = 5 that retreat one cell per two layers, free layers above z = 8 under a lid, a closed end. An
 /// impulsive stream along x over the slit: a constant force `peak / ramp` for `ramp` steps, then none.
-fn bed(tau_minus_half: f64, sigma: f64, peak: f64, ramp: u64) -> Result<Case, String> {
+fn bed(tau_minus_half: f64, sigma: f64, peak: f64, ramp: u64, angle_deg: f64) -> Result<Case, String> {
     let (w, slit_d, nz, floor, wedge_at, top) = (8usize, 30usize, 12usize, 2usize, 5usize, 8usize);
     let nu_lat = tau_minus_half / 3.0;
     let dx = 1.0 / w as f64;
@@ -142,7 +142,8 @@ fn bed(tau_minus_half: f64, sigma: f64, peak: f64, ramp: u64) -> Result<Case, St
     d.obstacles = obstacles.iter().map(|o| o.body.clone()).collect();
     let m = model(1.0, 1.0, d, fluid_procedure(dt, tau_minus_half, sigma));
     let a = peak / ramp.max(1) as f64;
-    finish(m, obstacles, env("PARITY_STEPS", 1500.0) as u64, Box::new(move |t| if t < ramp { [a, 0.0, 0.0] } else { [0.0; 3] }))
+    let (ax, ay) = (a * angle_deg.to_radians().cos(), a * angle_deg.to_radians().sin());
+    finish(m, obstacles, env("PARITY_STEPS", 1500.0) as u64, Box::new(move |t| if t < ramp { [ax, ay, 0.0] } else { [0.0; 3] }))
 }
 
 /// A hash of the f32 bits of the density and velocity of every cell, for the "off is bit-identical" comparison.
@@ -168,6 +169,7 @@ fn parity(name: &str, case: Result<Case, String>) -> Result<(), String> {
     // WALL_CORNER=1: the corner study (cells with three or more solid axis faces relax to equilibrium), read by the device too
     // WALL_TAU_FLOOR=<f>: the wall layer's floor on tau - 1/2 (with WALL_MRT)
     cpu.set_wall_tau_floor(env("WALL_TAU_FLOOR", 0.0));
+    cpu.set_wall_tau_floor_ratio(env("WALL_TAU_FLOOR_K", 0.0));
     cpu.set_wall_corner_relax(env("WALL_CORNER", 0.0) != 0.0 && env("MRT_ALL", 0.0) == 0.0);
     let mut gpu = GpuFlow::with_options(&cpu, Policy::from_env().map_err(|e| e.to_string())?, Options::default()).map_err(|e| e.to_string())?;
     let (tol_u, tol_r) = (env("PARITY_DU", 2e-5), env("PARITY_DRHO", 1e-6));
@@ -225,7 +227,17 @@ fn pocket_parity() {
 #[test]
 #[ignore = "GPU: run on the machine whose device is to be checked, alone on it (see the module docs)"]
 fn bed_parity() {
-    if let Err(e) = parity("bed", bed(1.8e-4, 0.95, env("PEAK", 0.11), 1000)) {
+    if let Err(e) = parity("bed", bed(1.8e-4, 0.95, env("PEAK", 0.11), 1000, 0.0)) {
+        panic!("{e}");
+    }
+}
+
+/// The C11 row of the corner and floor studies: the bed with the stream along y (angle 90), ramp 2,000 steps; set `PARITY_STEPS` for the run
+/// (the CPU row blows up at step 8,900 without the floor).
+#[test]
+#[ignore = "GPU: run on the machine whose device is to be checked, alone on it (see the module docs)"]
+fn c11_parity() {
+    if let Err(e) = parity("c11", bed(1.8e-4, 0.95, env("PEAK", 0.11), 2000, 90.0)) {
         panic!("{e}");
     }
 }

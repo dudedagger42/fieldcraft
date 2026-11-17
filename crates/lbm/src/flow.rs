@@ -607,6 +607,7 @@ pub struct Flow {
     wall_corner_relax: bool,
     /// The wall-layer MRT's floor on τ − ½ (0: none), see `set_wall_tau_floor`.
     wall_tau_floor: f64,
+    wall_tau_floor_k: f64,
     wall_corner_cells: Option<Vec<usize>>,
     wall_corner_exclude: Vec<usize>,
     /// Whether σ is dynamic (set per cell from the subgrid model, [`crate::hrr`]), and then its
@@ -1438,6 +1439,7 @@ impl Flow {
             wall_layer_mrt: false,
             wall_corner_relax: false,
             wall_tau_floor: 0.0,
+            wall_tau_floor_k: 0.0,
             wall_corner_cells: None,
             wall_corner_exclude: Vec::new(),
             dynamic: setup.dynamic_sigma,
@@ -1882,9 +1884,16 @@ impl Flow {
         self.wall_tau_floor = if floor.is_finite() && floor > 0.0 { floor } else { 0.0 };
     }
 
-    /// The wall layer's floor on τ − ½ ([`Flow::set_wall_tau_floor`]; 0 when off).
+    /// The same floor as a ratio `k` to the run's own τ − ½ (the fluid's): the layer's τ − ½ is at least `k` times the fluid's.
+    /// With both set the larger floor applies. Not finite or not positive switches it off.
+    pub fn set_wall_tau_floor_ratio(&mut self, k: f64) {
+        self.wall_tau_floor_k = if k.is_finite() && k > 0.0 { k } else { 0.0 };
+    }
+
+    /// The wall layer's floor on τ − ½ in lattice units ([`Flow::set_wall_tau_floor`], [`Flow::set_wall_tau_floor_ratio`]; 0 when off).
     pub fn wall_tau_floor(&self) -> f64 {
-        self.wall_tau_floor
+        let own = if self.omega_plus > 0.0 { 1.0 / self.omega_plus - 0.5 } else { 0.0 };
+        self.wall_tau_floor.max(self.wall_tau_floor_k * own)
     }
 
     /// The corner study's cell set, replacing its own pure-corner test (fluid cells only are used); `None` returns to the test.
@@ -2696,7 +2705,7 @@ impl Flow {
         let wall_gap = self.wall_gap;
         let wall_layer_sigma_one = self.wall_layer_sigma_one;
         let (wall_bulk, wall_mrt) = (self.wall_layer_bulk, self.wall_layer_mrt);
-        let wall_tau_floor = self.wall_tau_floor;
+        let wall_tau_floor = self.wall_tau_floor();
         // The wall layer of the two remedy studies: fluid cells with a solid axis neighbour (empty when neither is on).
         let layer: Vec<bool> = if (wall_bulk > 0.0 || wall_mrt) && regularized {
             let solid = |c: usize| !self.fluid.get(c).copied().unwrap_or(true);
@@ -3417,6 +3426,7 @@ impl crate::backend::Backend for Flow {
             wall_layer_mrt: _,
             wall_corner_relax: _,
             wall_tau_floor: _,
+            wall_tau_floor_k: _,
             wall_corner_cells: _,
             wall_corner_exclude: _,
             dynamic,
