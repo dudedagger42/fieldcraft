@@ -121,6 +121,7 @@ fn product_rows() {
             let mut drift_last_third = f64::NAN;
             let mut rho = rho0;
             while done < cap {
+                let chunk = chunk.min(cap - done);
                 if Backend::advance(&mut flow, chunk).is_err() {
                     println!("PRODUCT collision {label} tau-1/2 {tau_mh:e} case {name} cells {w}: STOPPED by the backend at step {done}");
                     break;
