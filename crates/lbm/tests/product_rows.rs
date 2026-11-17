@@ -339,13 +339,16 @@ fn range_after(hist: &[(u64, f64)], from: u64) -> f64 {
     v.iter().cloned().fold(f64::NEG_INFINITY, f64::max) - v.iter().cloned().fold(f64::INFINITY, f64::min)
 }
 
-/// The cross-section's secondary flow: the largest in-plane speed (y and z components combined) and the largest axial speed |u_x|,
-/// over the fluid cells, in lattice units.
-fn secondary_flow(flow: &mut fieldcraft_lbm::Flow, fluid: &[bool]) -> (f64, f64) {
+/// The cross-section's secondary flow: the largest in-plane speed (y and z components combined) with its cell, and the largest axial
+/// speed |u_x|, over the fluid cells, in lattice units.
+fn secondary_flow(flow: &mut fieldcraft_lbm::Flow, fluid: &[bool]) -> (f64, [usize; 3], f64) {
     let f = Backend::fields(flow).expect("fields");
-    (0..fluid.len()).filter(|&c| fluid[c]).fold((0.0f64, 0.0f64), |(p, a), c| {
+    let g = *flow.grid();
+    (0..fluid.len()).filter(|&c| fluid[c]).fold((0.0f64, [0usize; 3], 0.0f64), |(p, at, a), c| {
         let u = f.velocity[c];
-        (p.max((u[1] * u[1] + u[2] * u[2]).sqrt()), a.max(u[0].abs()))
+        let inplane = (u[1] * u[1] + u[2] * u[2]).sqrt();
+        let (p2, at2) = if inplane > p { (inplane, g.coords(c)) } else { (p, at) };
+        (p2, at2, a.max(u[0].abs()))
     })
 }
 
@@ -467,8 +470,15 @@ fn product_rows() {
                 hist.push((done, rate));
                 along_hist.push((done, along_duct_max(&mut flow, &fluid)));
                 if secondary_every > 0 && done >= next_secondary {
-                    let (inplane, axial) = secondary_flow(&mut flow, &fluid);
-                    secondary_hist.push(format!("{done}:{:.3e}/{axial:.4}={:.3e}", inplane, inplane / axial.max(1e-30)));
+                    let (inplane, at, axial) = secondary_flow(&mut flow, &fluid);
+                    // the peak's distance (cells) to the nearest wall along y and z: a corner has both small
+                    let edge = |i: usize| i.min(w.saturating_sub(1 + i));
+                    let corner = if duct {
+                        format!("@{at:?} edge dist y {} z {}", edge(at[1]), edge(at[2]))
+                    } else {
+                        format!("@{at:?} edge dist y {}", edge(at[1]))
+                    };
+                    secondary_hist.push(format!("{done}:{inplane:.3e}/{axial:.4}={:.3e} {corner}", inplane / axial.max(1e-30)));
                     next_secondary = done + secondary_every;
                 }
                 if pocket.is_some() {
@@ -511,7 +521,7 @@ fn product_rows() {
             if !secondary_hist.is_empty() {
                 println!(
                     "PRODUCT-SECONDARY collision {label} tau-1/2 {tau_mh:e} case {name} cells {w} (step:in-plane max / axial max = ratio): {}",
-                    secondary_hist.join(" ")
+                    secondary_hist.join(" | ")
                 );
             }
             let along_series: Vec<String> = along_hist.iter().step_by(every).map(|(st, a)| format!("{st}:{a:.3e}")).collect();
