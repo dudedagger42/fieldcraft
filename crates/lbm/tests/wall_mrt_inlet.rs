@@ -10,7 +10,7 @@
 //!
 //! `cargo test --release -p fieldcraft-lbm --test wall_mrt_inlet -- --ignored --nocapture wall_mrt_inlet`
 //! Environment: `STEPS` (20000), `TAU_MINUS_HALF` (1.8e-4), `LAYER` (1; 0 runs without the absorbing layer), `LENGTH` (160
-//! cells), `HEIGHT` (16 cells), `SIGMA` (0.95), `ULAT` (0.014), `HEIGHT2` (the gap past column `STRIP`, default HEIGHT), `STRIP` (33), `UNIFORM`, `EVERY` (10, the sampling interval), `SHOW` (1000, the pair gap list), `AVG` (2000, the time-mean flux window), `INIT` (1, the initial velocity as a share of ULAT), `ARMS` (1: the three-arm strip study).
+//! cells), `HEIGHT` (16 cells), `SIGMA` (0.95), `ULAT` (0.014), `HEIGHT2` (the gap past column `STRIP`, default HEIGHT), `STRIP` (33), `UNIFORM`, `EVERY` (10, the sampling interval), `SHOW` (1000, the pair gap list), `AVG` (2000, the time-mean flux window), `BUDGET` (0, steps between the mass and flux budget lines), `INIT` (1, the initial velocity as a share of ULAT), `ARMS` (1: the three-arm strip study, 2: WALL_MRT only).
 
 mod common;
 
@@ -80,6 +80,12 @@ fn run(sigma1: u8, wall_mrt: bool, tau_minus_half: f64, steps: u64) -> String {
     // the plane fluxes (x 10 inside the strip, x a and b) averaged over the last AVG steps (every EVERY steps)
     let avg_steps = env("AVG", 2000.0) as u64;
     let (mut sum, mut n_avg) = ([0.0f64; 3], 0u64);
+    // BUDGET (steps, default 0 = off): every BUDGET steps print the time means over the last BUDGET*2 steps of the flux at x 10, 40, 80, 120, the
+    // outlet flux (the last column) and the inlet flux (column 0), and the total mass of the fluid cells, from samples every EVERY steps.
+    let budget = env("BUDGET", 0.0) as u64;
+    let cols = [10usize.min(nx - 1), 40usize.min(nx - 1), 80usize.min(nx - 1), 120usize.min(nx - 1), nx - 1, 0];
+    let mut series: Vec<[f64; 6]> = Vec::new();
+    let mut budget_lines: Vec<String> = Vec::new();
     let every = env("EVERY", 10.0) as u64;
     let show = env("SHOW", 1000.0) as u64;
     let g = *flow.grid();
@@ -89,6 +95,24 @@ fn run(sigma1: u8, wall_mrt: bool, tau_minus_half: f64, steps: u64) -> String {
             break;
         }
         done = s + 1;
+        if budget > 0 && done % every == 0 {
+            let mut row = [0.0f64; 6];
+            for (r, &i) in row.iter_mut().zip(cols.iter()) {
+                *r = plane(&flow, i);
+            }
+            series.push(row);
+            if done % budget == 0 {
+                let w = ((2 * budget / every) as usize).min(series.len());
+                let tail = &series[series.len() - w..];
+                let m: Vec<f64> = (0..6).map(|k| tail.iter().map(|r| r[k]).sum::<f64>() / w as f64).collect();
+                let mass: f64 = (0..g.len()).filter(|&c| flow.is_fluid(c)).filter_map(|c| flow.moments(c).map(|(rho, _)| rho)).sum();
+                budget_lines.push(format!(
+                    "BUDGET step {done}: time-mean over the last {} steps: flux x=10 {:.6} x=40 {:.6} x=80 {:.6} x=120 {:.6}; outlet column {:.6}; inlet column 0 {:.6}; net (inlet - outlet) {:+.3e}; total mass {mass:.4}",
+                    w as u64 * every,
+                    m[0], m[1], m[2], m[3], m[4], m[5], m[5] - m[4]
+                ));
+            }
+        }
         if done % every == 0 && done + avg_steps > steps {
             for (acc, i) in sum.iter_mut().zip([10usize.min(nx - 1), a, b]) {
                 *acc += plane(&flow, i);
@@ -135,6 +159,9 @@ fn run(sigma1: u8, wall_mrt: bool, tau_minus_half: f64, steps: u64) -> String {
         }
     }
     let (fa, fb) = (plane(&flow, a), plane(&flow, b));
+    for l in &budget_lines {
+        println!("{l}");
+    }
     format!(
         "WALLMRT-STRIP sigma1 {sigma1} wall_mrt {wall_mrt} u {u} {} gap {h}->{h2} strip {strip} tau-1/2 {tau_minus_half:e} steps {done} of {steps}{stop}: {last}; flux at x={a} {fa:.6}, at x={b} {fb:.6}, ratio {:.6}; time-mean flux over the last {n_avg} samples (every {every} steps) at x=10 {:.6}, x={a} {:.6}, x={b} {:.6}, ratio b/a {:.6}, a/inlet {:.6}; 2dx pair gap (step:max |rho - mean of x neighbours|) {}",
         if uniform { "uniform" } else { "parabolic" },
@@ -154,7 +181,13 @@ fn wall_mrt_inlet() {
     let steps = env("STEPS", 20_000.0) as u64;
     let tau = env("TAU_MINUS_HALF", 1.8e-4);
     // ARMS: 0 = off and WALL_MRT (default, test 4), 1 = off, WALL_SIGMA1 = 1 and WALL_MRT (the strip study's three arms)
-    let arms: &[(u8, bool)] = if env("ARMS", 0.0) > 0.5 { &[(0, false), (1, false), (0, true)] } else { &[(0, false), (0, true)] };
+    let arms: &[(u8, bool)] = if env("ARMS", 0.0) > 1.5 {
+        &[(0, true)]
+    } else if env("ARMS", 0.0) > 0.5 {
+        &[(0, false), (1, false), (0, true)]
+    } else {
+        &[(0, false), (0, true)]
+    };
     for &(s1, mrt) in arms {
         println!("{}", run(s1, mrt, tau, steps));
     }
