@@ -32,6 +32,11 @@ fn lbm_wgsl_validates_for_the_collision_variants() {
         ("hybrid, dynamic σ, WALL_SIGMA1 = 1", [&hybrid[..], &[("DYNAMIC", 1.0), ("VREMAN", 1.0), ("WALL_SIGMA1", 1.0)]].concat()),
         ("hybrid, SA, WALL_SIGMA1 = 1", [&hybrid[..], &[("SA", 1.0), ("WALL_SIGMA1", 1.0)]].concat()),
         ("hybrid, on-node, WALL_SIGMA1 = 1", [&hybrid[..], &[("ON_NODE", 1.0), ("WALL_SIGMA1", 1.0)]].concat()),
+        ("hybrid with WALL_MRT = 0", [&hybrid[..], &[("WALL_MRT", 0.0)]].concat()),
+        ("hybrid with WALL_MRT = 1", [&hybrid[..], &[("WALL_MRT", 1.0)]].concat()),
+        ("hybrid, Vreman, WALL_MRT = 1", [&hybrid[..], &[("VREMAN", 1.0), ("WALL_MRT", 1.0)]].concat()),
+        ("hybrid, SA, WALL_MRT = 1", [&hybrid[..], &[("SA", 1.0), ("WALL_MRT", 1.0)]].concat()),
+        ("hybrid, on-node, WALL_MRT = 1", [&hybrid[..], &[("ON_NODE", 1.0), ("WALL_MRT", 1.0)]].concat()),
     ];
     let failures: Vec<String> = cases.iter().filter_map(|(name, s)| validate(s).err().map(|e| format!("{name}: {e}"))).collect();
     assert!(failures.is_empty(), "{}", failures.join("\n"));

@@ -171,6 +171,8 @@ fn parity(slotted: bool) -> Result<(), String> {
     let mut cpu = fieldcraft_lbm::Flow::new(&setup, &obstacles).map_err(|e| e.to_string())?;
     // PARITY_WALL_SIGMA1=1: the hybrid collision's σ = 1 in the wall layer (the study knob), on both backends (the device reads it from the CPU flow).
     cpu.set_wall_layer_sigma_one(env("PARITY_WALL_SIGMA1", 0.0) as u8);
+    // PARITY_WALL_MRT=1: MRT in the wall layer (the study knob), on both backends.
+    cpu.set_wall_layer_mrt(env("PARITY_WALL_MRT", 0.0) != 0.0);
     let mut gpu = match GpuFlow::with_options(&cpu, Policy::from_env().map_err(|e| e.to_string())?, Options::default()) {
         Ok(g) => g,
         Err(e) if !gpu_required() && e.to_string().contains("no GPU device") => {

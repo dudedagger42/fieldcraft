@@ -124,6 +124,8 @@ override VREMAN: bool = false;
 override DYNAMIC: bool = false;
 // The study knob WALL_SIGMA1 = 1 (Flow::set_wall_layer_sigma_one, with HRR): σ = 1 in every fluid cell with a solid axis neighbour.
 override WALL_SIGMA1: bool = false;
+// The study knob WALL_MRT (Flow::set_wall_layer_mrt, with HRR): the wall layer collides with the MRT scheme, the rest keeps the hybrid collision.
+override WALL_MRT: bool = false;
 // Fans and porous zones (fieldcraft_lbm::flow's zone actions, data in `fluid`: zones.rs); likewise.
 override ZONES: bool = false;
 // The Spalart–Allmaras model (fieldcraft_lbm::sa): ν̃'s passes and its ν_t in the collision; likewise.
@@ -1692,6 +1694,10 @@ fn collide_cell(cell: u32, lid: u32) {
     var g = Gradient(vec3<f32>(0.0), vec3<f32>(0.0), vec3<f32>(0.0), vec3<f32>(0.0));
     if collision_gradient() { g = fd_gradient(cell); }
     if REGULARIZED {
+        if WALL_MRT && HRR && wall_layer(xyz) {
+            collide_mrt(cell, lid, xyz, &fq, drho, rho, u, force, forced, g);
+            return;
+        }
         collide_regularized(cell, lid, xyz, &fq, drho, rho, u, force, forced, g);
         return;
     }

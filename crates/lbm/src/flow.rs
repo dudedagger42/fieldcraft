@@ -1845,6 +1845,16 @@ impl Flow {
         self.wall_layer_mrt = on;
     }
 
+    /// Whether the MRT wall-layer study is on ([`Flow::set_wall_layer_mrt`]).
+    pub fn wall_layer_mrt(&self) -> bool {
+        self.wall_layer_mrt
+    }
+
+    /// The share the wall-layer density-mode study removes ([`Flow::set_wall_layer_bulk`]; 0 off).
+    pub fn wall_layer_bulk(&self) -> f64 {
+        self.wall_layer_bulk
+    }
+
     /// The wall's distance from the cell centre the wall-aware gradient uses, in cells (default 0.5, half way): for studies.
     pub fn set_wall_gradient_gap(&mut self, gap: f64) {
         if gap.is_finite() && gap > 0.0 {

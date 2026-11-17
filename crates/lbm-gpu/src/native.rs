@@ -692,6 +692,8 @@ struct Variant {
     dynamic: bool,
     /// The study knob WALL_SIGMA1 = 1: σ = 1 in the wall layer.
     wall_sigma1: bool,
+    /// The study knob WALL_MRT: MRT in the wall layer.
+    wall_mrt: bool,
     /// Fans or porous zones.
     zones: bool,
     /// The Spalart–Allmaras model.
@@ -747,6 +749,7 @@ fn compile(device: &wgpu::Device, variant: Variant) -> Result<Kernels> {
                     ("VREMAN", if variant.vreman { 1.0 } else { 0.0 }),
                     ("DYNAMIC", if variant.dynamic { 1.0 } else { 0.0 }),
                     ("WALL_SIGMA1", if variant.wall_sigma1 { 1.0 } else { 0.0 }),
+                    ("WALL_MRT", if variant.wall_mrt { 1.0 } else { 0.0 }),
                     ("ZONES", if variant.zones { 1.0 } else { 0.0 }),
                     ("SA", if variant.sa { 1.0 } else { 0.0 }),
                     ("MAX_SPEED", MAX_LATTICE_SPEED),
@@ -1298,7 +1301,17 @@ impl GpuFlow {
         use fieldcraft_model::HrrSigma;
         let hybrid = flow.hybrid_sigma().filter(|s| *s != HrrSigma::Value(1.0));
         if flow.wall_layer_sigma_one() > 1 || flow.wall_aware_gradient() {
-            return Err(Error::Invalid("not supported yet: the wall-layer sigma study modes 2 and 3 and the wall-aware gradient on the GPU; solve on the CPU".into()));
+            return Err(Error::Invalid(
+                "not supported yet: the wall-layer sigma study modes 2 and 3 and the wall-aware gradient on the GPU; solve on the CPU".into(),
+            ));
+        }
+        if flow.wall_layer_bulk() > 0.0 {
+            return Err(Error::Invalid("not supported yet: the wall-layer density-mode damping (WALL_BULK) on the GPU; solve on the CPU".into()));
+        }
+        if flow.wall_layer_mrt() && hybrid.is_none() {
+            return Err(Error::Invalid(
+                "not supported yet: WALL_MRT without the hybrid collision (sigma below 1) on the GPU; solve on the CPU".into(),
+            ));
         }
         let fixed_sigma = match hybrid {
             Some(HrrSigma::Value(s)) => s,
@@ -1459,6 +1472,7 @@ impl GpuFlow {
             vreman: flow.vreman() > 0.0,
             dynamic: hybrid == Some(HrrSigma::Dynamic),
             wall_sigma1: hybrid.is_some() && flow.wall_layer_sigma_one() == 1,
+            wall_mrt: hybrid.is_some() && flow.wall_layer_mrt(),
             zones: zones.zones > 0,
             sa: sa_faces.is_some(),
         })?;
