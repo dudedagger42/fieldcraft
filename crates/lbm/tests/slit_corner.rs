@@ -86,6 +86,7 @@ fn build(
     let wf = w as f64;
     let ny = w + 4 + slit_d;
     let nz = if three_d { NZ } else { 4 };
+    let inlet = if three_d { env("INLET_ROW", 0.0) } else { 0.0 };
     let (lx, ly, lz) = (16.0 * dx, ny as f64 * dx, nz as f64 * dx);
     let ho = wf * dx;
     let (x0, x1) = (4.0 * dx, (4 + slit_w) as f64 * dx);
@@ -100,11 +101,23 @@ fn build(
         };
         let big = 3.0 * lx;
         let zz = |k: usize| k as f64 * dx;
-        add("Floor0".into(), [-big, -dx, -dx], [big, ly + dx, zz(1)]);
+        if inlet > 0.0 {
+            // the slit's x = 4 floor row (z = 0 under the lowered z = 1 row) is a velocity inlet pointing up into the slit
+            let (xa, xb, ya, yc) = (x0, x0 + dx, ho, ho + slit_d as f64 * dx);
+            add("Floor0Left".into(), [-big, -dx, -dx], [xa, ly + dx, zz(1)]);
+            add("Floor0Right".into(), [xb, -dx, -dx], [big, ly + dx, zz(1)]);
+            add("Floor0Front".into(), [xa, -dx, -dx], [xb, ya, zz(1)]);
+            add("Floor0Back".into(), [xa, yc, -dx], [xb, ly + dx, zz(1)]);
+            add("Inlet".into(), [xa, ya, -dx], [xb, yc, zz(1)]);
+        } else {
+            add("Floor0".into(), [-big, -dx, -dx], [big, ly + dx, zz(1)]);
+        }
         add("FloorUnderChannel".into(), [-big, -dx, zz(1)], [big, ho, zz(FLOOR)]);
         add("FloorSlitWall".into(), [x1, ho, zz(1)], [big, ly + dx, zz(FLOOR)]);
         add("FloorSlitLeftWall".into(), [-big, ho, zz(1)], [x0, ly + dx, zz(FLOOR)]);
-        add("Lid".into(), [-big, -dx, zz(nz - 1)], [big, ly + dx, zz(nz) + dx]);
+        if inlet <= 0.0 {
+            add("Lid".into(), [-big, -dx, zz(nz - 1)], [big, ly + dx, zz(nz) + dx]);
+        }
         let top = (env("FREE_TOP", (nz - 1) as f64) as usize).clamp(FLOOR + 1, nz - 1);
         for k in FLOOR..top {
             let extra = if k >= WEDGE_AT { ((k - WEDGE_AT) / 2 + 1) as f64 * dx } else { 0.0 };
@@ -131,6 +144,16 @@ fn build(
     let mut d = domain([0.0; 3], [lx, ly, lz], dx);
     for f in [&mut d.faces.x_min, &mut d.faces.x_max, &mut d.faces.y_min, &mut d.faces.y_max, &mut d.faces.z_min, &mut d.faces.z_max] {
         *f = PERIODIC;
+    }
+    if inlet > 0.0 {
+        // an open top (a pressure outlet) takes the inlet's flow; the floor below is a wall
+        d.faces.z_min = FaceCondition::Wall {};
+        d.faces.z_max = FaceCondition::Pressure { pressure: 0.0, outflow: Default::default() };
+        d.surfaces.push(fieldcraft_model::SurfaceBoundary {
+            face: fieldcraft_model::GeometryRef::face("Inlet", "z_max").map_err(|e| e.to_string())?,
+            condition: fieldcraft_model::SurfaceCondition::MovingWall { velocity: [0.0, 0.0, inlet * dx / dt] },
+        });
+        d.moving_wall_ramp = Some(env("INLET_RAMP", 2000.0) * dt);
     }
     d.obstacles = obstacles.iter().map(|o| o.body.clone()).collect();
     // the body force of a plane channel for the mean speed (2/3 of the peak): 12 nu U / H^2
@@ -393,9 +416,10 @@ fn slit_stream() {
     let fills = fill_cells();
     let three_d = env("GEOM3", 1.0) != 0.0;
     let label = format!(
-        "{} stream peak {peak} angle {:.0} deg tau-1/2 {tau:e} sigma {sigma} WALL_SIGMA1 {wall_sigma1} fill {fills:?}",
+        "{} stream peak {peak} angle {:.0} deg inlet row {} tau-1/2 {tau:e} sigma {sigma} WALL_SIGMA1 {wall_sigma1} fill {fills:?}",
         if three_d { "GEOM3" } else { "2D" },
-        angle.to_degrees()
+        angle.to_degrees(),
+        env("INLET_ROW", 0.0)
     );
     let case = match build(w, slit_w, slit_d, tau, peak, sigma, &fills, three_d) {
         Ok(c) => c,
