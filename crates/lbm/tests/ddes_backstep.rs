@@ -1139,8 +1139,11 @@ struct Readings {
     shear: Result<(f64, Found), NoReattachment>,
     /// The u = 0 crossings of the time-mean u in rows 2, 3 and 4, least squares to y = 0.
     rows_2_4: Result<f64, String>,
-    /// The station where row 2, 3 and 4 are forward half of the time (row 2 is the one compared).
+    /// The station where rows 1 to 4 are forward half of the time (row 1, the height of the mean shear's wall node, is the
+    /// one compared with it).
     forward: Vec<Result<(f64, Found), NoReattachment>>,
+    /// The forward-half-the-time crossings of rows 2, 3 and 4, least squares to y = 0 (the rows reader's extrapolation).
+    forward_2_4: Result<f64, String>,
     /// The samples the near-wall readings average.
     samples: u64,
 }
@@ -1148,10 +1151,18 @@ struct Readings {
 impl Readings {
     fn of(floor_x: &[f64], mean_shear: &[f64], rows: &FloorRows) -> Readings {
         let (at, xs) = rows.behind();
-        let forward = (1..FLOOR_ROWS)
+        let forward: Vec<Result<(f64, Found), NoReattachment>> = (0..FLOOR_ROWS)
             .map(|n| {
                 let half: Vec<f64> = rows.column(n, &at, 1).iter().map(|f| f - 0.5).collect();
                 furthest_crossing(&xs, &half, PRIMARY_BEYOND)
+            })
+            .collect();
+        let forward_points: Result<Vec<(f64, f64)>, String> = (1..FLOOR_ROWS)
+            .map(|n| match forward.get(n) {
+                Some(Ok((x, Found::Crossing))) => Ok((rows.y[n], *x)),
+                Some(Ok((_, found))) => Err(format!("row {}: {found:?}", n + 1)),
+                Some(Err(why)) => Err(format!("row {}: {why:?}", n + 1)),
+                None => Err(format!("row {}: missing", n + 1)),
             })
             .collect();
         let crossings: Result<Vec<(f64, f64)>, String> = (1..FLOOR_ROWS)
@@ -1165,11 +1176,12 @@ impl Readings {
             shear: furthest_crossing(floor_x, mean_shear, PRIMARY_BEYOND),
             rows_2_4: crossings.map(|c| intercept(&c, 1)),
             forward,
+            forward_2_4: forward_points.map(|c| intercept(&c, 1)),
             samples: rows.samples(),
         }
     }
 
-    /// The gap between the mean-shear and the forward-flow (row 2) readings when it exceeds
+    /// The gap between the mean-shear and the forward-flow (row 1: the mean shear sits at that height) readings when it exceeds
     /// [`READINGS_AGREE`].
     fn disagreement(&self) -> Option<f64> {
         let (Ok((a, _)), Some(Ok((b, _)))) = (&self.shear, self.forward.first()) else { return None };
@@ -1189,8 +1201,12 @@ impl std::fmt::Display for Readings {
             Ok(x) => write!(f, "; rows 2-4 of the time-mean u at the wall {x:.3} H")?,
             Err(why) => write!(f, "; rows 2-4 of the time-mean u none ({why})")?,
         }
-        let rows: Vec<String> = self.forward.iter().enumerate().map(|(n, r)| format!("row {} {}", n + 2, show(r))).collect();
+        let rows: Vec<String> = self.forward.iter().enumerate().map(|(n, r)| format!("row {} {}", n + 1, show(r))).collect();
         write!(f, "; forward half the time: {}", rows.join(", "))?;
+        match &self.forward_2_4 {
+            Ok(x) => write!(f, "; rows 2-4 of the forward fraction at the wall {x:.3} H")?,
+            Err(why) => write!(f, "; rows 2-4 of the forward fraction none ({why})")?,
+        }
         if let Some(gap) = self.disagreement() {
             write!(f, "; THE MEAN-SHEAR AND FORWARD-FLOW READINGS DIFFER BY {gap:.3} H (over {READINGS_AGREE} H), both are reported")?;
         }
@@ -2116,6 +2132,8 @@ fn the_window_readings_come_from_the_time_means_and_say_when_they_differ() {
     assert!((r.rows_2_4.clone().unwrap() - 6.0).abs() < 1e-6, "{:?}", r.rows_2_4);
     let (forward_x, _) = r.forward[0].clone().unwrap();
     assert!((forward_x - 6.1).abs() < 1e-9, "{forward_x}");
+    assert_eq!(r.forward.len(), FLOOR_ROWS, "rows 1 to 4");
+    assert!((r.forward_2_4.clone().unwrap() - 6.1).abs() < 1e-6, "{:?}", r.forward_2_4);
     assert_eq!(r.disagreement(), None, "0.1 H apart is inside the 0.2 H band");
     assert_eq!(r.samples, 4);
     // Moved 0.5 H apart they differ, and the report says so.
