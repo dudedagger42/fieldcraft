@@ -16,6 +16,8 @@
 //! `PRODUCT-POCKET-HISTORY` (step:largest speed in the pocket, then in the whole domain).
 //! `WALL_SIGMA1=1` (default 0, off) sets σ = 1 in every fluid cell with a solid axis neighbour, the blend kept in the interior
 //! (the wall-layer rule); 2 is its complement (σ = 1 everywhere else).
+//! `WALL_MRT=1` (default 0) makes the wall layer collide with MRT while the rest keeps the hybrid collision; `WALL_BULK=<0..1>` removes
+//! that share of the non-equilibrium density mode in the wall layer (both studies, off by default; printed in the row's collision label).
 //! `WALL_GRADIENT=1` (default off: rows unchanged) lets the hybrid collision's strain rate see the walls: next to a solid cell the
 //! velocity gradient is taken through the wall point (u = 0, half a cell away), exact for a parabola. Printed on the PRODUCT line.
 //! `CASE=pocket` (never part of the default run): the aligned plane channel (width `CELLS`) with a rectangular pocket cut into
@@ -344,6 +346,7 @@ fn product_rows() {
     let tau_mh = env("TAU_MINUS_HALF", 5e-3);
     let sigma = env("SIGMA", 0.95);
     let label = if mrt { "mrt".to_string() } else { format!("hrr sigma {sigma}") };
+    let label = format!("{label}{}{}", if env("WALL_MRT", 0.0) != 0.0 { " +WALL_MRT" } else { "" }, if env("WALL_BULK", 0.0) > 0.0 { format!(" +WALL_BULK {}", env("WALL_BULK", 0.0)) } else { String::new() });
     let nu_lat = tau_mh / 3.0;
     // CASE: `channel`, `duct` or unset (both); CELLS: a comma list of widths in cells (default 8,16).
     let only = std::env::var("CASE").ok();
@@ -384,6 +387,8 @@ fn product_rows() {
             flow.set_wall_aware_gradient(wall_gradient());
             flow.set_wall_gradient_gap(env("WALL_GAP", 0.5));
             flow.set_wall_layer_sigma_one(env("WALL_SIGMA1", 0.0) as u8);
+            flow.set_wall_layer_bulk(env("WALL_BULK", 0.0));
+            flow.set_wall_layer_mrt(env("WALL_MRT", 0.0) != 0.0);
             let n = flow.grid().len();
             let fluid: Vec<bool> = (0..n).map(|c| Backend::is_fluid(&flow, c)).collect();
             // the flow rate is read over the cells it counts: the channel's rows (all fluid cells, but the pocket's)
