@@ -197,7 +197,9 @@ fn product_rows() {
             let mut drift_last_third = f64::NAN;
             let mut rho = rho0;
             while done < cap {
-                let chunk = chunk.min(cap - done);
+                // the first chunk is sampled ten times finer, so that a jump inside it is seen by the running minimum
+                let step = if done < chunk { (chunk / 10).max(1) } else { chunk };
+                let chunk = step.min(cap - done);
                 if Backend::advance(&mut flow, chunk).is_err() {
                     println!("PRODUCT collision {label} tau-1/2 {tau_mh:e} case {name} cells {w}: STOPPED by the backend at step {done}");
                     break;
