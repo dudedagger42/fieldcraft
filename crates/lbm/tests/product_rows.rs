@@ -11,6 +11,8 @@
 //! Mechanism knobs, both off by default (the rows are then unchanged): `WALL=halfway` leaves the walls as the plain half-way
 //! bounce-back of the grid (no interpolated links); the default interpolates them (linear). `LENGTH=<n>` makes the square duct n
 //! cells long along the flow (still periodic); the default is the harness's own 4 cells. Both are printed on the PRODUCT line.
+//! `WALL_GRADIENT=1` (default off: rows unchanged) lets the hybrid collision's strain rate see the walls: next to a solid cell the
+//! velocity gradient is taken through the wall point (u = 0, half a cell away), exact for a parabola. Printed on the PRODUCT line.
 //! `CASE=pocket` (never part of the default run): the aligned plane channel (width `CELLS`) with a rectangular pocket cut into
 //! one wall, `POCKET_W` cells along the flow (default 2) and `POCKET_D` cells deep (default 6), in a periodic box 16 cells long.
 //! The flow rate is read over the channel's own rows. After the row's PRODUCT line, `PRODUCT-POCKET` prints the number of fluid
@@ -205,6 +207,11 @@ fn neighbour_counts(flow: &fieldcraft_lbm::Flow, fluid: &[bool]) -> (usize, usiz
     (none, lacking)
 }
 
+/// `WALL_GRADIENT=1`.
+fn wall_gradient() -> bool {
+    std::env::var("WALL_GRADIENT").is_ok_and(|v| v == "1")
+}
+
 fn hi_cells(len: f64, dx: f64) -> f64 {
     (len / dx).round()
 }
@@ -319,6 +326,8 @@ fn product_rows() {
             if !halfway_walls() {
                 flow.interpolate_walls_with(&setup, &obstacles, WallOrder::Linear).expect("interpolated walls");
             }
+            flow.set_wall_aware_gradient(wall_gradient());
+            flow.set_wall_gradient_gap(env("WALL_GAP", 0.5));
             let n = flow.grid().len();
             let fluid: Vec<bool> = (0..n).map(|c| Backend::is_fluid(&flow, c)).collect();
             // the flow rate is read over the cells it counts: the channel's rows (all fluid cells, but the pocket's)
@@ -433,7 +442,8 @@ fn product_rows() {
             let wall = if halfway_walls() { "halfway" } else { "interpolated" };
             let length = if duct { duct_length().to_string() } else { "8 (channel)".to_string() };
             println!(
-                "PRODUCT collision {label} tau-1/2 {tau_mh:e} WALL {wall} LENGTH {length} SEED_AMP {} U_LAT {} SA_SEED {} case {name} cells {w} steps {done} (minimum {min_steps}, cap {cap}): flow-rate error {:+.4} % (at 2/3 of the run {:+.4} %), change over the last third {:.4} %, max-min over it {range:.4} % ({status}){jumps}, range under the 1 % bar: {}, mean-density drift {:+.3e} per 10000 steps, largest nu_t/nu {max_ratio:.3e}{} ALONG_DUCT_MAX {along_max:.6e}",
+                "PRODUCT collision {label} tau-1/2 {tau_mh:e} WALL {wall} LENGTH {length} WALL_GRADIENT {} SEED_AMP {} U_LAT {} SA_SEED {} case {name} cells {w} steps {done} (minimum {min_steps}, cap {cap}): flow-rate error {:+.4} % (at 2/3 of the run {:+.4} %), change over the last third {:.4} %, max-min over it {range:.4} % ({status}){jumps}, range under the 1 % bar: {}, mean-density drift {:+.3e} per 10000 steps, largest nu_t/nu {max_ratio:.3e}{} ALONG_DUCT_MAX {along_max:.6e}",
+                u8::from(wall_gradient()),
                 seed_amp(),
                 u_lat(),
                 env("SA_SEED", 3.0),
