@@ -8,6 +8,10 @@
 //! third of it); `SA_SEED` (default 3.0) is SA's nu-tilde over nu at the start and at the inflows (0 starts the field at zero: the model's trivial solution); `U_LAT` (default 0.02) the exact mean speed in lattice units; `MIN_STEPS` (default 0: 1.5 W²/(tau - 1/2)) is the steps before any settle is allowed; `SCAN_STEPS` caps a row's steps (default four times its minimum). A row runs at least 1.5 W² / (tau - 1/2)
 //! steps (W the width in cells) and then until the flow rate changes by under 0.05 % over the last third of the run, or the cap.
 //!
+//! Mechanism knobs, both off by default (the rows are then unchanged): `WALL=halfway` leaves the walls as the plain half-way
+//! bounce-back of the grid (no interpolated links); the default interpolates them (linear). `LENGTH=<n>` makes the square duct n
+//! cells long along the flow (still periodic); the default is the harness's own 4 cells. Both are printed on the PRODUCT line.
+//!
 //! `COLLISION=hrr TAU_MINUS_HALF=5e-3 cargo test --release -p fieldcraft-lbm --test product_rows -- --ignored --nocapture product_rows`
 //!
 //! One line per row: `PRODUCT collision, tau-1/2, case, cells, steps, flow-rate error, drift of the last third, mean-density
@@ -32,12 +36,12 @@ fn env(name: &str, default: f64) -> f64 {
 }
 
 /// The plane channel of `w` cells (walls on cell faces, as the width sweep's 8.00 and 16.00) or the square duct of side `w` cells.
-fn build(duct: bool, w: usize, nu_lat: f64, mrt: bool, hrr_sigma: f64) -> Result<(Setup, Vec<Obstacle>, [f64; 3], f64, f64), String> {
+fn build(duct: bool, w: usize, nu_lat: f64, mrt: bool, hrr_sigma: f64, length: usize) -> Result<(Setup, Vec<Obstacle>, [f64; 3], f64, f64), String> {
     let dx = 1.0 / w as f64;
     let dt = nu_lat * dx * dx;
     let wf = w as f64;
     let (obstacles, lo, hi, span) = if duct {
-        let (ho, span) = (wf * dx, 4.0 * dx);
+        let (ho, span) = (wf * dx, length as f64 * dx);
         let (lo, hi) = (-2.0 * dx, ho + 2.0 * dx);
         let big = 1.0;
         let o = vec![
@@ -78,6 +82,16 @@ fn build(duct: bool, w: usize, nu_lat: f64, mrt: bool, hrr_sigma: f64) -> Result
     // the flow rate reference per column of cells along x: the channel's width times the mean speed, or the duct's area times it
     let (along, reference) = if duct { (hi_cells(hi[0], dx) * 1.0, u_lat() * wf * wf) } else { (hi_cells(hi[0], dx) * 4.0, u_lat() * wf) };
     Ok((setup, obstacles, [0.0; 3], along, reference))
+}
+
+/// `LENGTH` (cells along the flow of the duct; the default 4 is the harness's own length).
+fn duct_length() -> usize {
+    std::env::var("LENGTH").ok().and_then(|v| v.parse().ok()).filter(|n| (1..=1024).contains(n)).unwrap_or(4)
+}
+
+/// `WALL=halfway`: no interpolated links.
+fn halfway_walls() -> bool {
+    std::env::var("WALL").is_ok_and(|v| v == "halfway")
 }
 
 fn hi_cells(len: f64, dx: f64) -> f64 {
@@ -180,7 +194,7 @@ fn product_rows() {
             continue;
         }
         for &w in &widths {
-            let (setup, obstacles, _, along, reference) = match build(duct, w, nu_lat, mrt, sigma) {
+            let (setup, obstacles, _, along, reference) = match build(duct, w, nu_lat, mrt, sigma, duct_length()) {
                 Ok(v) => v,
                 Err(e) => {
                     println!("PRODUCT collision {label} tau-1/2 {tau_mh:e} case {name} cells {w}: REFUSED by the setup: {e}");
@@ -188,7 +202,9 @@ fn product_rows() {
                 }
             };
             let mut flow = fieldcraft_lbm::Flow::new(&setup, &obstacles).expect("flow");
-            flow.interpolate_walls_with(&setup, &obstacles, WallOrder::Linear).expect("interpolated walls");
+            if !halfway_walls() {
+                flow.interpolate_walls_with(&setup, &obstacles, WallOrder::Linear).expect("interpolated walls");
+            }
             let n = flow.grid().len();
             let fluid: Vec<bool> = (0..n).map(|c| Backend::is_fluid(&flow, c)).collect();
             // MIN_STEPS (default 0: the computed minimum) is the number of steps before any settle is allowed
@@ -225,7 +241,12 @@ fn product_rows() {
                     if let Some(&(_, back)) = hist.iter().rev().find(|(s, _)| *s <= t) {
                         drift_last_third = (rate - back).abs() / (1.0 + rate).abs();
                         let jump_in_third = first_jump(&hist).filter(|j| *j > t);
-                        if drift_last_third < 5e-4 && range_after(&hist, t) < 5e-4 && jump_in_third.is_none() && reversed(&hist).is_none() && !recent_jump_back(&hist, 3) {
+                        if drift_last_third < 5e-4
+                            && range_after(&hist, t) < 5e-4
+                            && jump_in_third.is_none()
+                            && reversed(&hist).is_none()
+                            && !recent_jump_back(&hist, 3)
+                        {
                             settled = true;
                             break;
                         }
@@ -259,8 +280,10 @@ fn product_rows() {
                     format!(" [LEFT LAMINAR at step {at}: |error| had fallen to {:.4} % at step {st}, final {:+.4} %]", 100.0 * m, 100.0 * last)
                 });
             let range = 100.0 * range_after(&hist, done * 2 / 3);
+            let wall = if halfway_walls() { "halfway" } else { "interpolated" };
+            let length = if duct { duct_length().to_string() } else { "8 (channel)".to_string() };
             println!(
-                "PRODUCT collision {label} tau-1/2 {tau_mh:e} U_LAT {} SA_SEED {} case {name} cells {w} steps {done} (minimum {min_steps}, cap {cap}): flow-rate error {:+.4} % (at 2/3 of the run {:+.4} %), change over the last third {:.4} %, max-min over it {range:.4} % ({status}){jumps}, range under the 1 % bar: {}, mean-density drift {:+.3e} per 10000 steps, largest nu_t/nu {max_ratio:.3e}{}",
+                "PRODUCT collision {label} tau-1/2 {tau_mh:e} WALL {wall} LENGTH {length} U_LAT {} SA_SEED {} case {name} cells {w} steps {done} (minimum {min_steps}, cap {cap}): flow-rate error {:+.4} % (at 2/3 of the run {:+.4} %), change over the last third {:.4} %, max-min over it {range:.4} % ({status}){jumps}, range under the 1 % bar: {}, mean-density drift {:+.3e} per 10000 steps, largest nu_t/nu {max_ratio:.3e}{}",
                 u_lat(),
                 env("SA_SEED", 3.0),
                 100.0 * last,
