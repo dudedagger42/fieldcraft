@@ -17,11 +17,20 @@ use fieldcraft_gpu::select::Policy;
 use fieldcraft_lbm::backend::Backend;
 use fieldcraft_lbm_gpu::{GpuFlow, Options};
 
+/// How the study paces its device: `FIELDCRAFT_GPU_SUBMIT_STEPS` steps per waited-for submission (default 1) and
+/// `FIELDCRAFT_GPU_DUTY` the fraction of time kept busy (default 1: no pause), which holds a laptop's temperature down.
+fn device_pacing() -> (u64, f64) {
+    let steps = std::env::var("FIELDCRAFT_GPU_SUBMIT_STEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+    let duty = std::env::var("FIELDCRAFT_GPU_DUTY").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0);
+    (steps, duty)
+}
+
 /// Sets the study's device: a GPU flow built from the CPU flow the study has built and set.
 fn install() {
     let _ = ddes_backstep::DEVICE.set(Box::new(|flow| {
         let policy = Policy::from_env().map_err(|e| e.to_string())?;
-        let gpu = GpuFlow::with_options(flow, policy, Options::default()).map_err(|e| e.to_string())?;
+        let (submit_steps, duty) = device_pacing();
+        let gpu = GpuFlow::with_options(flow, policy, Options { submit_steps, duty, ..Options::default() }).map_err(|e| e.to_string())?;
         Ok(Box::new(gpu) as Box<dyn Backend>)
     }));
 }
@@ -176,18 +185,23 @@ fn watched_short_gpu_run() {
     let cells = std::env::var("CELLS_PER_H").ok().and_then(|v| v.parse().ok()).unwrap_or(24usize);
     let span: f64 = std::env::var("SPAN").ok().and_then(|v| v.parse().ok()).unwrap_or(4.0);
     let steps: u64 = std::env::var("STEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(3000);
-    let submit_steps: u64 = std::env::var("SUBMIT_STEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+    let (submit_steps, duty) = device_pacing();
     let (cpu, config) = ddes_backstep::built_zone_step(cells, span);
     println!("CASE {config}");
     let policy = Policy::from_env().expect("FIELDCRAFT_GPU names a policy");
-    let mut gpu = match GpuFlow::with_options(&cpu, policy, Options { submit_steps, ..Options::default() }) {
+    let mut gpu = match GpuFlow::with_options(&cpu, policy, Options { submit_steps, duty, ..Options::default() }) {
         Ok(g) => g,
         Err(why) => {
             println!("DEVICE refused: {why}");
             return;
         }
     };
-    println!("DEVICE {}; {} cells ({} fluid); {steps} steps, {submit_steps} per submission", gpu.adapter_name(), cpu.grid().len(), cpu.fluid_cells());
+    println!(
+        "DEVICE {}; {} cells ({} fluid); {steps} steps, {submit_steps} per submission, duty {duty}",
+        gpu.adapter_name(),
+        cpu.grid().len(),
+        cpu.fluid_cells()
+    );
     println!("WATCH START");
     let started = std::time::Instant::now();
     let mut done = 0;

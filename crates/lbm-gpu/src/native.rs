@@ -247,6 +247,10 @@ pub struct Options {
     /// runs longer than that many steps (a long dispatch train can starve the display driver's watchdog). The order of
     /// the dispatches does not change, so the results are bit for bit the same ([`GpuFlow::submit_seconds`] times them).
     pub submit_steps: u64,
+    /// With `submit_steps` above 0: the fraction of the time the device is kept busy, above 0 and below 1 (0, or 1 and
+    /// above, is no pause): after each waited-for submission of `t` seconds the call sleeps `t (1 / duty − 1)` seconds,
+    /// so a laptop holds a lower temperature. The results do not change.
+    pub duty: f64,
 }
 
 /// GPU time per kernel, summed over the dispatches since the flow was created (with
@@ -264,6 +268,7 @@ pub struct GpuFlow {
     /// With [`Options::submit_steps`]: steps per submission, and the wall seconds of each waited-for submission so far
     /// (at most [`MAX_SUBMIT_TIMES`] kept).
     submit_steps: u64,
+    duty: f64,
     submit_times: Vec<f64>,
     /// With [`Options::profile`]: the GPU time of each kernel so far.
     kernel_times: Option<std::cell::RefCell<std::collections::BTreeMap<&'static str, KernelTime>>>,
@@ -1711,6 +1716,7 @@ impl GpuFlow {
             device: device.clone(),
             queue: queue.clone(),
             submit_steps: options.submit_steps,
+            duty: options.duty,
             submit_times: Vec::new(),
             kernel_times: profile.then(Default::default),
             pipeline_seconds,
@@ -2273,8 +2279,12 @@ impl GpuFlow {
                 self.device
                     .poll(wgpu::PollType::Wait { submission_index: Some(index), timeout: Some(DEVICE_TIMEOUT) })
                     .map_err(|e| gpu_error(format!("waiting for a submission: {e}")))?;
+                let seconds = started.elapsed().as_secs_f64();
                 if self.submit_times.len() < MAX_SUBMIT_TIMES {
-                    self.submit_times.push(started.elapsed().as_secs_f64());
+                    self.submit_times.push(seconds);
+                }
+                if self.duty > 0.0 && self.duty < 1.0 {
+                    std::thread::sleep(std::time::Duration::from_secs_f64((seconds * (1.0 / self.duty - 1.0)).clamp(0.0, 1.0)));
                 }
                 from = to;
             }
