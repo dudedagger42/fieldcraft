@@ -99,18 +99,18 @@ fn first_jump(hist: &[(u64, f64)]) -> Option<u64> {
         let mut nb: Vec<f64> = (i.saturating_sub(2)..(i + 3).min(d.len())).filter(|&j| j != i).map(|j| d[j]).collect();
         nb.sort_by(f64::total_cmp);
         let med = nb.get(nb.len() / 2).copied().unwrap_or(0.0);
-        (d[i] > 1e-6 && d[i] > 10.0 * med).then(|| hist[i + 1].0)
+        (med >= 1e-6 && d[i] > 10.0 * med).then(|| hist[i + 1].0)
     })
 }
 
 /// A second jump flag, looking backwards only: the first chunk whose change exceeds 5 times the median of the previous five
-/// changes (at least three before it; floor 1e-6). The next chunk's movement cannot hide it. An extra tag, not part of the verdict.
+/// changes (at least three before it; skipped when that median is under the floor of 1e-6, 1e-4 points). The next chunk's movement cannot hide it. An extra tag, not part of the verdict.
 fn first_jump_back(hist: &[(u64, f64)]) -> Option<u64> {
     let d: Vec<f64> = hist.windows(2).map(|w| (w[1].1 - w[0].1).abs()).collect();
     (3..d.len()).find_map(|i| jump_back_at(&d, i).then(|| hist[i + 1].0))
 }
 
-/// Whether change `i` exceeds 5 times the median of the previous five (at least three before it; floor 1e-6).
+/// Whether change `i` exceeds 5 times the median of the previous five (at least three before it; skipped when that median is under the floor of 1e-6, 1e-4 points).
 fn jump_back_at(d: &[f64], i: usize) -> bool {
     if i < 3 || i >= d.len() {
         return false;
@@ -118,7 +118,8 @@ fn jump_back_at(d: &[f64], i: usize) -> bool {
     let mut prev: Vec<f64> = d[i.saturating_sub(5)..i].to_vec();
     prev.sort_by(f64::total_cmp);
     let med = prev.get(prev.len() / 2).copied().unwrap_or(0.0);
-    d[i] > 1e-6 && d[i] > 5.0 * med
+    // a neighbourhood that is flat (median under the floor) tags nothing
+    med >= 1e-6 && d[i] > 5.0 * med
 }
 
 /// A JUMP-BACK in any of the last `n` chunks: such a row is not allowed to settle yet.
@@ -292,4 +293,12 @@ fn a_jump_back_in_the_last_chunks_holds_the_settle() {
     assert!(recent_jump_back(&h, 3), "still inside the last three chunks");
     h.extend([(2200, last + 0.01 + 2e-7), (2300, last + 0.01 + 3e-7), (2400, last + 0.01 + 4e-7)]);
     assert!(!recent_jump_back(&h, 3), "three quiet chunks later it may settle");
+}
+
+#[test]
+fn a_flat_neighbourhood_tags_no_jump() {
+    let mut h: Vec<(u64, f64)> = (1..8).map(|i| (i * 100, -0.9157 + 0.0043 * i as f64)).collect();
+    let last = h.last().map_or(0.0, |x| x.1);
+    h.extend((8..16).map(|i| (i * 100, last)));
+    assert!(first_jump(&h).is_none() && first_jump_back(&h).is_none());
 }
