@@ -47,7 +47,7 @@ fn zone_throughput_and_diagnostic_cost() {
         let m = model(1.0, 0.1, d, step(232.0, 1.0, None));
         let (_, flow) = prepare(&m, &[]);
         let policy = Policy::from_env().expect("FIELDCRAFT_GPU names a policy");
-        let Ok(mut device) = GpuFlow::with_options(&flow, policy, Options { streaming: Streaming::InPlace, profile: false }) else {
+        let Ok(mut device) = GpuFlow::with_options(&flow, policy, Options { streaming: Streaming::InPlace, profile: false, ..Options::default() }) else {
             println!("skipping {kind}: no GPU or not enough memory");
             return;
         };
@@ -116,7 +116,7 @@ fn cell_updates_per_second() {
         let picked = auto.streams_in_place();
         drop(auto);
         for (streaming, in_place) in [(Streaming::InPlace, true), (Streaming::TwoBuffers, false)] {
-            let mut gpu = GpuFlow::with_options(&flow, policy, Options { streaming, profile }).unwrap();
+            let mut gpu = GpuFlow::with_options(&flow, policy, Options { streaming, profile, ..Options::default() }).unwrap();
             // One warm-up chunk, then the timed run: the chunk's steps are one submission.
             gpu.advance(1).unwrap();
             let start = std::time::Instant::now();
@@ -382,7 +382,7 @@ fn les_cost() {
             });
             let policy = Policy::from_env().expect("FIELDCRAFT_GPU names a policy");
             for (streaming, label) in [(Streaming::InPlace, "in place"), (Streaming::TwoBuffers, "two buffers")] {
-                let Ok(mut gpu) = GpuFlow::with_options(&flow, policy, Options { streaming, profile: false }) else {
+                let Ok(mut gpu) = GpuFlow::with_options(&flow, policy, Options { streaming, profile: false, ..Options::default() }) else {
                     println!("skipping: no GPU");
                     return;
                 };

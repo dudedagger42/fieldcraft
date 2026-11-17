@@ -77,6 +77,9 @@ fn update_diagnostic_phase(phase: Option<&str>) {
 /// Steps per submission: the stability check and a cancel take effect between submissions.
 const MAX_CHUNK: u64 = 64;
 
+/// Submission times kept for [`GpuFlow::submit_seconds`].
+const MAX_SUBMIT_TIMES: usize = 1 << 20;
+
 /// How long one wait for the device may take before the solve gives up on it.
 const DEVICE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
@@ -239,6 +242,11 @@ pub struct Options {
     /// Time every kernel with timestamp queries ([`GpuFlow::kernel_times`]). Each dispatch then
     /// gets its own pass and every chunk waits for its timestamps: for measurements, not solves.
     pub profile: bool,
+    /// Time steps per submission to the device: 0 (the default) submits a whole chunk (up to 64 steps) at once; above 0 a
+    /// chunk is cut into submissions of that many steps, each waited for before the next goes in, so no single submission
+    /// runs longer than that many steps (a long dispatch train can starve the display driver's watchdog). The order of
+    /// the dispatches does not change, so the results are bit for bit the same ([`GpuFlow::submit_seconds`] times them).
+    pub submit_steps: u64,
 }
 
 /// GPU time per kernel, summed over the dispatches since the flow was created (with
@@ -253,6 +261,10 @@ pub struct KernelTime {
 pub struct GpuFlow {
     device: wgpu::Device,
     queue: wgpu::Queue,
+    /// With [`Options::submit_steps`]: steps per submission, and the wall seconds of each waited-for submission so far
+    /// (at most [`MAX_SUBMIT_TIMES`] kept).
+    submit_steps: u64,
+    submit_times: Vec<f64>,
     /// With [`Options::profile`]: the GPU time of each kernel so far.
     kernel_times: Option<std::cell::RefCell<std::collections::BTreeMap<&'static str, KernelTime>>>,
     /// How long compiling the kernels took for this flow (zero when the process had compiled
@@ -1683,6 +1695,8 @@ impl GpuFlow {
         Ok(GpuFlow {
             device: device.clone(),
             queue: queue.clone(),
+            submit_steps: options.submit_steps,
+            submit_times: Vec::new(),
             kernel_times: profile.then(Default::default),
             pipeline_seconds,
             aa,
@@ -1894,6 +1908,11 @@ impl GpuFlow {
     }
 
     /// The adapter's name.
+    /// With [`Options::submit_steps`]: the wall seconds of every submission so far (each waited for), oldest first.
+    pub fn submit_seconds(&self) -> &[f64] {
+        &self.submit_times
+    }
+
     pub fn adapter_name(&self) -> &str {
         &self.adapter
     }
@@ -2114,6 +2133,7 @@ impl GpuFlow {
         self.write_ramp(steps)?;
         self.queue.write_buffer(&self.stats, 0, &bytes_u32(&[0; 8]));
         let mut commands = Vec::with_capacity(self.dispatches_per_step() * steps as usize + 7);
+        let mut step_ends: Vec<usize> = Vec::with_capacity(steps as usize);
         for step in 0..steps {
             // Each fan's flow from the populations and its previous push, then its rise moved
             // toward its curve, before anything else in the step reads the push (as on the CPU).
@@ -2196,6 +2216,7 @@ impl GpuFlow {
                 }
             }
             self.current ^= 1;
+            step_ends.push(commands.len());
         }
         // The momentum (and heat) exchange of the last step, from its post-collision
         // populations; with solids also without fluid links, for their heat into box faces.
@@ -2215,7 +2236,33 @@ impl GpuFlow {
         if self.thermal.is_some() {
             commands.push((self.current, "thermal_check", self.cells));
         }
-        self.submit("lbm steps", &commands)?;
+        if self.submit_steps == 0 || self.kernel_times.is_some() {
+            self.submit("lbm steps", &commands)?;
+        } else {
+            // Cut after whole steps (the last piece also takes the tail), wait for each piece.
+            let mut from = 0;
+            let mut done = 0u64;
+            while done < steps {
+                done = (done + self.submit_steps).min(steps);
+                let to = if done == steps { commands.len() } else { step_ends.get(done as usize - 1).copied().unwrap_or(commands.len()) };
+                let started = std::time::Instant::now();
+                let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("lbm steps") });
+                {
+                    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("lbm steps"), timestamp_writes: None });
+                    for &(bind, name, groups) in commands.get(from..to).unwrap_or_default() {
+                        self.dispatch(&mut pass, bind, name, groups)?;
+                    }
+                }
+                let index = self.queue.submit([enc.finish()]);
+                self.device
+                    .poll(wgpu::PollType::Wait { submission_index: Some(index), timeout: Some(DEVICE_TIMEOUT) })
+                    .map_err(|e| gpu_error(format!("waiting for a submission: {e}")))?;
+                if self.submit_times.len() < MAX_SUBMIT_TIMES {
+                    self.submit_times.push(started.elapsed().as_secs_f64());
+                }
+                from = to;
+            }
+        }
         self.steps_done += steps;
         self.exchange_cache = None;
         let stats = self.read(&self.stats, 32)?;
