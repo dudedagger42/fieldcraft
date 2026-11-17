@@ -687,6 +687,8 @@ pub struct Flow {
     wall_gradient: bool,
     /// The wall's distance from the cell centre the gradient uses, in cells (0.5 half way).
     wall_gap: f64,
+    /// A study: σ = 1 in every fluid cell with a solid axis neighbour (the wall layer).
+    wall_layer_sigma_one: bool,
     /// Whether σ is dynamic (set per cell from the subgrid model, [`crate::hrr`]), and then its
     /// smallest and mean value over the fluid cells in the last collision.
     dynamic: bool,
@@ -1808,6 +1810,7 @@ impl Flow {
             sigma: setup.sigma,
             wall_gradient: false,
             wall_gap: 0.5,
+            wall_layer_sigma_one: false,
             dynamic: setup.dynamic_sigma,
             sigma_stats: None,
             gradient_u: if setup.collision == Collision::Hrr || setup.vreman > 0.0 || setup.spalart_allmaras.is_some() {
@@ -2493,6 +2496,11 @@ impl Flow {
     /// links' cut distances are not read yet: every wall is taken half way.
     pub fn set_wall_aware_gradient(&mut self, on: bool) {
         self.wall_gradient = on;
+    }
+
+    /// A study: σ = 1 in every cell with a solid neighbour along an axis.
+    pub fn set_wall_layer_sigma_one(&mut self, on: bool) {
+        self.wall_layer_sigma_one = on;
     }
 
     /// The wall's distance from the cell centre the wall-aware gradient uses, in cells (default 0.5, half way): for studies.
@@ -3304,6 +3312,7 @@ impl Flow {
         let mrt = self.collision == Collision::Mrt;
         let (sigma, gradient_u, grid, periodic, wall_gradient) = (self.sigma, &self.gradient_u, self.grid, self.periodic, self.wall_gradient);
         let wall_gap = self.wall_gap;
+        let wall_layer_sigma_one = self.wall_layer_sigma_one;
         // Dynamic σ's cap on the von Kármán length: the box's shortest extent in cells.
         let l_max = self.grid.cells.iter().copied().min().unwrap_or(1) as f64;
         let (wp, wm) = (self.omega_plus, self.omega_minus);
@@ -3490,12 +3499,26 @@ impl Flow {
                         let strain = if wall_gradient {
                             let p = grid.coords(b * block + i);
                             let gaps: crate::hrr::WallGaps = [0, 1, 2].map(|axis| {
-                                [false, true]
-                                    .map(|up| across(&grid, periodic, p, axis, up).filter(|&c| !fluid.get(c).copied().unwrap_or(true)).map(|_| wall_gap))
+                                [false, true].map(|up| {
+                                    across(&grid, periodic, p, axis, up).filter(|&c| !fluid.get(c).copied().unwrap_or(true)).map(|_| wall_gap)
+                                })
                             });
                             crate::hrr::strain(&crate::hrr::gradient_walled(u, nb, &gaps))
                         } else {
                             crate::hrr::strain(g)
+                        };
+                        // A study: σ = 1 in the wall layer (a fluid cell with a solid axis neighbour).
+                        let cell_sigma = if wall_layer_sigma_one && {
+                            let p = grid.coords(b * block + i);
+                            (0..3).any(|axis| {
+                                [false, true]
+                                    .iter()
+                                    .any(|&up| across(&grid, periodic, p, axis, up).is_some_and(|c| !fluid.get(c).copied().unwrap_or(true)))
+                            })
+                        } {
+                            1.0
+                        } else {
+                            cell_sigma
                         };
                         (cell_sigma, strain)
                     });
@@ -4061,6 +4084,7 @@ impl crate::backend::Backend for Flow {
             gradient_u: _,
             wall_gradient: _,
             wall_gap: _,
+            wall_layer_sigma_one: _,
             dynamic,
             sigma_stats,
             periodic,
