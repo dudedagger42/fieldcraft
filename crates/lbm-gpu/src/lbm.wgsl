@@ -130,6 +130,9 @@ override WALL_MRT: bool = false;
 // relaxes every non-conserved moment fully to equilibrium. It rides the wall layer's MRT path: the host flags those cells with
 // LAYER_BIT and CORNER_BIT, and `collide_mrt` reads the rates of the full relaxation from the corner tables instead.
 override WALL_CORNER: bool = false;
+// The study knob WALL_TAU_FLOOR (Flow::set_wall_tau_floor, with HRR and WALL_MRT): a floor on tau - 1/2 of the wall layer's MRT
+// stresses; 0 is off (the select then folds away at pipeline creation).
+override WALL_TAU_FLOOR: f32 = 0.0;
 // Fans and porous zones (fieldcraft_lbm::flow's zone actions, data in `fluid`: zones.rs); likewise.
 override ZONES: bool = false;
 // The Spalart–Allmaras model (fieldcraft_lbm::sa): ν̃'s passes and its ν_t in the collision; likewise.
@@ -1843,6 +1846,10 @@ fn collide_mrt(cell: u32, lid: u32, xyz: vec3<i32>, fq: ptr<function, array<f32,
             if nu_t > 0.0 { omega = explicit_omega(nu_t); }
         }
         record_eddy(cell, lid, omega, u);
+    }
+    // The wall layer's floor on tau - 1/2 (a select on the cell's layer flag; with the knob off it is not compiled in).
+    if WALL_TAU_FLOOR > 0.0 && WALL_MRT && HRR {
+        omega = select(omega, min(omega, 1.0 / (0.5 + WALL_TAU_FLOOR)), in_wall_layer(cell));
     }
     // The corner study's cells relax fully (a select on a cell flag, not a branch: the same code runs in every cell).
     let corner = WALL_CORNER && in_corner(cell);

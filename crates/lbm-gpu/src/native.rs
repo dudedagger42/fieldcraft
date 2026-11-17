@@ -698,8 +698,10 @@ struct Variant {
     wall_sigma1: bool,
     /// The study knob WALL_MRT: MRT in the wall layer.
     wall_mrt: bool,
-    /// The study knob WALL_CORNER: full relaxation to equilibrium in cells with three or more solid axis faces.
+    /// The study knob WALL_CORNER: full relaxation to equilibrium in pure concave corners.
     wall_corner: bool,
+    /// The study knob WALL_TAU_FLOOR: the floor on tau - 1/2 in the wall layer's MRT, as f32 bits (0: off).
+    wall_tau_floor: u32,
     /// Fans or porous zones.
     zones: bool,
     /// The Spalart–Allmaras model.
@@ -757,6 +759,7 @@ fn compile(device: &wgpu::Device, variant: Variant) -> Result<Kernels> {
                     ("WALL_SIGMA1", if variant.wall_sigma1 { 1.0 } else { 0.0 }),
                     ("WALL_MRT", if variant.wall_mrt { 1.0 } else { 0.0 }),
                     ("WALL_CORNER", if variant.wall_corner { 1.0 } else { 0.0 }),
+                    ("WALL_TAU_FLOOR", f64::from(f32::from_bits(variant.wall_tau_floor))),
                     ("ZONES", if variant.zones { 1.0 } else { 0.0 }),
                     ("SA", if variant.sa { 1.0 } else { 0.0 }),
                     ("MAX_SPEED", MAX_LATTICE_SPEED),
@@ -1491,6 +1494,7 @@ impl GpuFlow {
             wall_sigma1: hybrid.is_some() && flow.wall_layer_sigma_one() == 1,
             wall_mrt: hybrid.is_some() && flow.wall_layer_mrt(),
             wall_corner: hybrid.is_some() && flow.wall_corner_relax(),
+            wall_tau_floor: if hybrid.is_some() && flow.wall_layer_mrt() { (flow.wall_tau_floor() as f32).to_bits() } else { 0 },
             zones: zones.zones > 0,
             sa: sa_faces.is_some(),
         })?;

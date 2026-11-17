@@ -39,6 +39,11 @@ fn lbm_wgsl_validates_for_the_collision_variants() {
         ("hybrid with WALL_CORNER = 1", [&hybrid[..], &[("WALL_CORNER", 1.0)]].concat()),
         ("hybrid, Vreman, WALL_CORNER and WALL_MRT = 1", [&hybrid[..], &[("VREMAN", 1.0), ("WALL_CORNER", 1.0), ("WALL_MRT", 1.0)]].concat()),
         ("hybrid, SA, WALL_CORNER = 1", [&hybrid[..], &[("SA", 1.0), ("WALL_CORNER", 1.0)]].concat()),
+        ("hybrid, WALL_MRT and WALL_TAU_FLOOR", [&hybrid[..], &[("WALL_MRT", 1.0), ("WALL_TAU_FLOOR", 5e-4)]].concat()),
+        (
+            "hybrid, SA, WALL_MRT, WALL_CORNER and WALL_TAU_FLOOR",
+            [&hybrid[..], &[("SA", 1.0), ("WALL_MRT", 1.0), ("WALL_CORNER", 1.0), ("WALL_TAU_FLOOR", 5e-4)]].concat(),
+        ),
         ("MRT everywhere", vec![("MRT", 1.0)]),
         ("MRT everywhere, Vreman", vec![("MRT", 1.0), ("VREMAN", 1.0)]),
         ("MRT everywhere, SA", vec![("MRT", 1.0), ("SA", 1.0)]),
