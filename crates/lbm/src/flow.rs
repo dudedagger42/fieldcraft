@@ -577,6 +577,10 @@ pub struct Flow {
     /// the collision (for the finite-difference gradient; empty otherwise).
     sigma: f64,
     gradient_u: Vec<[f64; 3]>,
+    /// Whether the hybrid collision's strain rate takes the wall into account ([`crate::hrr::gradient_walled`]); off by default.
+    wall_gradient: bool,
+    /// The wall's distance from the cell centre the gradient uses, in cells (0.5 half way).
+    wall_gap: f64,
     /// Whether σ is dynamic (set per cell from the subgrid model, [`crate::hrr`]), and then its
     /// smallest and mean value over the fluid cells in the last collision.
     dynamic: bool,
@@ -1399,6 +1403,8 @@ impl Flow {
             cell_force,
             cell_u,
             sigma: setup.sigma,
+            wall_gradient: false,
+            wall_gap: 0.5,
             dynamic: setup.dynamic_sigma,
             sigma_stats: None,
             gradient_u: if setup.collision == Collision::Hrr || setup.vreman > 0.0 || setup.spalart_allmaras.is_some() {
@@ -1774,6 +1780,22 @@ impl Flow {
     /// so that ν_t is the law's at y⁺ = y u_τ/ν ([`crate::sa::WallLaw`]).
     pub fn sa_wall_function(&self) -> (Option<crate::sa::WallLaw>, &[(usize, f64, f64)]) {
         self.sa.as_ref().map_or((None, &[][..]), |s| (s.law, &s.wall[..]))
+    }
+
+    /// Let the hybrid collision's strain rate see the walls: next to a solid cell the velocity gradient is taken through the
+    /// wall point (u = 0, half a cell away: the half-way bounce-back wall) instead of ignoring the solid side
+    /// ([`crate::hrr::gradient_walled`]). Off by default; with it off the flow is unchanged bit for bit. Only the
+    /// blend's strain rate changes, not Vreman's, the Spalart–Allmaras model's or the dynamic σ's gradient. Interpolated
+    /// links' cut distances are not read yet: every wall is taken half way.
+    pub fn set_wall_aware_gradient(&mut self, on: bool) {
+        self.wall_gradient = on;
+    }
+
+    /// The wall's distance from the cell centre the wall-aware gradient uses, in cells (default 0.5, half way): for studies.
+    pub fn set_wall_gradient_gap(&mut self, gap: f64) {
+        if gap.is_finite() && gap > 0.0 {
+            self.wall_gap = gap;
+        }
     }
 
     /// With the Spalart–Allmaras model: take exactly `n` equal sub-steps of ν̃ per lattice step
@@ -2519,7 +2541,8 @@ impl Flow {
         let gradients = !self.gradient_u.is_empty() && (hybrid || self.vreman > 0.0);
         let regularized = self.collision.is_regularized();
         let mrt = self.collision == Collision::Mrt;
-        let (sigma, gradient_u, grid, periodic) = (self.sigma, &self.gradient_u, self.grid, self.periodic);
+        let (sigma, gradient_u, grid, periodic, wall_gradient) = (self.sigma, &self.gradient_u, self.grid, self.periodic, self.wall_gradient);
+        let wall_gap = self.wall_gap;
         // Dynamic σ's cap on the von Kármán length: the box's shortest extent in cells.
         let l_max = self.grid.cells.iter().copied().min().unwrap_or(1) as f64;
         let (wp, wm) = (self.omega_plus, self.omega_minus);
@@ -2702,7 +2725,18 @@ impl Flow {
                         } else {
                             sigma
                         };
-                        (cell_sigma, crate::hrr::strain(g))
+                        // The strain rate of the blend: with the walls in the gradient where the flow has asked for it.
+                        let strain = if wall_gradient {
+                            let p = grid.coords(b * block + i);
+                            let gaps: crate::hrr::WallGaps = [0, 1, 2].map(|axis| {
+                                [false, true]
+                                    .map(|up| across(&grid, periodic, p, axis, up).filter(|&c| !fluid.get(c).copied().unwrap_or(true)).map(|_| wall_gap))
+                            });
+                            crate::hrr::strain(&crate::hrr::gradient_walled(u, nb, &gaps))
+                        } else {
+                            crate::hrr::strain(g)
+                        };
+                        (cell_sigma, strain)
                     });
                     // The cell's rate: a shear-dependent fluid's of its flux (not at a wall cell
                     // under the wall model), Smagorinsky's, or the one above.
@@ -3162,6 +3196,8 @@ impl crate::backend::Backend for Flow {
             sigma,
             // Each cell's velocity before the collision, rebuilt from `f` at the start of a step.
             gradient_u: _,
+            wall_gradient: _,
+            wall_gap: _,
             dynamic,
             sigma_stats,
             periodic,
