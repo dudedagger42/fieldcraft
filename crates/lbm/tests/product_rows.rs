@@ -2,7 +2,7 @@
 //! collision and relaxation time, on interpolated walls with the mass correction off, against the exact flow rate. No frozen
 //! values and no assertions: the lines are read, not gated.
 //!
-//! Environment: `COLLISION` = `hrr` (default) or `mrt`; `SIGMA` (default 0.95) is the hybrid collision's sigma (1.0 may be refused by the setup: the row then prints REFUSED); `TAU_MINUS_HALF` (default 5e-3: lattice viscosity is a
+//! Environment: `CASE` (`channel` or `duct`; both when unset), `CELLS` (comma list of widths, default 8,16), `COLLISION` = `hrr` (default) or `mrt`; `SIGMA` (default 0.95) is the hybrid collision's sigma (1.0 may be refused by the setup: the row then prints REFUSED); `TAU_MINUS_HALF` (default 5e-3: lattice viscosity is a
 //! third of it); `SCAN_STEPS` caps a row's steps (default four times its minimum). A row runs at least 1.5 W² / (tau - 1/2)
 //! steps (W the width in cells) and then until the flow rate changes by under 0.05 % over the last third of the run, or the cap.
 //!
@@ -117,8 +117,18 @@ fn product_rows() {
     let sigma = env("SIGMA", 0.95);
     let label = if mrt { "mrt".to_string() } else { format!("hrr sigma {sigma}") };
     let nu_lat = tau_mh / 3.0;
+    // CASE: `channel`, `duct` or unset (both); CELLS: a comma list of widths in cells (default 8,16).
+    let only = std::env::var("CASE").ok();
+    let widths: Vec<usize> = std::env::var("CELLS")
+        .ok()
+        .map(|v| v.split(',').filter_map(|t| t.trim().parse().ok()).filter(|&w| (2..=128).contains(&w)).collect())
+        .filter(|v: &Vec<usize>| !v.is_empty())
+        .unwrap_or_else(|| vec![8, 16]);
     for (name, duct) in [("channel", false), ("duct", true)] {
-        for w in [8usize, 16] {
+        if only.as_deref().is_some_and(|c| c != name) {
+            continue;
+        }
+        for &w in &widths {
             let (setup, obstacles, _, along, reference) = match build(duct, w, nu_lat, mrt, sigma) {
                 Ok(v) => v,
                 Err(e) => {
