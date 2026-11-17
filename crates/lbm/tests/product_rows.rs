@@ -328,7 +328,7 @@ fn product_rows() {
             }
             flow.set_wall_aware_gradient(wall_gradient());
             flow.set_wall_gradient_gap(env("WALL_GAP", 0.5));
-            flow.set_wall_layer_sigma_one(env("WALL_SIGMA1", 0.0) == 1.0);
+            flow.set_wall_layer_sigma_one(env("WALL_SIGMA1", 0.0) as u8);
             let n = flow.grid().len();
             let fluid: Vec<bool> = (0..n).map(|c| Backend::is_fluid(&flow, c)).collect();
             // the flow rate is read over the cells it counts: the channel's rows (all fluid cells, but the pocket's)
