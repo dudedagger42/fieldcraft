@@ -846,7 +846,7 @@ fn study_spalart_allmaras_on_han_s_wall_meets_karman_schoenherr() {
         let period = 4.0 * cells * 3f64.sqrt() / (1.0 - 3.0 * grid.lattice_velocity * grid.lattice_velocity);
         grid.absorbing = grid.absorbing.map(|a| AbsorbingLayer { filter_time: Some(0.25 * period * grid.lattice_velocity * dx), ..a });
     }
-    println!("2DZP study: absorbing layer {:?}", grid.absorbing);
+    println!("2DZP study: absorbing layer {:?}, hybrid collision sigma {:?}", grid.absorbing, grid.sigma);
     // The model's own wall law by default; `FIELDCRAFT_WALL_LAW=spalding` runs Spalding's instead.
     let (wall, name) = study_wall_law();
     println!("2DZP study: wall law {name} ({wall:?})");
