@@ -29,6 +29,8 @@ const OUTLET: usize = fieldcraft_lbm::memory::DEVICE_OUTLET_WORDS;
 /// The flag word of a boundary node of the on-node wall-function bounce: it streams, but it is not
 /// fluid (lbm.wgsl, `is_fluid`).
 const NODE: u32 = 2;
+/// The flag bit of a fluid cell in the wall layer (lbm.wgsl `LAYER_BIT`).
+const LAYER_BIT: u32 = 1 << 31;
 /// The floats of one wall model wall cell in `walls`: four rows (lbm.wgsl).
 const WALL_ROW: usize = 16;
 /// The scalar lattice's directions (the first seven of D3Q19) and weights.
@@ -1009,7 +1011,7 @@ impl GpuFlow {
                 let Some(second) = second else { continue };
                 let row = u32::try_from(wall_rows.len() / WALL_ROW + 1)
                     .ok()
-                    .filter(|r| *r < 1 << 31)
+                    .filter(|r| *r < 1 << 30)
                     .ok_or_else(|| Error::Limit("too many wall cells for the GPU's flags".into()))?;
                 let second = u32::try_from(second).map_err(|_| Error::Limit("too many cells for the GPU solver".into()))?;
                 if let Some(u) = fluid_u32.get_mut(cell) {
@@ -1374,6 +1376,11 @@ impl GpuFlow {
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             })
         });
+        // The WALL_MRT study's wall layer, marked once here: a fluid cell with a solid axis neighbour (a step out of a
+        // non-periodic box is not solid) carries `LAYER_BIT`, which the kernel reads instead of probing six neighbours.
+        if hybrid.is_some() && flow.wall_layer_mrt() {
+            mark_wall_layer(flow.grid(), flow.periodic(), on_node, &mut fluid_u32);
+        }
         let fluid_buf = storage("lbm fluid", &bytes_u32(&fluid_u32));
         let walls_buf = storage("lbm walls", &bytes_f32(&wall_rows));
         let damping_buf = storage("lbm wall damping", &bytes_f32(damping.as_ref().map_or(&[][..], |(data, _)| &data[..])));
@@ -2314,6 +2321,40 @@ impl Backend for GpuFlow {
     }
 }
 
+/// Sets `LAYER_BIT` on every fluid cell that has a solid cell beside it along an axis (the kernel's `is_fluid`: bit 0 under
+/// the on-node bounce, any flag otherwise). The flags are read before any is set, so the marks never feed each other.
+fn mark_wall_layer(grid: &fieldcraft_lbm::voxel::Grid, periodic: [bool; 3], on_node: bool, flags: &mut [u32]) {
+    let solid_word = |w: u32| if on_node { w & 1 == 0 } else { w == 0 };
+    let marks: Vec<usize> = (0..grid.len().min(flags.len()))
+        .filter(|&c| flags.get(c).is_some_and(|w| !solid_word(*w)))
+        .filter(|&c| {
+            let p = grid.coords(c);
+            (0..3).any(|axis| {
+                [false, true].iter().any(|&up| {
+                    let mut q = p;
+                    let n = grid.cells.get(axis).copied().unwrap_or(1);
+                    let v = match (q.get(axis).copied().unwrap_or(0), up) {
+                        (x, true) if x + 1 < n => x + 1,
+                        (_, true) if periodic.get(axis).copied().unwrap_or(false) => 0,
+                        (x, false) if x > 0 => x - 1,
+                        (_, false) if periodic.get(axis).copied().unwrap_or(false) => n.saturating_sub(1),
+                        _ => return false,
+                    };
+                    if let Some(slot) = q.get_mut(axis) {
+                        *slot = v;
+                    }
+                    flags.get(grid.index(q)).is_some_and(|w| solid_word(*w))
+                })
+            })
+        })
+        .collect();
+    for c in marks {
+        if let Some(w) = flags.get_mut(c) {
+            *w |= LAYER_BIT;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2470,5 +2511,41 @@ mod tests {
             assert!(gy == 1 || gx == MAX_GROUPS_X, "{count}: {gx} × {gy}");
             assert!((gx * gy * WG) as usize >= count, "{count}: {gx} × {gy}");
         }
+    }
+
+    /// The wall layer: fluid cells beside a solid cell along an axis, a box edge not solid, a periodic wrap counted.
+    #[test]
+    fn the_wall_layer_marks_fluid_cells_beside_solid_ones() {
+        let grid = fieldcraft_lbm::voxel::Grid { origin: [0.0; 3], spacing: 1.0, cells: [3, 5, 2] };
+        let mut flags = vec![1u32; grid.len()];
+        for (c, flag) in flags.iter_mut().enumerate() {
+            let y = grid.coords(c)[1];
+            if y == 0 || y == 4 {
+                *flag = 0;
+            }
+        }
+        mark_wall_layer(&grid, [true, false, true], false, &mut flags);
+        for (c, flag) in flags.iter().enumerate() {
+            let y = grid.coords(c)[1];
+            let want = if y == 0 || y == 4 {
+                0
+            } else if y == 1 || y == 3 {
+                1 | LAYER_BIT
+            } else {
+                1
+            };
+            assert_eq!(*flag, want, "cell {c} y {y}");
+        }
+        // an open box edge is not solid
+        let mut open = vec![1u32; grid.len()];
+        mark_wall_layer(&grid, [false; 3], false, &mut open);
+        assert!(open.iter().all(|w| *w == 1));
+        // a solid cell beside the periodic seam is seen across it
+        let mut seam = vec![1u32; grid.len()];
+        seam[grid.index([2, 2, 0])] = 0;
+        mark_wall_layer(&grid, [true, false, false], false, &mut seam);
+        assert_eq!(seam[grid.index([0, 2, 0])], 1 | LAYER_BIT);
+        assert_eq!(seam[grid.index([1, 2, 0])], 1 | LAYER_BIT);
+        assert_eq!(seam[grid.index([0, 3, 0])], 1);
     }
 }

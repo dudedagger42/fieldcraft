@@ -402,9 +402,15 @@ fn cell_of(lid: u32, wg: vec3<u32>) -> u32 {
 // A boundary node's flag word under the on-node bounce (native.rs NODE).
 const NODE_FLAG: u32 = 2u;
 
+// The top bit of a cell's flag word marks a fluid cell with a solid axis neighbour (the wall layer of the WALL_MRT study,
+// set once on the host); every other reader sees the word without it.
+const LAYER_BIT: u32 = 0x80000000u;
+fn cell_word(cell: u32) -> u32 { return fluid[cell] & ~LAYER_BIT; }
+fn in_wall_layer(cell: u32) -> bool { return (fluid[cell] & LAYER_BIT) != 0u; }
+
 fn is_fluid(cell: u32) -> bool {
-    if ON_NODE { return (fluid[cell] & 1u) != 0u; }
-    return fluid[cell] != 0u;
+    if ON_NODE { return (cell_word(cell) & 1u) != 0u; }
+    return cell_word(cell) != 0u;
 }
 
 // A cell's grid coordinates (integer divisions once per cell, not once per direction).
@@ -612,7 +618,7 @@ fn spalding_root(speed: f32, y: f32, nu: f32, kappa: f32, b: f32) -> f32 {
 // normal plus one tangential axis a takes ½ τ_a c_a off, so the two such populations per axis take
 // the stress from the cell's momentum and nothing from its mass; 0 for any other population.
 fn bounce_shift(q: u32, cell: u32) -> f32 {
-    let k = fluid[cell] >> 1u;
+    let k = cell_word(cell) >> 1u;
     if k == 0u { return 0.0; }
     let d = c_of(q) - vec3<i32>(round(walls[4u * (k - 1u)].xyz));
     if dot(d, d) != 1 { return 0.0; }
@@ -1005,7 +1011,7 @@ fn wall_sample(@builtin(local_invocation_index) lid: u32, @builtin(workgroup_id)
 // The wall model's reconstruction of `cell` (fieldcraft_lbm::wall::Walls::reconstruct), in the
 // populations' deviations from the weights: false when it is not a modelled wall cell.
 fn wall_rebuild(cell: u32, fq: ptr<function, array<f32, 19>>, acc: vec3<f32>) -> bool {
-    let k = fluid[cell] >> 1u;
+    let k = cell_word(cell) >> 1u;
     if k == 0u { return false; }
     let n = walls[4u * (k - 1u)].xyz;
     let u = walls[4u * (k - 1u) + 2u].xyz - 0.5 * acc;
@@ -1042,7 +1048,7 @@ fn wall_rebuild(cell: u32, fq: ptr<function, array<f32, 19>>, acc: vec3<f32>) ->
 // The wall model's rate of `cell` from the last sample, or a negative number when it is not a
 // modelled wall cell.
 fn wall_omega(cell: u32) -> f32 {
-    let k = fluid[cell] >> 1u;
+    let k = cell_word(cell) >> 1u;
     if k == 0u { return -1.0; }
     return walls[4u * (k - 1u) + 2u].w;
 }
@@ -1102,7 +1108,7 @@ fn gradient_velocity(@builtin(local_invocation_index) lid: u32, @builtin(workgro
             drho = drho + v;
             j = j + vec3<f32>(c_of(q)) * v;
         }
-        if WALL_MODEL && (fluid[cell] >> 1u) > 0u {
+        if WALL_MODEL && (cell_word(cell) >> 1u) > 0u {
             if wall_rebuild(cell, &fq, acc_of(cell)) {
                 drho = 0.0;
                 j = vec3<f32>(0.0);
@@ -1408,7 +1414,7 @@ fn sa_side(p: vec3<i32>, d: vec3<i32>, face: u32) -> vec2<u32> {
     let w = p + d;
     if any(((w < vec3<i32>(0)) | (w >= size)) & !periodic) { return vec2<u32>((params.sa.x >> (2u * face)) & 3u, 0u); }
     let cell = wrapped(w);
-    if ON_NODE && fluid[cell] == NODE_FLAG { return vec2<u32>(SA_NODE, 0u); }
+    if ON_NODE && cell_word(cell) == NODE_FLAG { return vec2<u32>(SA_NODE, 0u); }
     if !is_fluid(cell) { return vec2<u32>(SA_WALL, 0u); }
     return vec2<u32>(SA_CELL, cell);
 }
@@ -1656,9 +1662,9 @@ fn collide_cell(cell: u32, lid: u32) {
         drho = drho + v;
         j = j + vec3<f32>(c_of(q)) * v;
     }
-    if WALL_MODEL && (fluid[cell] >> 1u) > 0u {
+    if WALL_MODEL && (cell_word(cell) >> 1u) > 0u {
         // The momentum the reconstruction takes from the cell, which its wall receives.
-        let row = 4u * ((fluid[cell] >> 1u) - 1u) + 3u;
+        let row = 4u * ((cell_word(cell) >> 1u) - 1u) + 3u;
         var removed = vec3<f32>(0.0);
         if wall_rebuild(cell, &fq, acc_of(cell)) {
             let before = j;
@@ -1694,7 +1700,7 @@ fn collide_cell(cell: u32, lid: u32) {
     var g = Gradient(vec3<f32>(0.0), vec3<f32>(0.0), vec3<f32>(0.0), vec3<f32>(0.0));
     if collision_gradient() { g = fd_gradient(cell); }
     if REGULARIZED {
-        if WALL_MRT && HRR && wall_layer(coords(cell)) {
+        if WALL_MRT && HRR && in_wall_layer(cell) {
             collide_mrt(cell, lid, xyz, &fq, drho, rho, u, force, forced, g);
             return;
         }
@@ -2037,7 +2043,7 @@ fn stream(@builtin(local_invocation_index) lid: u32, @builtin(workgroup_id) wg: 
     let cell = cell_of(lid, wg);
     if cell >= params.n { return; }
     // Fluid cells and the on-node bounce's boundary nodes.
-    if fluid[cell] == 0u { return; }
+    if cell_word(cell) == 0u { return; }
     let n = params.n;
     let nx = i32(params.nx);
     let ny = i32(params.ny);
@@ -2602,7 +2608,7 @@ fn cell_moments(@builtin(local_invocation_index) lid: u32, @builtin(workgroup_id
 fn wall_moments(@builtin(local_invocation_index) lid: u32, @builtin(workgroup_id) wg: vec3<u32>) {
     let cell = cell_of(lid, wg);
     if !WALL_MODEL || cell >= params.n || !is_fluid(cell) { return; }
-    let k = fluid[cell] >> 1u;
+    let k = cell_word(cell) >> 1u;
     if k == 0u { return; }
     moments[cell] = vec4<f32>(walls[4u * (k - 1u) + 2u].xyz, moments[cell].w);
 }
