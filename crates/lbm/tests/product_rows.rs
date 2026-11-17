@@ -3,7 +3,7 @@
 //! values and no assertions: the lines are read, not gated.
 //!
 //! Environment: `CASE` (`channel` or `duct`; both when unset), `CELLS` (comma list of widths, default 8,16), `COLLISION` = `hrr` (default) or `mrt`; `SIGMA` (default 0.95) is the hybrid collision's sigma (1.0 may be refused by the setup: the row then prints REFUSED); `TAU_MINUS_HALF` (default 5e-3: lattice viscosity is a
-//! third of it); `SCAN_STEPS` caps a row's steps (default four times its minimum). A row runs at least 1.5 W² / (tau - 1/2)
+//! third of it); `MIN_STEPS` (default 0: 1.5 W²/(tau - 1/2)) is the steps before any settle is allowed; `SCAN_STEPS` caps a row's steps (default four times its minimum). A row runs at least 1.5 W² / (tau - 1/2)
 //! steps (W the width in cells) and then until the flow rate changes by under 0.05 % over the last third of the run, or the cap.
 //!
 //! `COLLISION=hrr TAU_MINUS_HALF=5e-3 cargo test --release -p fieldcraft-lbm --test product_rows -- --ignored --nocapture product_rows`
@@ -100,12 +100,24 @@ fn first_jump(hist: &[(u64, f64)]) -> Option<u64> {
 /// changes (at least three before it; floor 1e-6). The next chunk's movement cannot hide it. An extra tag, not part of the verdict.
 fn first_jump_back(hist: &[(u64, f64)]) -> Option<u64> {
     let d: Vec<f64> = hist.windows(2).map(|w| (w[1].1 - w[0].1).abs()).collect();
-    (3..d.len()).find_map(|i| {
-        let mut prev: Vec<f64> = d[i.saturating_sub(5)..i].to_vec();
-        prev.sort_by(f64::total_cmp);
-        let med = prev.get(prev.len() / 2).copied().unwrap_or(0.0);
-        (d[i] > 1e-6 && d[i] > 5.0 * med).then(|| hist[i + 1].0)
-    })
+    (3..d.len()).find_map(|i| jump_back_at(&d, i).then(|| hist[i + 1].0))
+}
+
+/// Whether change `i` exceeds 5 times the median of the previous five (at least three before it; floor 1e-6).
+fn jump_back_at(d: &[f64], i: usize) -> bool {
+    if i < 3 || i >= d.len() {
+        return false;
+    }
+    let mut prev: Vec<f64> = d[i.saturating_sub(5)..i].to_vec();
+    prev.sort_by(f64::total_cmp);
+    let med = prev.get(prev.len() / 2).copied().unwrap_or(0.0);
+    d[i] > 1e-6 && d[i] > 5.0 * med
+}
+
+/// A JUMP-BACK in any of the last `n` chunks: such a row is not allowed to settle yet.
+fn recent_jump_back(hist: &[(u64, f64)], n: usize) -> bool {
+    let d: Vec<f64> = hist.windows(2).map(|w| (w[1].1 - w[0].1).abs()).collect();
+    (d.len().saturating_sub(n)..d.len()).any(|i| jump_back_at(&d, i))
 }
 
 /// LEFT LAMINAR: a run starts from rest and should approach the answer from one side, so the |flow-rate error| fell, then rose
@@ -169,7 +181,11 @@ fn product_rows() {
             let mut flow = fieldcraft_lbm::Flow::new(&setup, &obstacles).expect("flow");
             let n = flow.grid().len();
             let fluid: Vec<bool> = (0..n).map(|c| Backend::is_fluid(&flow, c)).collect();
-            let min_steps = (1.5 * (w * w) as f64 / tau_mh).ceil() as u64;
+            // MIN_STEPS (default 0: the computed minimum) is the number of steps before any settle is allowed
+            let min_steps = match env("MIN_STEPS", 0.0) {
+                m if m >= 1.0 => m as u64,
+                _ => (1.5 * (w * w) as f64 / tau_mh).ceil() as u64,
+            };
             let cap = env("SCAN_STEPS", 4.0 * min_steps as f64) as u64;
             let chunk = (min_steps / 40).max(250);
             let (_, rho0) = flow_rate(&mut flow, &fluid, along, reference);
@@ -197,7 +213,7 @@ fn product_rows() {
                     if let Some(&(_, back)) = hist.iter().rev().find(|(s, _)| *s <= t) {
                         drift_last_third = (rate - back).abs() / (1.0 + rate).abs();
                         let jump_in_third = first_jump(&hist).filter(|j| *j > t);
-                        if drift_last_third < 5e-4 && range_after(&hist, t) < 5e-4 && jump_in_third.is_none() && reversed(&hist).is_none() {
+                        if drift_last_third < 5e-4 && range_after(&hist, t) < 5e-4 && jump_in_third.is_none() && reversed(&hist).is_none() && !recent_jump_back(&hist, 3) {
                             settled = true;
                             break;
                         }
@@ -254,4 +270,17 @@ fn the_reversal_flag_fires_on_a_second_branch_and_not_on_a_smooth_run() {
     assert_eq!(reversed(&branch).map(|m| (m.0, m.2)), Some((3900, 4000)));
     let rising: Vec<(u64, f64)> = (1..10).map(|i| (i * 100, 0.01 * i as f64)).collect();
     assert!(reversed(&rising).is_none(), "an error that only grows never decreased first");
+}
+
+#[test]
+fn a_jump_back_in_the_last_chunks_holds_the_settle() {
+    let mut h: Vec<(u64, f64)> = (1..20).map(|i| (i * 100, -0.1 + 0.001 * (i as f64).recip())).collect();
+    assert!(!recent_jump_back(&h, 3));
+    let last = h.last().map_or(0.0, |x| x.1);
+    h.push((2000, last + 0.01));
+    assert!(recent_jump_back(&h, 3), "a rise on the final chunk");
+    h.push((2100, last + 0.01 + 1e-7));
+    assert!(recent_jump_back(&h, 3), "still inside the last three chunks");
+    h.extend([(2200, last + 0.01 + 2e-7), (2300, last + 0.01 + 3e-7), (2400, last + 0.01 + 4e-7)]);
+    assert!(!recent_jump_back(&h, 3), "three quiet chunks later it may settle");
 }
