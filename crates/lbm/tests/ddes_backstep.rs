@@ -2082,6 +2082,52 @@ fn transfer(from: &Field, to: &mut Flow) -> Result<(), String> {
     to.set_sa_nu_tilde(&values).map_err(|e| format!("setting ν̃: {e}"))
 }
 
+/// T3b's disturbance: every fluid cell with x in [0, 6] H and z in (0, 3] H (the zone behind the step edge, above the floor)
+/// takes an independent uniform random velocity of `amplitude` (a fraction of the lattice speed, which is U_ref) in each of the
+/// three components, different in every cell and so in every spanwise column; the means over the seeded cells are removed so
+/// the mean momentum is unchanged, and the densities are left as they are (so mass is unchanged). Deterministic: the
+/// numbers come from a hash of the cell index. Amplitude zero changes nothing (the parity with T3).
+fn seed_disturbance(flow: &mut Flow, amplitude: f64, lattice_velocity: f64) {
+    if amplitude == 0.0 || !amplitude.is_finite() {
+        return;
+    }
+    let g = *flow.grid();
+    let hash = |c: usize, k: u64| -> f64 {
+        let mut z = (c as u64).wrapping_mul(3).wrapping_add(k).wrapping_add(0x9E37_79B9_7F4A_7C15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        (z >> 11) as f64 / (1u64 << 53) as f64 * 2.0 - 1.0
+    };
+    let seeded = |c: usize| {
+        let [i, _, k] = g.coords(c);
+        let (x, z) = (g.origin[0] + (i as f64 + 0.5) * g.spacing, g.origin[2] + (k as f64 + 0.5) * g.spacing);
+        (0.0..=6.0).contains(&x) && z > 0.0 && z <= 3.0
+    };
+    let moments: Vec<Option<(f64, [f64; 3])>> = (0..g.len()).map(|c| flow.moments(c)).collect();
+    let mut sum = [0.0; 3];
+    let mut count = 0usize;
+    let delta = |c: usize| [0, 1, 2].map(|k| amplitude * lattice_velocity * hash(c, k as u64));
+    for c in (0..g.len()).filter(|&c| seeded(c) && moments.get(c).is_some_and(|m| m.is_some())) {
+        let d = delta(c);
+        (0..3).for_each(|k| sum[k] += d[k]);
+        count += 1;
+    }
+    if count == 0 {
+        return;
+    }
+    let mean = sum.map(|v| v / count as f64);
+    flow.set_equilibrium(|c| match moments.get(c).copied().flatten() {
+        Some((rho, u)) if seeded(c) => {
+            let d = delta(c);
+            (rho, [0, 1, 2].map(|k| u[k] + d[k] - mean[k]))
+        }
+        Some(m) => m,
+        None => (1.0, [0.0; 3]),
+    });
+    println!("T3b: seeded {count} cells with a random velocity of {amplitude} of the lattice speed, means removed");
+}
+
 /// The incoming boundary layer at x = −4 H as a table, one line per row from the first fluid row
 /// above the step's top to mid-channel: `z/H  u/U_ref  ν̃/ν` (span means; ν̃ in units of ν). It is the
 /// inlet profile of a shorter domain, which the solver cannot impose yet (no tabulated inflow
@@ -2655,7 +2701,15 @@ pub(crate) fn t3_ddes_in_the_zone_from_t2s_field_reports_x_r_with_its_error() {
     // The source flow goes before the target is built: the two never coexist (see [`Field`]).
     let field = snapshot(&from).unwrap_or_else(|e| panic!("T3: {e}"));
     drop(from);
-    let run = t3.try_run_from(Some(Box::new(move |flow: &mut Flow| transfer(&field, flow)))).unwrap_or_else(|e| panic!("T3: {e}"));
+    let seed: f64 = std::env::var("FIELDCRAFT_STEP_SEED").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0);
+    let lattice_velocity = t3.lattice_velocity;
+    let run = t3
+        .try_run_from(Some(Box::new(move |flow: &mut Flow| {
+            transfer(&field, flow)?;
+            seed_disturbance(flow, seed, lattice_velocity);
+            Ok(())
+        })))
+        .unwrap_or_else(|e| panic!("T3: {e}"));
     let a = run.reattachment.acceptance();
     println!(
         "T3 x_r {:?} H (mean-shear reading); mean of {} block reattachments {:.4} H, 95 % half-width {:?} (relative {:?}), half-window drift {:?}; {} steps = {:.1} H/U, settled {} ({:?}), {} blocks refused, {} censored
