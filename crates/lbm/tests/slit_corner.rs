@@ -254,6 +254,7 @@ fn slit_corner() {
     flow.set_wall_layer_mrt(env("WALL_MRT", 0.0) != 0.0);
     flow.set_wall_corner_relax(env("WALL_CORNER", 0.0) != 0.0);
     flow.set_wall_tau_floor(env("WALL_TAU_FLOOR", 0.0));
+    flow.set_wall_tau_floor_ratio(env("WALL_TAU_FLOOR_K", 0.0));
     let n = flow.grid().len();
     let fluid: Vec<bool> = (0..n).map(|c| Backend::is_fluid(&flow, c)).collect();
     println!(
@@ -451,6 +452,7 @@ fn slit_stream() {
     flow.set_wall_layer_mrt(env("WALL_MRT", 0.0) != 0.0);
     flow.set_wall_corner_relax(env("WALL_CORNER", 0.0) != 0.0);
     flow.set_wall_tau_floor(env("WALL_TAU_FLOOR", 0.0));
+    flow.set_wall_tau_floor_ratio(env("WALL_TAU_FLOOR_K", 0.0));
     let n = flow.grid().len();
     let fluid: Vec<bool> = (0..n).map(|c| Backend::is_fluid(&flow, c)).collect();
     // the census of concave corners: fluid cells with 3 or more solid axis faces (a wrap counts across a periodic box)
