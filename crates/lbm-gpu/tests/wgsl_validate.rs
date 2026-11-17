@@ -36,6 +36,9 @@ fn lbm_wgsl_validates_for_the_collision_variants() {
         ("hybrid with WALL_MRT = 1", [&hybrid[..], &[("WALL_MRT", 1.0)]].concat()),
         ("hybrid, Vreman, WALL_MRT = 1", [&hybrid[..], &[("VREMAN", 1.0), ("WALL_MRT", 1.0)]].concat()),
         ("hybrid, SA, WALL_MRT = 1", [&hybrid[..], &[("SA", 1.0), ("WALL_MRT", 1.0)]].concat()),
+        ("MRT everywhere", vec![("MRT", 1.0)]),
+        ("MRT everywhere, Vreman", vec![("MRT", 1.0), ("VREMAN", 1.0)]),
+        ("MRT everywhere, SA", vec![("MRT", 1.0), ("SA", 1.0)]),
         ("hybrid, on-node, WALL_MRT = 1", [&hybrid[..], &[("ON_NODE", 1.0), ("WALL_MRT", 1.0)]].concat()),
     ];
     let failures: Vec<String> = cases.iter().filter_map(|(name, s)| validate(s).err().map(|e| format!("{name}: {e}"))).collect();

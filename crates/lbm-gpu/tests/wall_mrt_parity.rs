@@ -163,7 +163,7 @@ fn checksum(density: &[f64], velocity: &[[f64; 3]]) -> u64 {
 fn parity(name: &str, case: Result<Case, String>) -> Result<(), String> {
     let case = case?;
     let mut cpu = fieldcraft_lbm::Flow::new(&case.setup, &case.obstacles).map_err(|e| e.to_string())?;
-    let on = env("WALL_MRT", 1.0) != 0.0;
+    let on = env("WALL_MRT", 1.0) != 0.0 && env("MRT_ALL", 0.0) == 0.0;
     cpu.set_wall_layer_mrt(on);
     let mut gpu = GpuFlow::with_options(&cpu, Policy::from_env().map_err(|e| e.to_string())?, Options::default()).map_err(|e| e.to_string())?;
     let (tol_u, tol_r) = (env("PARITY_DU", 2e-5), env("PARITY_DRHO", 1e-6));
