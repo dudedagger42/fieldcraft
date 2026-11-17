@@ -18,7 +18,10 @@ use fieldcraft_lbm::backend::Backend;
 use fieldcraft_lbm::{Limits, Obstacle, Setup};
 use fieldcraft_model::{Collision, FaceCondition, HrrSigma, Procedure, WallTreatment};
 
-const U_LAT: f64 = 0.02;
+/// The exact mean speed in lattice units: the force, and the reference the flow rate is read against, follow it (`U_LAT`, default 0.02).
+fn u_lat() -> f64 {
+    env("U_LAT", 0.02)
+}
 const PERIODIC: FaceCondition = FaceCondition::Periodic {};
 
 fn env(name: &str, default: f64) -> f64 {
@@ -55,7 +58,7 @@ fn build(duct: bool, w: usize, nu_lat: f64, mrt: bool, hrr_sigma: f64) -> Result
     }
     d.obstacles = obstacles.iter().map(|o| o.body.clone()).collect();
     // the body force that gives the exact mean speed U_LAT (plane channel: 12 nu U / H^2; duct: U nu / (c H^2), c from the series)
-    let g_lat = if duct { U_LAT * nu_lat / (duct_coefficient() * wf * wf) } else { 12.0 * nu_lat * U_LAT / (wf * wf) };
+    let g_lat = if duct { u_lat() * nu_lat / (duct_coefficient() * wf * wf) } else { 12.0 * nu_lat * u_lat() / (wf * wf) };
     d.acceleration = [g_lat * dx / (dt * dt), 0.0, 0.0];
     let mut p = with_walls(collide(1e6 * dt, dt, None, if mrt { Collision::Mrt } else { Collision::Hrr }), WallTreatment::Interpolated);
     if let Procedure::Fluid { sigma, .. } = &mut p
@@ -66,7 +69,7 @@ fn build(duct: bool, w: usize, nu_lat: f64, mrt: bool, hrr_sigma: f64) -> Result
     let m = model(1.0, 1.0, d, p);
     let setup = Setup::new(&m, None, &obstacles, &Limits::default()).map_err(|e| format!("{e}"))?;
     // the flow rate reference per column of cells along x: the channel's width times the mean speed, or the duct's area times it
-    let (along, reference) = if duct { (hi_cells(hi[0], dx) * 1.0, U_LAT * wf * wf) } else { (hi_cells(hi[0], dx) * 4.0, U_LAT * wf) };
+    let (along, reference) = if duct { (hi_cells(hi[0], dx) * 1.0, u_lat() * wf * wf) } else { (hi_cells(hi[0], dx) * 4.0, u_lat() * wf) };
     Ok((setup, obstacles, [0.0; 3], along, reference))
 }
 
@@ -148,7 +151,8 @@ fn product_rows() {
             let last = hist.last().map_or(f64::NAN, |h| h.1);
             let third = hist.iter().rev().find(|(s, _)| *s <= done * 2 / 3).map_or(f64::NAN, |h| h.1);
             println!(
-                "PRODUCT collision {label} tau-1/2 {tau_mh:e} case {name} cells {w} steps {done} (minimum {min_steps}, cap {cap}): flow-rate error {:+.4} % (at 2/3 of the run {:+.4} %), change over the last third {:.4} % ({}), mean-density drift {:+.3e} per 10000 steps, largest nu_t/nu {max_ratio:.3e}{}",
+                "PRODUCT collision {label} tau-1/2 {tau_mh:e} U_LAT {} case {name} cells {w} steps {done} (minimum {min_steps}, cap {cap}): flow-rate error {:+.4} % (at 2/3 of the run {:+.4} %), change over the last third {:.4} % ({}), mean-density drift {:+.3e} per 10000 steps, largest nu_t/nu {max_ratio:.3e}{}",
+                u_lat(),
                 100.0 * last,
                 100.0 * third,
                 100.0 * drift_last_third,
