@@ -97,7 +97,7 @@ fn plane_flux_parity() {
 }
 
 /// A 24 x 12 cell open box (one cell deep, periodic in z): a velocity inlet at x min, a convective pressure outlet at x max, no-slip
-/// floor and roof. The planes beside the open layers read the same on both backends and the open layers are refused.
+/// floor and roof. The planes beside the open layers read the same on both backends, with the open arrival cells left out and counted.
 #[test]
 #[ignore = "GPU: run on the machine whose device is to be checked, alone on it (see the module docs)"]
 fn open_channel_plane_flux_parity() {
@@ -136,8 +136,59 @@ fn open_channel_plane_flux_parity() {
     let inside: Vec<bool> = (0..n).map(|c| g.coords(c)[0] >= 1 && g.coords(c)[0] + 1 < g.cells[0]).collect();
     let (a, b) = (cpu.population_flux(0, 1, Some(&inside)).expect("cpu"), gpu.population_flux(0, 1, Some(&inside)).expect("gpu"));
     worst = worst.max((a - b).abs() / reference);
-    assert!(cpu.population_flux(0, 1, None).is_err() && gpu.population_flux(0, 1, None).is_err());
-    assert!(cpu.open_face_flux(0, false, 0, None).is_err() && gpu.open_face_flux(0, false, 0, None).is_err());
+    let (a, b) = (cpu.population_flux_parts(0, 1, None).expect("cpu"), gpu.population_flux_parts(0, 1, None).expect("gpu"));
+    assert!(a.skipped > 0 && a.skipped == b.skipped, "{} {}", a.skipped, b.skipped);
+    worst = worst.max((a.flux - b.flux).abs() / reference);
     println!("OPEN-PLANE-FLUX worst diff/flux {worst:.2e}");
     assert!(worst < 1e-5, "{worst}");
+}
+
+/// A 3D open duct as the duct runs call it: inlet at x min, pressure outlet at x max, no-slip walls all round, a cell mask (a
+/// window of the plane), repeated calls between odd-sized chunks. Both backends must agree at every print and the values must move.
+#[test]
+#[ignore = "GPU: run on the machine whose device is to be checked, alone on it (see the module docs)"]
+fn open_duct_plane_flux_over_time() {
+    use fieldcraft_model::{Outflow, Profile};
+    let dx = 1.0 / 12.0;
+    let mut d = domain([0.0; 3], [2.0, 1.0, 0.75], dx);
+    d.faces.x_min = FaceCondition::Velocity { velocity: [0.5, 0.0, 0.0], profile: Profile::Uniform };
+    d.faces.x_max = FaceCondition::Pressure { pressure: 0.0, outflow: Outflow::Convective };
+    for f in [&mut d.faces.y_min, &mut d.faces.y_max, &mut d.faces.z_min, &mut d.faces.z_max] {
+        *f = FaceCondition::Wall {};
+    }
+    let dt = 0.05 * dx / 0.5;
+    let m = model(1.0, 0.02, d, collide(1e6 * dt, dt, None, Collision::Hrr));
+    let setup = Setup::new(&m, None, &[], &Limits::default()).expect("setup");
+    let mut cpu = Flow::new(&setup, &[]).expect("flow");
+    let mut gpu = GpuFlow::with_options(&cpu, Policy::from_env().expect("policy"), Options::default()).expect("device flow");
+    let g = *cpu.grid();
+    let n = g.len();
+    let window: Vec<bool> = (0..n).map(|c| (2..g.cells[1] - 2).contains(&g.coords(c)[1]) && (2..g.cells[2] - 2).contains(&g.coords(c)[2])).collect();
+    let mut worst = 0.0f64;
+    let mut seen: Vec<f64> = Vec::new();
+    let mut reference = 0.0f64;
+    for chunk in 0..24 {
+        let steps = 37 + 2 * chunk as u64; // odd, so the device alternates its storage phase
+        Backend::advance(&mut cpu, steps).expect("cpu");
+        Backend::advance(&mut gpu, steps).expect("gpu");
+        for (what, a, b) in [
+            ("x plane 6", cpu.population_flux(0, 6, None), gpu.population_flux(0, 6, None)),
+            ("x plane 12 window", cpu.population_flux(0, 12, Some(&window)), gpu.population_flux(0, 12, Some(&window))),
+            ("high face, 1 in, window", cpu.open_face_flux(0, true, 1, Some(&window)), gpu.open_face_flux(0, true, 1, Some(&window))),
+            ("y plane 5 window", cpu.population_flux(1, 5, Some(&window)), gpu.population_flux(1, 5, Some(&window))),
+        ] {
+            let (a, b) = (a.expect("cpu"), b.expect("gpu"));
+            if what == "x plane 6" {
+                seen.push(b);
+                reference = reference.max(a.abs());
+            }
+            println!("DUCT-FLUX chunk {chunk} {what}: cpu {a:+.6e} device {b:+.6e}");
+            worst = worst.max((a - b).abs() / reference.max(1e-9));
+        }
+    }
+    let (a, b) = (cpu.population_flux_parts(1, 5, Some(&window)).expect("cpu"), gpu.population_flux_parts(1, 5, Some(&window)).expect("gpu"));
+    assert!(a.skipped > 0 && a.skipped == b.skipped, "{} {}", a.skipped, b.skipped);
+    let moved = seen.windows(2).filter(|w| (w[0] - w[1]).abs() > 1e-9).count();
+    println!("DUCT-FLUX worst diff/flux {worst:.2e}, device value changed in {moved} of {} prints", seen.len() - 1);
+    assert!(moved > 10 && worst < 1e-4, "moved {moved}, worst {worst}");
 }

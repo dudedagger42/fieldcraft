@@ -9,7 +9,7 @@ use fieldcraft_lbm::backend::{Backend, Fields};
 use fieldcraft_lbm::lattice::{C, Q, W};
 use fieldcraft_lbm::outlet::UNKNOWN;
 use fieldcraft_lbm::setup::MAX_LATTICE_SPEED;
-use fieldcraft_lbm::{Error, Flow, Group, Result, Rule, Target};
+use fieldcraft_lbm::{Error, Flow, Group, PlaneFlux, Result, Rule, Target};
 use fieldcraft_model::{BoxFace, ThermalCondition};
 use wgpu::util::DeviceExt;
 
@@ -1972,10 +1972,15 @@ impl GpuFlow {
     /// lattice units per step, from the links that crossed it in the last streaming: the same quantity as
     /// [`Flow::population_flux`], read from the device (f32 populations, the weights added in double precision). `cells` keeps the
     /// arrival cells whose flag is set (indexed like the grid). One small dispatch and a readback of the two layers' cells, meant
-    /// for report intervals; the time step is not touched. A plane whose arrival cells (inside `cells`) include an inlet or outlet
-    /// cell is refused (the open boundary sets those populations after streaming); leave the open layer out of `cells` or read a
-    /// plane further inside. A flow with a slip face (reflected links) is refused.
+    /// for report intervals; the time step is not touched. The inlet and outlet arrival cells (inside `cells`) are left out (the
+    /// open boundary sets those populations after streaming; their number is in [`PlaneFlux::skipped`]). A flow with a slip face
+    /// (reflected links) is refused.
     pub fn population_flux(&self, axis: usize, plane: usize, cells: Option<&[bool]>) -> Result<f64> {
+        self.population_flux_parts(axis, plane, cells).map(|p| p.flux)
+    }
+
+    /// [`GpuFlow::population_flux`] with the number of open arrival cells left out.
+    pub fn population_flux_parts(&self, axis: usize, plane: usize, cells: Option<&[bool]>) -> Result<PlaneFlux> {
         let size = self.dims;
         let n_axis = *size.get(axis).ok_or_else(|| Error::Invalid(format!("population_flux: axis {axis} is not 0, 1 or 2")))?;
         let periodic = self.periodic_axes.get(axis).copied().unwrap_or(false);
@@ -2000,19 +2005,6 @@ impl GpuFlow {
         if self.has_reflect {
             return Err(Error::Invalid("population_flux on the device does not follow the reflected links of a slip face; read the CPU flow".into()));
         }
-        let [d0, d1, _] = self.dims;
-        for c in 0..self.n {
-            let at = [c % d0, (c / d0) % d1, c / (d0 * d1)].get(axis).copied().unwrap_or(0);
-            if (at == high || at == low)
-                && self.open_mask.get(c).copied().unwrap_or(false)
-                && self.fluid.get(c).copied().unwrap_or(false)
-                && cells.is_none_or(|m| m.get(c).copied().unwrap_or(false))
-            {
-                return Err(Error::Invalid(format!(
-                    "population_flux: cell {c} of the plane is an inlet or outlet cell, whose populations the open boundary sets; leave it out of `cells` or read a plane further inside"
-                )));
-            }
-        }
         let params = self.params.get(self.current).ok_or_else(|| gpu_error("no uniforms for a phase"))?;
         let args = [axis as f32, high as f32, low as f32];
         self.queue.write_buffer(params, RAMP + 4, &bytes_f32(&args));
@@ -2020,6 +2012,7 @@ impl GpuFlow {
         let values = self.read_f32(&self.moments, 4 * 2 * layer)?;
         let rows = values.as_chunks::<4>().0;
         let mut total = 0.0;
+        let mut skipped = 0usize;
         for (e, row) in rows.iter().enumerate().take(2 * layer) {
             let (is_low, r) = (e >= layer, e % layer);
             let mut p = [0usize; 3];
@@ -2028,6 +2021,10 @@ impl GpuFlow {
             p[a2] = r / s1;
             let cell = p[0] + self.dims[0] * (p[1] + self.dims[1] * p[2]);
             if !cells.is_none_or(|m| m.get(cell).copied().unwrap_or(false)) {
+                continue;
+            }
+            if self.open_mask.get(cell).copied().unwrap_or(false) && self.fluid.get(cell).copied().unwrap_or(false) {
+                skipped += 1;
                 continue;
             }
             let mask = row[1] as u32;
@@ -2040,17 +2037,22 @@ impl GpuFlow {
         if !total.is_finite() {
             return Err(Error::Invalid("non-finite population flux".into()));
         }
-        Ok(total)
+        Ok(PlaneFlux { flux: total, skipped })
     }
 
-    /// The flux through a face of the domain, one cell inside it ([`Flow::open_face_flux`]), from the device.
+    /// The flux through a face of the domain, read `layers_in` layers inside it ([`Flow::open_face_flux`]), from the device.
     pub fn open_face_flux(&self, axis: usize, high: bool, layers_in: usize, cells: Option<&[bool]>) -> Result<f64> {
+        self.open_face_flux_parts(axis, high, layers_in, cells).map(|p| p.flux)
+    }
+
+    /// [`GpuFlow::open_face_flux`] with the number of open arrival cells left out.
+    pub fn open_face_flux_parts(&self, axis: usize, high: bool, layers_in: usize, cells: Option<&[bool]>) -> Result<PlaneFlux> {
         let n = self.dims.get(axis).copied().ok_or_else(|| Error::Invalid(format!("open_face_flux: axis {axis} is not 0, 1 or 2")))?;
         if n < 2 {
             return Err(Error::Invalid(format!("open_face_flux: axis {axis} has {n} layer")));
         }
         let plane = if high { (n - 1).checked_sub(layers_in) } else { Some(1 + layers_in) };
-        self.population_flux(axis, plane.ok_or_else(|| Error::Invalid("open_face_flux: layers_in reaches past the other face".into()))?, cells)
+        self.population_flux_parts(axis, plane.ok_or_else(|| Error::Invalid("open_face_flux: layers_in reaches past the other face".into()))?, cells)
     }
 
     /// The moments of the current state into the moments buffer.

@@ -117,15 +117,20 @@ fn open_channel_flux_is_the_injected_flux() {
     let u_lat = injected / g.cells[1] as f64;
     flow.set_equilibrium(|_| (1.0, [u_lat, 0.0, 0.0]));
     Backend::advance(&mut flow, 1500).expect("advance");
-    // the open layers are refused, the planes beside them are not
-    assert!(flow.population_flux(0, 1, None).is_err(), "the plane next to the inlet layer reads the inlet cells' arrivals");
+    // the open layer's arrival cells are left out and counted, the rest of the plane is read
+    let beside = flow.population_flux_parts(0, 1, None).expect("plane beside the inlet");
+    assert!(beside.skipped > 0, "the inlet cells arrive in the plane");
     let inside: Vec<bool> = (0..n).map(|c| g.coords(c)[0] >= 1 && g.coords(c)[0] + 1 < g.cells[0]).collect();
-    assert!(flow.population_flux(0, 1, Some(&inside)).is_ok());
+    let masked = flow.population_flux_parts(0, 1, Some(&inside)).expect("masked");
+    assert_eq!((masked.skipped, masked.flux.to_bits()), (0, beside.flux.to_bits()), "a mask without the open layer reads what the skip reads");
     for plane in [2usize, 5, 10, 15, g.cells[0] - 2] {
         let q = flow.population_flux(0, plane, None).expect("interior plane");
         assert!((q / injected - 1.0).abs() < 2e-3, "plane {plane}: {q} against the injected {injected}");
     }
     let (lo, hi) = (flow.open_face_flux(0, false, 1, None).expect("inlet side"), flow.open_face_flux(0, true, 1, None).expect("outlet side"));
     assert!((lo / injected - 1.0).abs() < 2e-3 && (hi / injected - 1.0).abs() < 2e-3, "{lo} {hi} against {injected}");
-    assert!(flow.open_face_flux(0, false, 0, None).is_err() && flow.open_face_flux(0, true, 0, None).is_err());
+    for high in [false, true] {
+        let p = flow.open_face_flux_parts(0, high, 0, None).expect("face");
+        assert!(p.skipped > 0 && p.flux.is_finite());
+    }
 }
