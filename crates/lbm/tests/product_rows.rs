@@ -11,6 +11,11 @@
 //! Mechanism knobs, both off by default (the rows are then unchanged): `WALL=halfway` leaves the walls as the plain half-way
 //! bounce-back of the grid (no interpolated links); the default interpolates them (linear). `LENGTH=<n>` makes the square duct n
 //! cells long along the flow (still periodic); the default is the harness's own 4 cells. Both are printed on the PRODUCT line.
+//! `CASE=pocket` (never part of the default run): the aligned plane channel (width `CELLS`) with a rectangular pocket cut into
+//! one wall, `POCKET_W` cells along the flow (default 2) and `POCKET_D` cells deep (default 6), in a periodic box 16 cells long.
+//! The flow rate is read over the channel's own rows. After the row's PRODUCT line, `PRODUCT-POCKET` prints the number of fluid
+//! cells with an axis that has no fluid neighbour (and the number with an axis that lacks one), the pocket's largest speed
+//! (final, and over the run), and the first history chunk where any speed passed 0.3 (lattice units) or a number was not finite.
 //! `SEED_AMP` (default 0: none) starts the flow with a random velocity in every cell, all three components independent and
 //! uniform in ±SEED_AMP times the peak speed (2.096 U_LAT in the duct, 1.5 U_LAT in the channel), reproducible from `SEED`
 //! (an integer, default 1). Every row prints `ALONG_DUCT_MAX` at its end (and the `PRODUCT-ALONG` history line): the largest
@@ -41,7 +46,15 @@ fn env(name: &str, default: f64) -> f64 {
 }
 
 /// The plane channel of `w` cells (walls on cell faces, as the width sweep's 8.00 and 16.00) or the square duct of side `w` cells.
-fn build(duct: bool, w: usize, nu_lat: f64, mrt: bool, hrr_sigma: f64, length: usize) -> Result<(Setup, Vec<Obstacle>, [f64; 3], f64, f64), String> {
+fn build(
+    duct: bool,
+    w: usize,
+    nu_lat: f64,
+    mrt: bool,
+    hrr_sigma: f64,
+    length: usize,
+    pocket: Option<(usize, usize)>,
+) -> Result<(Setup, Vec<Obstacle>, [f64; 3], f64, f64), String> {
     let dx = 1.0 / w as f64;
     let dt = nu_lat * dx * dx;
     let wf = w as f64;
@@ -57,10 +70,23 @@ fn build(duct: bool, w: usize, nu_lat: f64, mrt: bool, hrr_sigma: f64, length: u
         ];
         (o, [0.0, lo, lo], [span, hi, hi], span)
     } else {
-        let ny = (wf + 4.0).ceil() as usize;
-        let (lx, ly, lz) = (8.0 * dx, ny as f64 * dx, 4.0 * dx);
+        let depth = pocket.map_or(0, |(_, d)| d);
+        let ny = (wf + 4.0).ceil() as usize + depth;
+        let cells_x = if pocket.is_some() { 16.0 } else { 8.0 };
+        let (lx, ly, lz) = (cells_x * dx, ny as f64 * dx, 4.0 * dx);
         let ho = wf * dx;
-        let o = vec![obstacle("Wall0", cuboid([-3.0 * lx, ho, -dx], [3.0 * lx, ly, lz + dx]), &CUBOID_FACES)];
+        let o = match pocket {
+            None => vec![obstacle("Wall0", cuboid([-3.0 * lx, ho, -dx], [3.0 * lx, ly, lz + dx]), &CUBOID_FACES)],
+            // the wall with the pocket cut into it: the two sides and the cap over it
+            Some((pw, pd)) => {
+                let (x0, x1) = (4.0 * dx, (4 + pw) as f64 * dx);
+                vec![
+                    obstacle("WallLeft", cuboid([-3.0 * lx, ho, -dx], [x0, ly, lz + dx]), &CUBOID_FACES),
+                    obstacle("WallRight", cuboid([x1, ho, -dx], [3.0 * lx, ly, lz + dx]), &CUBOID_FACES),
+                    obstacle("WallCap", cuboid([x0, ho + pd as f64 * dx, -dx], [x1, ly, lz + dx]), &CUBOID_FACES),
+                ]
+            }
+        };
         (o, [0.0, 0.0, 0.0], [lx, ly, lz], lx)
     };
     let _ = span;
@@ -135,6 +161,48 @@ fn along_duct_max(flow: &mut fieldcraft_lbm::Flow, fluid: &[bool]) -> f64 {
         }
     }
     worst
+}
+
+/// The largest speed over all fluid cells, over the pocket's cells (fluid rows y ≥ `w`), and whether all are finite.
+fn speeds(flow: &mut fieldcraft_lbm::Flow, fluid: &[bool], w: usize) -> (f64, f64, bool) {
+    let f = Backend::fields(flow).expect("fields");
+    let g = *flow.grid();
+    let (mut all, mut inside, mut finite) = (0.0f64, 0.0f64, true);
+    for c in (0..fluid.len()).filter(|&c| fluid[c]) {
+        let u = f.velocity[c];
+        let m = (u[0] * u[0] + u[1] * u[1] + u[2] * u[2]).sqrt();
+        finite &= m.is_finite() && f.density[c].is_finite();
+        all = all.max(m);
+        if g.coords(c)[1] >= w {
+            inside = inside.max(m);
+        }
+    }
+    (all, inside, finite)
+}
+
+/// Fluid cells with an axis whose two neighbours are both missing (solid), and with an axis with one missing (all faces periodic).
+fn neighbour_counts(flow: &fieldcraft_lbm::Flow, fluid: &[bool]) -> (usize, usize) {
+    let g = *flow.grid();
+    let (mut none, mut lacking) = (0, 0);
+    for c in (0..fluid.len()).filter(|&c| fluid[c]) {
+        let p = g.coords(c);
+        let missing: Vec<usize> = (0..3)
+            .map(|a| {
+                [false, true]
+                    .iter()
+                    .filter(|&&up| {
+                        let mut q = p;
+                        let n = g.cells[a];
+                        q[a] = if up { (p[a] + 1) % n } else { (p[a] + n - 1) % n };
+                        !fluid.get(g.index(q)).copied().unwrap_or(false)
+                    })
+                    .count()
+            })
+            .collect();
+        none += usize::from(missing.contains(&2));
+        lacking += usize::from(missing.iter().any(|&m| m > 0));
+    }
+    (none, lacking)
 }
 
 fn hi_cells(len: f64, dx: f64) -> f64 {
@@ -232,12 +300,15 @@ fn product_rows() {
         .map(|v| v.split(',').filter_map(|t| t.trim().parse().ok()).filter(|&w| (2..=128).contains(&w)).collect())
         .filter(|v: &Vec<usize>| !v.is_empty())
         .unwrap_or_else(|| vec![8, 16]);
-    for (name, duct) in [("channel", false), ("duct", true)] {
-        if only.as_deref().is_some_and(|c| c != name) {
+    let pocket_dims = (env("POCKET_W", 2.0) as usize, env("POCKET_D", 6.0) as usize);
+    for (name, duct) in [("channel", false), ("duct", true), ("pocket", false)] {
+        // the pocket case runs only when asked for by name
+        if only.as_deref().map_or(name == "pocket", |c| c != name) {
             continue;
         }
+        let pocket = (name == "pocket").then_some(pocket_dims);
         for &w in &widths {
-            let (setup, obstacles, _, along, reference) = match build(duct, w, nu_lat, mrt, sigma, duct_length()) {
+            let (setup, obstacles, _, along, reference) = match build(duct, w, nu_lat, mrt, sigma, duct_length(), pocket) {
                 Ok(v) => v,
                 Err(e) => {
                     println!("PRODUCT collision {label} tau-1/2 {tau_mh:e} case {name} cells {w}: REFUSED by the setup: {e}");
@@ -250,6 +321,13 @@ fn product_rows() {
             }
             let n = flow.grid().len();
             let fluid: Vec<bool> = (0..n).map(|c| Backend::is_fluid(&flow, c)).collect();
+            // the flow rate is read over the cells it counts: the channel's rows (all fluid cells, but the pocket's)
+            let rate_cells: Vec<bool> = if pocket.is_some() {
+                let g = *flow.grid();
+                (0..n).map(|c| fluid[c] && g.coords(c)[1] < w).collect()
+            } else {
+                fluid.clone()
+            };
             if seed_amp() != 0.0 {
                 let peak = u_lat() * if duct { 2.096 } else { 1.5 };
                 let (amp, seed) = (seed_amp() * peak, env("SEED", 1.0) as u64);
@@ -265,13 +343,14 @@ fn product_rows() {
             };
             let cap = env("SCAN_STEPS", 4.0 * min_steps as f64) as u64;
             let chunk = (min_steps / 40).max(250);
-            let (_, rho0) = flow_rate(&mut flow, &fluid, along, reference);
+            let (_, rho0) = flow_rate(&mut flow, &rate_cells, along, reference);
             let mut hist: Vec<(u64, f64)> = Vec::new();
             let (mut done, mut max_ratio) = (0u64, 0.0f64);
             let mut settled = false;
             let mut drift_last_third = f64::NAN;
             let mut rho = rho0;
             let mut along_hist: Vec<(u64, f64)> = Vec::new();
+            let (mut pocket_max, mut pocket_last, mut first_flag) = (0.0f64, 0.0f64, None::<u64>);
             while done < cap {
                 // the first chunk is sampled ten times finer, so that a jump inside it is seen by the running minimum
                 let step = if done < chunk { (chunk / 10).max(1) } else { chunk };
@@ -282,10 +361,18 @@ fn product_rows() {
                 }
                 done += chunk;
                 max_ratio = max_ratio.max(flow.eddy_viscosity_ratio());
-                let (rate, r) = flow_rate(&mut flow, &fluid, along, reference);
+                let (rate, r) = flow_rate(&mut flow, &rate_cells, along, reference);
                 rho = r;
                 hist.push((done, rate));
                 along_hist.push((done, along_duct_max(&mut flow, &fluid)));
+                if pocket.is_some() {
+                    let (all, inside, finite) = speeds(&mut flow, &fluid, w);
+                    pocket_max = pocket_max.max(inside);
+                    pocket_last = inside;
+                    if first_flag.is_none() && (!finite || all > 0.3) {
+                        first_flag = Some(done);
+                    }
+                }
                 if !rate.is_finite() {
                     break;
                 }
@@ -313,6 +400,13 @@ fn product_rows() {
             let along_series: Vec<String> = along_hist.iter().step_by(every).map(|(st, a)| format!("{st}:{a:.3e}")).collect();
             println!("PRODUCT-ALONG collision {label} tau-1/2 {tau_mh:e} case {name} cells {w}: {}", along_series.join(" "));
             let along_max = along_hist.last().map_or(f64::NAN, |a| a.1);
+            if let Some((pw, pd)) = pocket {
+                let (none, lacking) = neighbour_counts(&flow, &fluid);
+                println!(
+                    "PRODUCT-POCKET collision {label} tau-1/2 {tau_mh:e} pocket {pw}x{pd} cells {w}: fluid cells with an axis without any fluid neighbour {none}, with an axis lacking one {lacking}; pocket max |u| at the end {pocket_last:.4e}, over the run {pocket_max:.4e}; first chunk with a speed over 0.3 or a non-finite number: {}",
+                    first_flag.map_or("none".to_string(), |s| s.to_string())
+                );
+            }
             let last = hist.last().map_or(f64::NAN, |h| h.1);
             let third = hist.iter().rev().find(|(s, _)| *s <= done * 2 / 3).map_or(f64::NAN, |h| h.1);
             let last_jump = first_jump(&hist).filter(|j| *j > done * 2 / 3);
