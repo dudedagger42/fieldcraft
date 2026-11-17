@@ -21,6 +21,9 @@
 //! - `SLIT-HISTORY`: the corner deviation every 100 steps (`*` marks an alternating read);
 //! - the run's stop (the solver's own, a speed over 0.3 or a non-finite number), if any.
 //!
+//! `GEOM3=1` selects the 3D variant: a floor (two solid layers; the slit's x = 4 row one layer lower), side walls that widen into a wedge
+//! above z = 5, a lid and a closed end. `FILL="x,y,z;..."` then fills single cells (z optional). Probes: `site` (5, 34, 2) and `corner`.
+//!
 //! Environment: `TAU_MINUS_HALF` (default 1.8e-4), `PEAK` (peak lattice speed of the channel's parabola, default 0.11; the mean is 2/3 of it
 //! (parabola), `SIGMA` (default 0.95), `WALL_SIGMA1` (0 or 1, default 0), `SA_SEED` (default 0: the model's trivial solution).
 //!
@@ -40,46 +43,89 @@ fn env(name: &str, default: f64) -> f64 {
 }
 
 /// `FILL="x,y;x,y"`: cells (coordinates) made solid.
-fn fill_cells() -> Vec<(usize, usize)> {
+fn fill_cells() -> Vec<(usize, usize, Option<usize>)> {
     std::env::var("FILL")
         .unwrap_or_default()
         .split(';')
         .filter_map(|p| {
-            let (a, b) = p.split_once(',')?;
-            Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
+            let mut it = p.split(',').map(|v| v.trim().parse::<usize>().ok());
+            let (a, b) = (it.next()??, it.next()??);
+            Some((a, b, it.next().flatten()))
         })
         .collect()
 }
 
+/// The vertical layout of the `GEOM3` variant: cells in z, the floor's solid layers, and the layer the slit's walls start to widen at.
+const NZ: usize = 12;
+const FLOOR: usize = 2;
+const WEDGE_AT: usize = 5;
+
 struct Case {
     setup: Setup,
     obstacles: Vec<Obstacle>,
-    /// The two corner cells' coordinates.
-    corners: [[usize; 3]; 2],
+    /// The probes: a name and the cells it reads (the largest deviation of them).
+    probes: Vec<(&'static str, Vec<[usize; 3]>)>,
     /// The acceleration (lattice units) the flow is driven with.
     base_acceleration: f64,
 }
 
 /// The channel with the slit, in lattice units with dx = 1/w.
-fn build(w: usize, slit_w: usize, slit_d: usize, tau_minus_half: f64, peak: f64, sigma: f64, fills: &[(usize, usize)]) -> Result<Case, String> {
+fn build(
+    w: usize,
+    slit_w: usize,
+    slit_d: usize,
+    tau_minus_half: f64,
+    peak: f64,
+    sigma: f64,
+    fills: &[(usize, usize, Option<usize>)],
+    three_d: bool,
+) -> Result<Case, String> {
     let nu_lat = tau_minus_half / 3.0;
     let dx = 1.0 / w as f64;
     let dt = nu_lat * dx * dx;
     let wf = w as f64;
     let ny = w + 4 + slit_d;
-    let (lx, ly, lz) = (16.0 * dx, ny as f64 * dx, 4.0 * dx);
+    let nz = if three_d { NZ } else { 4 };
+    let (lx, ly, lz) = (16.0 * dx, ny as f64 * dx, nz as f64 * dx);
     let ho = wf * dx;
     let (x0, x1) = (4.0 * dx, (4 + slit_w) as f64 * dx);
-    let mut obstacles = vec![
-        obstacle("WallLeft", cuboid([-3.0 * lx, ho, -dx], [x0, ly, lz + dx]), &CUBOID_FACES),
-        obstacle("WallRight", cuboid([x1, ho, -dx], [3.0 * lx, ly, lz + dx]), &CUBOID_FACES),
-        obstacle("WallCap", cuboid([x0, ho + slit_d as f64 * dx, -dx], [x1, ly, lz + dx]), &CUBOID_FACES),
-    ];
-    for (k, &(cx, cy)) in fills.iter().enumerate() {
+    let mut obstacles = Vec::new();
+    if three_d {
+        // GEOM3: the slit has a floor (the layers below z = FLOOR are solid; the slit's x = 4 row is one layer lower), full-height side
+        // walls up to z = WEDGE_AT, then walls that retreat one cell per two layers (the wedge), a lid on the domain, a closed end
+        let mut names = Vec::new();
+        let mut add = |name: String, lo: [f64; 3], hi: [f64; 3]| {
+            let n: &'static str = Box::leak(name.into_boxed_str());
+            names.push(obstacle(n, cuboid(lo, hi), &CUBOID_FACES));
+        };
+        let big = 3.0 * lx;
+        let zz = |k: usize| k as f64 * dx;
+        add("Floor0".into(), [-big, -dx, -dx], [big, ly + dx, zz(1)]);
+        add("FloorUnderChannel".into(), [-big, -dx, zz(1)], [big, ho, zz(FLOOR)]);
+        add("FloorSlitWall".into(), [x1, ho, zz(1)], [big, ly + dx, zz(FLOOR)]);
+        add("FloorSlitLeftWall".into(), [-big, ho, zz(1)], [x0, ly + dx, zz(FLOOR)]);
+        add("Lid".into(), [-big, -dx, zz(nz - 1)], [big, ly + dx, zz(nz) + dx]);
+        for k in FLOOR..nz - 1 {
+            let extra = if k >= WEDGE_AT { ((k - WEDGE_AT) / 2 + 1) as f64 * dx } else { 0.0 };
+            add(format!("WallLeft{k}"), [-big, ho, zz(k)], [x0 - extra, ly + dx, zz(k + 1)]);
+            add(format!("WallRight{k}"), [x1 + extra, ho, zz(k)], [big, ly + dx, zz(k + 1)]);
+            add(format!("WallCap{k}"), [x0 - extra, ho + slit_d as f64 * dx, zz(k)], [x1 + extra, ly + dx, zz(k + 1)]);
+        }
+        obstacles = names;
+    } else {
+        obstacles.push(obstacle("WallLeft", cuboid([-3.0 * lx, ho, -dx], [x0, ly, lz + dx]), &CUBOID_FACES));
+        obstacles.push(obstacle("WallRight", cuboid([x1, ho, -dx], [3.0 * lx, ly, lz + dx]), &CUBOID_FACES));
+        obstacles.push(obstacle("WallCap", cuboid([x0, ho + slit_d as f64 * dx, -dx], [x1, ly, lz + dx]), &CUBOID_FACES));
+    }
+    for (k, &(cx, cy, cz)) in fills.iter().enumerate() {
         let (a, b) = (cx as f64 * dx, cy as f64 * dx);
         let name: &'static str =
             ["Fill0", "Fill1", "Fill2", "Fill3", "Fill4", "Fill5", "Fill6", "Fill7"].get(k).copied().ok_or("at most 8 fill cells")?;
-        obstacles.push(obstacle(name, cuboid([a, b, -dx], [a + dx, b + dx, lz + dx]), &CUBOID_FACES));
+        let (z0, z1) = match cz {
+            Some(z) => (z as f64 * dx, (z + 1) as f64 * dx),
+            None => (-dx, lz + dx),
+        };
+        obstacles.push(obstacle(name, cuboid([a, b, z0], [a + dx, b + dx, z1]), &CUBOID_FACES));
     }
     let mut d = domain([0.0; 3], [lx, ly, lz], dx);
     for f in [&mut d.faces.x_min, &mut d.faces.x_max, &mut d.faces.y_min, &mut d.faces.y_max, &mut d.faces.z_min, &mut d.faces.z_max] {
@@ -100,11 +146,16 @@ fn build(w: usize, slit_w: usize, slit_d: usize, tau_minus_half: f64, peak: f64,
     let m = model(1.0, 1.0, d, p);
     let setup = Setup::new(&m, None, &obstacles, &Limits::default()).map_err(|e| e.to_string())?;
     let yb = w + slit_d - 1;
-    Ok(Case { setup, obstacles, corners: [[4, yb, 0], [5, yb, 0]], base_acceleration: g_lat })
+    let probes = if three_d {
+        vec![("site", vec![[5, yb - 3, FLOOR]]), ("corner", vec![[5, yb, FLOOR], [4, yb, FLOOR - 1]])]
+    } else {
+        vec![("site", vec![[5, yb - 3, 0]]), ("corner", vec![[4, yb, 0], [5, yb, 0]])]
+    };
+    Ok(Case { setup, obstacles, probes, base_acceleration: g_lat })
 }
 
 /// One read of the corner: the largest |rho - baseline| over the corner cells, its signed value, and the alternation flag.
-fn read_corner(flow: &mut Flow, fluid: &[bool], corners: &[[usize; 3]; 2], baseline: &[f64]) -> Option<(f64, bool)> {
+fn read_corner(flow: &mut Flow, fluid: &[bool], corners: &[[usize; 3]], baseline: &[f64]) -> Option<(f64, bool)> {
     let f = Backend::fields(flow).ok()?;
     let g = *flow.grid();
     let dev = |c: usize| f.density.get(c).copied().unwrap_or(f64::NAN) - baseline.get(c).copied().unwrap_or(f64::NAN);
@@ -150,8 +201,10 @@ fn slit_corner() {
     let (amp, sample) = (env("PULSE_AMP", 1e-3), (env("SAMPLE", 10.0) as u64).max(1));
     let wall_sigma1 = env("WALL_SIGMA1", 0.0) as u8;
     let fills = fill_cells();
-    let label = format!("tau-1/2 {tau:e} peak {peak} sigma {sigma} WALL_SIGMA1 {wall_sigma1} fill {fills:?}");
-    let case = match build(w, slit_w, slit_d, tau, peak, sigma, &fills) {
+    let three_d = env("GEOM3", 0.0) != 0.0;
+    let label =
+        format!("{} tau-1/2 {tau:e} peak {peak} sigma {sigma} WALL_SIGMA1 {wall_sigma1} fill {fills:?}", if three_d { "GEOM3" } else { "2D" });
+    let case = match build(w, slit_w, slit_d, tau, peak, sigma, &fills, three_d) {
         Ok(c) => c,
         Err(e) => {
             println!("SLIT-CORNER {label}: setup refused: {e}");
@@ -169,14 +222,13 @@ fn slit_corner() {
     let n = flow.grid().len();
     let fluid: Vec<bool> = (0..n).map(|c| Backend::is_fluid(&flow, c)).collect();
     println!(
-        "SLIT-GEOMETRY {label}: grid {:?}, corner cells {:?}, corner fluid {:?}",
+        "SLIT-GEOMETRY {label}: grid {:?}, probes {:?}, fluid {:?}",
         flow.grid().cells,
-        case.corners,
-        case.corners.map(|p| fluid[flow.grid().index(p)])
+        case.probes,
+        case.probes.iter().map(|(_, ps)| ps.iter().map(|&p| fluid[flow.grid().index(p)]).collect::<Vec<_>>()).collect::<Vec<_>>()
     );
     let a0 = flow.acceleration();
     let mut stop: Option<String> = None;
-    // settle
     let mut done = 0u64;
     while done < settle && stop.is_none() {
         let c = 1000.min(settle - done);
@@ -189,12 +241,11 @@ fn slit_corner() {
         Ok(f) if stop.is_none() => f.density,
         _ => vec![1.0; n],
     };
-    // pulse and after: one clock of `sample` steps
     let pulse_a = [a0[0] + amp / pulse_steps.max(1) as f64, a0[1], a0[2]];
     let total = pulse_steps + after;
-    let (mut t, mut peak_dev, mut peak_at) = (0u64, 0.0f64, 0u64);
-    let mut hist: Vec<(u64, f64, bool)> = Vec::new();
-    let mut alt_reads = 0usize;
+    let mut t = 0u64;
+    let np = case.probes.len();
+    let mut hist: Vec<Vec<(u64, f64, bool)>> = vec![Vec::new(); np];
     while t < total && stop.is_none() {
         let c = sample.min(total - t);
         let a = if t < pulse_steps { pulse_a } else { a0 };
@@ -207,57 +258,68 @@ fn slit_corner() {
             break;
         }
         t += c;
-        match read_corner(&mut flow, &fluid, &case.corners, &baseline) {
-            Some((d, alt)) => {
-                if !d.is_finite() {
-                    stop = Some(format!("non-finite corner density at time {t}"));
+        for (i, (_, cells)) in case.probes.iter().enumerate() {
+            match read_corner(&mut flow, &fluid, cells, &baseline) {
+                Some((d, alt)) => {
+                    if !d.is_finite() {
+                        stop = Some(format!("non-finite density at time {t}"));
+                        break;
+                    }
+                    if let Some(h) = hist.get_mut(i) {
+                        h.push((t, d, alt));
+                    }
+                }
+                None => {
+                    stop = Some(format!("could not read the fields at time {t}"));
                     break;
                 }
-                alt_reads += usize::from(alt);
-                if d.abs() > peak_dev {
-                    peak_dev = d.abs();
-                    peak_at = t;
-                }
-                hist.push((t, d, alt));
-            }
-            None => {
-                stop = Some(format!("could not read the fields at time {t}"));
-                break;
             }
         }
     }
-    let series: Vec<String> =
-        hist.iter().filter(|(s, ..)| s % 100 == 0).map(|(s, d, alt)| format!("{s}:{d:+.3e}{}", if *alt { "*" } else { "" })).collect();
-    println!("SLIT-HISTORY {label} (time since the pulse start: corner deviation):\n{}", series.join(" "));
-    // envelope blocks of 500 steps after the pulse
-    let blocks: Vec<f64> = hist
-        .iter()
-        .filter(|(s, ..)| *s > pulse_steps)
-        .fold(Vec::<(u64, f64)>::new(), |mut acc, (s, d, _)| {
-            let b = (s - pulse_steps - 1) / 500;
-            if acc.last().map(|x| x.0) == Some(b) {
-                if let Some(l) = acc.last_mut() {
-                    l.1 = l.1.max(d.abs());
-                }
-            } else {
-                acc.push((b, d.abs()));
+    let stop_text = stop.unwrap_or_else(|| "no stop".to_string());
+    for ((name, _), h) in case.probes.iter().zip(&hist) {
+        let (mut peak_dev, mut peak_at, mut alt_reads) = (0.0f64, 0u64, 0usize);
+        for &(s, d, alt) in h {
+            alt_reads += usize::from(alt);
+            if d.abs() > peak_dev {
+                peak_dev = d.abs();
+                peak_at = s;
             }
-            acc
-        })
-        .into_iter()
-        .map(|(_, v)| v)
-        .collect();
-    let rate = match (blocks.first(), blocks.last()) {
-        (Some(&f), Some(&l)) if blocks.len() > 1 && f > 0.0 && l > 0.0 => ((l / f).ln() / ((blocks.len() - 1) as f64 * 0.5)).to_string(),
-        _ => "n/a".to_string(),
-    };
-    println!(
-        "SLIT-CORNER {label}: amplification {:.3} (peak corner deviation {:.3e} at time {peak_at}, pulse {amp:e}); rate per 1000 steps {rate} (positive grows); alternating reads {alt_reads} of {}; envelope blocks of 500 steps {:?}; {}",
-        peak_dev / amp,
-        peak_dev,
-        hist.len(),
-        blocks.iter().map(|b| format!("{b:.2e}")).collect::<Vec<_>>(),
-        stop.unwrap_or_else(|| "no stop".to_string())
-    );
+        }
+        let series: Vec<String> =
+            h.iter().filter(|(s, ..)| s % 100 == 0).map(|(s, d, alt)| format!("{s}:{d:+.3e}{}", if *alt { "*" } else { "" })).collect();
+        println!(
+            "SLIT-HISTORY {label} probe {name} (time since the pulse start: deviation):
+{}",
+            series.join(" ")
+        );
+        let blocks: Vec<f64> = h
+            .iter()
+            .filter(|(s, ..)| *s > pulse_steps)
+            .fold(Vec::<(u64, f64)>::new(), |mut acc, (s, d, _)| {
+                let b = (s - pulse_steps - 1) / 500;
+                if acc.last().map(|x| x.0) == Some(b) {
+                    if let Some(l) = acc.last_mut() {
+                        l.1 = l.1.max(d.abs());
+                    }
+                } else {
+                    acc.push((b, d.abs()));
+                }
+                acc
+            })
+            .into_iter()
+            .map(|(_, v)| v)
+            .collect();
+        let rate = match (blocks.first(), blocks.last()) {
+            (Some(&f), Some(&l)) if blocks.len() > 1 && f > 0.0 && l > 0.0 => ((l / f).ln() / ((blocks.len() - 1) as f64 * 0.5)).to_string(),
+            _ => "n/a".to_string(),
+        };
+        println!(
+            "SLIT-CORNER {label} probe {name}: amplification {:.3} (peak deviation {peak_dev:.3e} at time {peak_at}, pulse {amp:e}); rate per 1000 steps {rate} (positive grows); alternating reads {alt_reads} of {}; envelope blocks of 500 steps {:?}; {stop_text}",
+            peak_dev / amp,
+            h.len(),
+            blocks.iter().map(|b| format!("{b:.2e}")).collect::<Vec<_>>()
+        );
+    }
     let _ = case.base_acceleration;
 }
