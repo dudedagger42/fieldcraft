@@ -122,6 +122,97 @@ fn t3_readings_from_its_restart_file() {
     println!("READINGS {}", ddes_backstep::t3_readings_of_restart(&file, span).expect("the restart's readings"));
 }
 
+/// The four diagnostics of the T3 interim ruling from a T3 restart (`FIELDCRAFT_STEP_RESTART`; `DDES=0` for a T2 restart:
+/// stresses and floor shear only), CPU only, seconds.
+#[test]
+#[ignore = "local: needs a T2 or T3 restart file"]
+fn step_diagnostics_from_a_restart_file() {
+    let file = std::path::PathBuf::from(std::env::var("FIELDCRAFT_STEP_RESTART").expect("FIELDCRAFT_STEP_RESTART"));
+    let span: f64 = std::env::var("FIELDCRAFT_STEP_SPAN").ok().and_then(|v| v.parse().ok()).unwrap_or(4.0);
+    let ddes = std::env::var("DDES").map(|v| v != "0").unwrap_or(true);
+    println!("DIAGNOSTICS {}", ddes_backstep::step_diagnostics_of_restart(&file, span, ddes).expect("the restart's diagnostics"));
+}
+
+/// Short submissions change nothing: the same small DDES step advanced 64 steps in one chunk with one submission, with a
+/// submission per step and with one per 3 steps (and the whole-chunk run twice), fields compared bit for bit.
+#[test]
+#[ignore = "local: GPU run"]
+fn short_submissions_are_bit_identical() {
+    let cells = std::env::var("CELLS_PER_H").ok().and_then(|v| v.parse().ok()).unwrap_or(8usize);
+    let (cpu, config) = ddes_backstep::built_zone_step(cells, 1.0);
+    println!("CASE {config}");
+    let policy = Policy::from_env().expect("FIELDCRAFT_GPU names a policy");
+    let run = |submit_steps: u64| -> Option<(Vec<u64>, Vec<u64>, Vec<u64>, usize)> {
+        let mut gpu = match GpuFlow::with_options(&cpu, policy, Options { submit_steps, ..Options::default() }) {
+            Ok(g) => g,
+            Err(why) => {
+                println!("DEVICE refused: {why}");
+                return None;
+            }
+        };
+        Backend::advance(&mut gpu, 64).unwrap();
+        let f = Backend::fields(&mut gpu).unwrap();
+        let nu = Backend::nu_tilde(&mut gpu).unwrap().unwrap();
+        let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<u64>>();
+        let vel: Vec<f64> = f.velocity.iter().flatten().copied().collect();
+        Some((bits(&f.density), bits(&vel), bits(&nu), gpu.submit_seconds().len()))
+    };
+    let (Some(base), Some(base2), Some(one), Some(three)) = (run(0), run(0), run(1), run(3)) else { return };
+    println!("submissions per 64-step chunk: whole {}, one step {}, three steps {}", base.3, one.3, three.3);
+    println!("whole chunk twice: density {} velocity {} nu-tilde {}", base.0 == base2.0, base.1 == base2.1, base.2 == base2.2);
+    println!("whole vs one step per submission: density {} velocity {} nu-tilde {}", base.0 == one.0, base.1 == one.1, base.2 == one.2);
+    println!("whole vs three steps per submission: density {} velocity {} nu-tilde {}", base.0 == three.0, base.1 == three.1, base.2 == three.2);
+    assert!(base.0 == one.0 && base.1 == one.1 && base.2 == one.2, "one step per submission changed the fields");
+    assert!(base.0 == three.0 && base.1 == three.1 && base.2 == three.2, "three steps per submission changed the fields");
+}
+
+/// The watched load test: a DDES step in T3's zone (`CELLS_PER_H` 24, `SPAN` 4: 12 M cells), `STEPS` steps (3000) with
+/// one step per submission (`SUBMIT_STEPS`, 1), each submission waited for; prints the submission times (min, median,
+/// 99th percentile, max) and the steps per second. Run it under the watcher script, which polls the System log for
+/// nvlddmkm and the GPU's temperature, clocks and power.
+#[test]
+#[ignore = "local: GPU run, watched"]
+fn watched_short_gpu_run() {
+    let cells = std::env::var("CELLS_PER_H").ok().and_then(|v| v.parse().ok()).unwrap_or(24usize);
+    let span: f64 = std::env::var("SPAN").ok().and_then(|v| v.parse().ok()).unwrap_or(4.0);
+    let steps: u64 = std::env::var("STEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(3000);
+    let submit_steps: u64 = std::env::var("SUBMIT_STEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+    let (cpu, config) = ddes_backstep::built_zone_step(cells, span);
+    println!("CASE {config}");
+    let policy = Policy::from_env().expect("FIELDCRAFT_GPU names a policy");
+    let mut gpu = match GpuFlow::with_options(&cpu, policy, Options { submit_steps, ..Options::default() }) {
+        Ok(g) => g,
+        Err(why) => {
+            println!("DEVICE refused: {why}");
+            return;
+        }
+    };
+    println!("DEVICE {}; {} cells ({} fluid); {steps} steps, {submit_steps} per submission", gpu.adapter_name(), cpu.grid().len(), cpu.fluid_cells());
+    println!("WATCH START");
+    let started = std::time::Instant::now();
+    let mut done = 0;
+    while done < steps {
+        let n = 20.min(steps - done);
+        Backend::advance(&mut gpu, n).unwrap();
+        done += n;
+        if done % 500 == 0 {
+            println!("step {done}: {:.1} s", started.elapsed().as_secs_f64());
+        }
+    }
+    let mut t: Vec<f64> = gpu.submit_seconds().to_vec();
+    t.sort_by(f64::total_cmp);
+    let q = |p: f64| t.get(((t.len() as f64 - 1.0) * p).round() as usize).copied().unwrap_or(f64::NAN);
+    println!(
+        "WATCH END; {} submissions: min {:.1} ms, median {:.1} ms, p99 {:.1} ms, max {:.1} ms; {:.1} ms per step overall",
+        t.len(),
+        1e3 * q(0.0),
+        1e3 * q(0.5),
+        1e3 * q(0.99),
+        1e3 * q(1.0),
+        1e3 * started.elapsed().as_secs_f64() / steps as f64
+    );
+}
+
 /// T1 itself on the device: the full-domain RANS step (`FIELDCRAFT_STEP_CELLS_PER_H`, `_MAX_STEPS`, `_CHECKPOINT`,
 /// `_PROFILE`), whose restart file and inlet profile T1s starts from.
 #[test]

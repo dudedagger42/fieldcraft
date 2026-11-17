@@ -1302,23 +1302,28 @@ impl ShearLayer {
         }
     }
 
+    /// Station `s`'s rows: (height in H, resolved, modelled stress over the inlet speed squared) of every row with fluid in
+    /// it and in both neighbours.
+    fn layer(&self, s: usize) -> Vec<(f64, f64, f64)> {
+        let rows = &self.sums[s * self.nz..(s + 1) * self.nz];
+        let mean = |k: usize, what: usize| rows.get(k).filter(|r| r[4] > 0.0).map(|r| r[what] / r[4]);
+        let scale = self.lattice_velocity * self.lattice_velocity;
+        (1..self.nz.saturating_sub(1))
+            .filter_map(|k| {
+                let (up, down) = (mean(k + 1, 0)?, mean(k - 1, 0)?);
+                let resolved = -(mean(k, 2)? - mean(k, 0)? * mean(k, 1)?);
+                let modelled = mean(k, 3)? * (up - down) / 2.0;
+                Some(((k as f64 - 0.5) * self.spacing, resolved / scale, modelled / scale))
+            })
+            .collect()
+    }
+
     /// Each station's stress, or why there is none (no samples, or no fluid row with both
     /// neighbours to difference).
     fn stresses(&self) -> Vec<Result<Stress, String>> {
         (0..self.columns.len())
             .map(|s| {
-                let rows = &self.sums[s * self.nz..(s + 1) * self.nz];
-                let mean = |k: usize, what: usize| rows.get(k).filter(|r| r[4] > 0.0).map(|r| r[what] / r[4]);
-                let scale = self.lattice_velocity * self.lattice_velocity;
-                // (height in H, resolved, modelled) of every row with fluid in it and in both neighbours.
-                let layer: Vec<(f64, f64, f64)> = (1..self.nz.saturating_sub(1))
-                    .filter_map(|k| {
-                        let (up, down) = (mean(k + 1, 0)?, mean(k - 1, 0)?);
-                        let resolved = -(mean(k, 2)? - mean(k, 0)? * mean(k, 1)?);
-                        let modelled = mean(k, 3)? * (up - down) / 2.0;
-                        Some(((k as f64 - 0.5) * self.spacing, resolved / scale, modelled / scale))
-                    })
-                    .collect();
+                let layer = self.layer(s);
                 let peak = layer
                     .iter()
                     .copied()
@@ -1781,6 +1786,171 @@ fn the_floor_crossing_of_a_restart_file() {
     let x: Vec<f64> = floor.iter().map(|s| 0.5 * (s.x.0 + s.x.1)).collect();
     let per_area: Vec<f64> = shear.iter().zip(&floor).map(|(t, s)| t / ((s.x.1 - s.x.0) / h).round()).collect();
     println!("the floor shear's sign change over the next 500 steps: {:?}", reattachment(&x, &per_area));
+}
+
+/// The four diagnostics of the T3 interim ruling, from a T3 restart (`ddes`) or a T2 restart (RANS, stresses and the floor
+/// shear only), CPU only and without stepping except one CPU step for the LES-mode map: (1) the peak resolved, modelled and
+/// total shear stress over the inlet speed squared at 1, 3 and 5 H, from the window's sums; (2) the spanwise over streamwise
+/// velocity variance at the stress peak at 3 H, from the stored field (one snapshot, columns 2.5 to 3.5 H, the peak row and
+/// its neighbours); (3) the time-mean floor shear against x, in 0.5 H bins over 0 to 20 H; (4) the share of cells in LES
+/// mode (f_d above a half, from the wall distance, d̃ and C_DES) against x, in the zone's cells, and where the zone starts.
+pub(crate) fn step_diagnostics_of_restart(file: &std::path::Path, span: f64, ddes: bool) -> Result<String, String> {
+    let rans = sa_rans();
+    let Turbulence::SpalartAllmaras { prandtl, wall_model, inflow_ratio, .. } = rans else { return Err("sa_rans is Spalart–Allmaras".into()) };
+    let base = sa_step_in(rans, true, span);
+    let h = base.spacing();
+    let mut step = if ddes {
+        let zone = fieldcraft_model::DdesZone { min: [-1.0, -1.0, -h], max: [12.0, span + 1.0, 3.0] };
+        let model =
+            Turbulence::SpalartAllmaras { prandtl, wall_model, inflow_ratio, ddes: Some(fieldcraft_model::Ddes { c_des: 0.65, zone: Some(zone) }) };
+        sa_step_in(model, true, span)
+    } else {
+        base
+    };
+    let h_over_u = (step.cells_per_h as f64 / step.lattice_velocity).round() as u64;
+    step.sample = 100;
+    step.block = if ddes { (30 * h_over_u).div_ceil(100) as usize } else { 10 };
+    let (mut flow, strips, _) = step.build();
+    let (steps, samples, saved) = load_all(file, &mut flow);
+    let mut window = Window::new(&flow, &step);
+    window.restore(&saved);
+    let mut out = format!("{} at step {steps} = {:.1} H/U, {} samples\n", file.display(), steps as f64 / h_over_u as f64, samples.len());
+    // (1) the stress magnitudes.
+    out += "(1) peak shear stress over the inlet speed squared (max over the rows of each):\n";
+    for (s, x) in STRESS_STATIONS.iter().enumerate() {
+        let layer = window.layer.layer(s);
+        let top = |f: &dyn Fn(&(f64, f64, f64)) -> f64| layer.iter().map(|l| (f(l), l.0)).max_by(|a, b| a.0.abs().total_cmp(&b.0.abs()));
+        match (top(&|l| l.1), top(&|l| l.2), top(&|l| l.1 + l.2)) {
+            (Some(r), Some(m), Some(t)) => {
+                out += &format!(
+                    "  x = {x} H: resolved {:+.3e} (z {:.2} H), modelled {:+.3e} (z {:.2} H), total {:+.3e} (z {:.2} H)\n",
+                    r.0, r.1, m.0, m.1, t.0, t.1
+                )
+            }
+            _ => out += &format!("  x = {x} H: no sample\n"),
+        }
+    }
+    // (2) the variances, one snapshot of the stored field.
+    if ddes {
+        let g = *flow.grid();
+        let [nx, ny, _] = g.cells;
+        let peak_z = window.layer.stresses().get(1).and_then(|s| s.as_ref().ok()).map(|s| s.z);
+        match peak_z {
+            Some(z) => {
+                let k0 = (z / h + 0.5).round() as usize;
+                let cols: Vec<usize> = (0..nx).filter(|&i| (-step.upstream + (i as f64 + 0.5) * h - 3.0).abs() <= 0.5).collect();
+                let (mut vu, mut vv, mut vw, mut n) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+                for &i in &cols {
+                    for k in k0.saturating_sub(1)..=k0 + 1 {
+                        let cells: Vec<[f64; 3]> = (0..ny).filter_map(|j| flow.moments(g.index([i, j, k])).map(|m| m.1)).collect();
+                        if cells.len() < 2 {
+                            continue;
+                        }
+                        let c = cells.len() as f64;
+                        let var = |a: usize| {
+                            let mean = cells.iter().map(|u| u[a]).sum::<f64>() / c;
+                            cells.iter().map(|u| (u[a] - mean).powi(2)).sum::<f64>() / c
+                        };
+                        vu += var(0);
+                        vv += var(1);
+                        vw += var(2);
+                        n += 1.0;
+                    }
+                }
+                out += &format!(
+                    "(2) at x = 3 H, stress peak z = {z:.2} H, one snapshot, {} columns, rows {}..{}: spanwise over streamwise velocity variance {:.3} (<v'v'> {:.3e}, <u'u'> {:.3e}, <w'w'> {:.3e}, in lattice units about each cell row's span mean)\n",
+                    cols.len(),
+                    k0.saturating_sub(1),
+                    k0 + 1,
+                    vv / vu.max(1e-300),
+                    vv / n.max(1.0),
+                    vu / n.max(1.0),
+                    vw / n.max(1.0)
+                );
+            }
+            None => out += "(2) none: no stress peak at 3 H\n",
+        }
+    }
+    // (3) the floor shear.
+    let mut shear = Shear::new(strips.len(), step.block);
+    samples.iter().for_each(|s| {
+        shear.push(s);
+    });
+    // The reference station as the run takes it: x = −4 H, mid-channel, span-mean.
+    let (rho_ref, u_ref) = {
+        let g = *flow.grid();
+        let i = ((-4.0 + step.upstream) / h).floor().clamp(0.0, g.cells[0] as f64 - 1.0) as usize;
+        let k = (((0.5 * (1.0 + step.roof())) + h) / h).floor().clamp(0.0, g.cells[2] as f64 - 1.0) as usize;
+        let cells: Vec<(f64, [f64; 3])> = (0..g.cells[1]).filter_map(|j| flow.moments(g.index([i, j, k]))).collect();
+        let n = cells.len().max(1) as f64;
+        (cells.iter().map(|c| c.0).sum::<f64>() / n, cells.iter().map(|c| c.1[0]).sum::<f64>() / n)
+    };
+    let q = 0.5 * rho_ref * u_ref * u_ref;
+    let mean = shear.mean();
+    let floor: Vec<(f64, f64)> = strips.iter().zip(&mean).filter(|(s, _)| s.floor).map(|(s, &t)| (0.5 * (s.x.0 + s.x.1), t / q)).collect();
+    out += &format!(
+        "(3) time-mean floor shear over q = ½ρU_ref² (x_c in H: value, mean of the 0.125 H strips in each 0.5 H bin), {} blocks:\n  ",
+        shear.blocks()
+    );
+    let mut bins = Vec::new();
+    for b in 0..40 {
+        let (lo, hi) = (0.5 * b as f64, 0.5 * (b + 1) as f64);
+        let v: Vec<f64> = floor.iter().filter(|(x, _)| *x >= lo && *x < hi).map(|(_, c)| *c).collect();
+        if !v.is_empty() {
+            bins.push(format!("{:.2}: {:+.2e}", 0.5 * (lo + hi), v.iter().sum::<f64>() / v.len() as f64));
+        }
+    }
+    out += &bins.join(", ");
+    out += "\n";
+    // (4) the LES-mode map: one CPU step fills d̃ (f64, from the stored f32 state).
+    if ddes {
+        flow.step().map_err(|e| format!("the step for d̃: {e}"))?;
+        let c_des = flow.ddes_constant().unwrap_or(0.65);
+        let (Some(dt), Some(dw), Some(zone)) = (flow.ddes_length(), flow.sa_wall_distance(), flow.ddes_zone()) else {
+            return Err("no d̃, wall distance or zone on the flow".into());
+        };
+        let g = *flow.grid();
+        let [nx, ny, nz] = g.cells;
+        let first_zone_x = (0..nx).find(|&i| zone.get(g.index([i, 0, nz / 2])).copied().unwrap_or(false)).map(|i| -step.upstream + i as f64 * h);
+        out += &format!("(4) the zone's upstream face (first zone column of a mid-height row): x = {first_zone_x:?} H (set at −1.0 H)\n");
+        out += "    share of cells in LES mode (f_d > 0.5) among the zone's fluid cells of each 0.5 H x-bin; 'layer' = cells within 1.5 H above the wall (the step top for x < 0, the floor behind):\n    ";
+        let mut rows = Vec::new();
+        for b in 0..12 {
+            let (lo, hi) = (-4.0 + 0.5 * b as f64, -4.0 + 0.5 * (b + 1) as f64);
+            let (mut all, mut all_les, mut lay, mut lay_les) = (0usize, 0usize, 0usize, 0usize);
+            for i in 0..nx {
+                let xc = -step.upstream + (i as f64 + 0.5) * h;
+                if xc < lo || xc >= hi {
+                    continue;
+                }
+                let floor_z = if xc < 0.0 { 1.0 } else { 0.0 };
+                for k in 0..nz {
+                    let z = (k as f64 - 0.5) * h;
+                    for j in 0..ny {
+                        let c = g.index([i, j, k]);
+                        if !zone.get(c).copied().unwrap_or(false) || flow.moments(c).is_none() {
+                            continue;
+                        }
+                        let d = dw.get(c).copied().unwrap_or(0.0);
+                        let tilde = dt.get(c).copied().unwrap_or(0.0);
+                        let fd = if d > c_des { ((d - tilde) / (d - c_des)).clamp(0.0, 1.0) } else { 0.0 };
+                        let les = fd > 0.5;
+                        all += 1;
+                        all_les += les as usize;
+                        if z >= floor_z && z - floor_z <= 1.5 {
+                            lay += 1;
+                            lay_les += les as usize;
+                        }
+                    }
+                }
+            }
+            let share = |a: usize, n: usize| if n == 0 { "-".to_string() } else { format!("{:.3}", a as f64 / n as f64) };
+            rows.push(format!("{:.2}: all {} layer {}", 0.5 * (lo + hi), share(all_les, all), share(lay_les, lay)));
+        }
+        out += &rows.join("; ");
+        out += "\n";
+    }
+    Ok(out)
 }
 
 /// T3's whole-window readings from a T3 restart file (`span` as the run's): the stored samples replayed into the strips' block
