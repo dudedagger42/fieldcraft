@@ -39,7 +39,8 @@ fn step_probe() {
     println!("CASE {config}");
     println!("CELLS {cells} ({fluid} fluid); the CPU flow built in {:.1} s", clock.elapsed().as_secs_f64());
     let clock = std::time::Instant::now();
-    let device = Policy::from_env().map_err(|e| e.to_string()).and_then(|p| GpuFlow::with_options(&cpu, p, Options::default()).map_err(|e| e.to_string()));
+    let device =
+        Policy::from_env().map_err(|e| e.to_string()).and_then(|p| GpuFlow::with_options(&cpu, p, Options::default()).map_err(|e| e.to_string()));
     let mut gpu = match device {
         Ok(g) => g,
         Err(why) => {

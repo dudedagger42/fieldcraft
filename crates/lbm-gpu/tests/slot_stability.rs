@@ -504,11 +504,7 @@ fn slotted_channel_stability() {
                                 }
                             }
                         }
-                        if t.is_empty() {
-                            "open interior".to_string()
-                        } else {
-                            t.join("+")
-                        }
+                        if t.is_empty() { "open interior".to_string() } else { t.join("+") }
                     };
                     println!(
                         "diag step {done}: max|u| {um:.4} at {im:?} (x {:.3} m; touches {}); max|rho-1| {dr:.4} at {ir:?} (touches {})",
@@ -663,6 +659,45 @@ fn slotted_channel_stability() {
         if done % print_every == 0 || (done <= 1000 && done % 100 == 0 && use_gpu && use_cpu) {
             println!("{line} gpu s {t_gpu:.2} cpu s {t_cpu:.2}");
         }
+        // JET symmetry (print only): at two stations downstream of the plate (2 and 4 slot widths past its downstream face), the offset in
+        // cells of the peak-speed cell from the slot centreline (positive toward z max), its speed, and the same for the spanwise-mean profile.
+        if done % print_every == 0
+            && let Some(f) = fa.as_ref().or(fb.as_ref())
+        {
+            let zc = 0.4 + 0.5 * slot_w * dx;
+            let mut parts = Vec::new();
+            for m in [2.0, 4.0] {
+                let i = (((x_hi + m * slot_w * dx + ext_up) / dx).round() as usize).min(nx.saturating_sub(1));
+                let (mut best, mut kb, mut kmean, mut bmean) = (0.0f64, nz / 2, nz / 2, 0.0f64);
+                for k in 0..nz {
+                    let (mut sum, mut cnt) = (0.0, 0usize);
+                    for j in 0..ny {
+                        let c = grid.index([i, j, k]);
+                        if fluid[c] {
+                            let v = f.velocity[c].iter().map(|v| v * v).sum::<f64>().sqrt();
+                            if v > best {
+                                best = v;
+                                kb = k;
+                            }
+                            sum += v;
+                            cnt += 1;
+                        }
+                    }
+                    if cnt > 0 && sum / cnt as f64 > bmean {
+                        bmean = sum / cnt as f64;
+                        kmean = k;
+                    }
+                }
+                let off = |k: usize| (lo + (k as f64 + 0.5) * dx - zc) / dx;
+                parts.push(format!(
+                    "x {:.3} m (cell {i}): peak cell offset {:+.1} cells speed {best:.5}; spanwise-mean peak offset {:+.1} cells speed {bmean:.5}",
+                    dx * i as f64 - ext_up,
+                    off(kb),
+                    off(kmean)
+                ));
+            }
+            println!("JET step {done}: {} (offset from the slot centreline z {zc:.4} m, in cells, + toward z max)", parts.join(" | "));
+        }
     }
     // The friction share: the plates' wall exchange split by the local wall normal, averaged over SPLIT_STEPS (200) single steps after
     // the run (they are not in `steps`), the tangential part over tangential plus normal along the flow.
@@ -719,7 +754,9 @@ fn slotted_channel_stability() {
         }
     }
     println!("FRICTION {friction}");
-    println!("PENDING wall mass correction not yet taken back, per fluid cell, sampled at the end of each {chunk}-step chunk: largest |value| {pend_max:.3e}, last {pend_last:+.3e} (a settled run above about 1e-6 is distorted)");
+    println!(
+        "PENDING wall mass correction not yet taken back, per fluid cell, sampled at the end of each {chunk}-step chunk: largest |value| {pend_max:.3e}, last {pend_last:+.3e} (a settled run above about 1e-6 is distorted)"
+    );
     let steps_cap = steps;
     let steps = done;
     // the samples of the backend that ran (the CPU's, or the device's when CPU=0)
@@ -748,7 +785,12 @@ fn slotted_channel_stability() {
             let kmin = ks.iter().cloned().fold(f64::MAX, f64::min);
             println!(
                 "KJUMP-BACK {}; K over all windows from {kmin:.3} to {kmax:.3}",
-                jump.map_or("none".to_string(), |i| format!("at the window ending step {}: K {:.3} -> {:.3}", (i as u64 + 2) * win_steps, ks[i], ks[i + 1]))
+                jump.map_or("none".to_string(), |i| format!(
+                    "at the window ending step {}: K {:.3} -> {:.3}",
+                    (i as u64 + 2) * win_steps,
+                    ks[i],
+                    ks[i + 1]
+                ))
             );
         }
     }
@@ -938,6 +980,31 @@ fn slotted_channel_stability() {
                     open as f64 / ny as f64
                 );
             }
+            // THROAT profile (print only): u_x (lattice, spanwise mean) in every cell across the slot at x 0.7 m, the plate's mid-length
+            // and a throat section (the slot is the same width in every plate layer), from the lower plate's top toward z max.
+            {
+                let i = at(0.7);
+                let mut row = Vec::new();
+                for k in 0..nz {
+                    let (mut sum, mut cnt) = (0.0, 0usize);
+                    for j in 0..ny {
+                        let c = grid.index([i, j, k]);
+                        if fluid[c] && (lo + (k as f64 + 0.5) * dx) > 0.4 - 1e-9 && (lo + (k as f64 + 0.5) * dx) < z_hi + 1e-9 {
+                            sum += fl.velocity[c][0];
+                            cnt += 1;
+                        }
+                    }
+                    if cnt > 0 {
+                        row.push(format!("{:.6}", sum / cnt as f64));
+                    }
+                }
+                println!(
+                    "THROAT u_x per cell across the slot at x {:.3} m (cell {i}), {} cells from z 0.4 m: {}",
+                    dx * i as f64 - ext_up,
+                    row.len(),
+                    row.join(" ")
+                );
+            }
             // DIAG4 (g): the loss metric for every arm: the area-mean total pressure p + rho |u|^2 / 2 (lattice, p = (rho - 1) / 3,
             // mean over the fluid cells of the section) at x 0.4, less the same at the downstream plane, over 0.5 u_nom^2.
             {
@@ -959,6 +1026,9 @@ fn slotted_channel_stability() {
                 let up = p_tot(at(0.4));
                 // CLOSURE: the tracked wall force (|F_t.d| + |F_n.d|, d along the flow) over the total-pressure drop (x 0.4 to 1.0 m)
                 // times the duct's fluid cross-section at x 0.4; 1 within about 2 % or the share is untrusted.
+                if split_avg.is_none() {
+                    println!("CLOSURE not computed (INTERP=0: the wall links are not tracked with half-way walls)");
+                }
                 if let Some(w) = split_avg {
                     let section = (0..nz).flat_map(|k| (0..ny).map(move |j| (j, k))).filter(|&(j, k)| fluid[grid.index([at(0.4), j, k])]).count();
                     // the force along the flow is the SUM of the tangential and normal parts (signed): |t| + |n| counts a reverse-flow
