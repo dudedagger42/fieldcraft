@@ -1444,6 +1444,9 @@ fn sa_step_in(sa: Turbulence, short: bool, span: f64) -> Step {
     let cells_per_h = std::env::var("FIELDCRAFT_STEP_CELLS_PER_H").ok().and_then(|v| v.parse().ok()).unwrap_or(16);
     let extra: f64 = std::env::var("FIELDCRAFT_STEP_EXTRA_UPSTREAM").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0);
     let case = Step::driver_seegmiller(sa, span);
+    // `FIELDCRAFT_STEP_SIGMA`: the hybrid collision's sigma (the case's 0.99 when unset); printed with the run's configuration.
+    let sigma = std::env::var("FIELDCRAFT_STEP_SIGMA").ok().and_then(|v| v.parse::<f64>().ok()).or(case.sigma);
+    let case = Step { sigma, ..case };
     if short {
         let downstream = std::env::var("FIELDCRAFT_STEP_DOWNSTREAM").ok().and_then(|v| v.parse().ok()).unwrap_or(20.0);
         return Step { cells_per_h, upstream: 4.0 + 2.0 / cells_per_h as f64, downstream, short: true, ..case };
