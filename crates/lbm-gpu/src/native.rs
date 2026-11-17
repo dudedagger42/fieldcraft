@@ -1666,6 +1666,15 @@ impl GpuFlow {
         Ok(())
     }
 
+    /// LOCAL PROBE, never committed: hold every link's moving-wall factor at `f` from the next
+    /// chunk on (ends any ramp), for a harness that drives an inlet by a fan curve.
+    pub fn set_wall_factor(&mut self, f: f64) {
+        self.ramp_done = true;
+        for p in &self.params {
+            self.queue.write_buffer(p, RAMP, &(f as f32).to_bits().to_le_bytes());
+        }
+    }
+
     /// Write the sub-step dt = 1/n into both phases' uniforms.
     fn set_sa_dt(&self, n: u32) {
         let dt = (1.0 / f64::from(n.max(1))) as f32;
