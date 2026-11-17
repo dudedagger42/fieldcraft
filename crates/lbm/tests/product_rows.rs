@@ -312,10 +312,17 @@ fn recent_jump_back(hist: &[(u64, f64)], n: usize) -> bool {
 /// LEFT LAMINAR: a run starts from rest (flow-rate error -100 %, as sample 0) and should approach the answer from one side, so the
 /// signed error rises; it left that branch when it falls by more than 0.05 points below its running maximum. A rise through zero
 /// (an overshoot that ends monotone) is not a reversal. Returns the step and value (fraction) of the running maximum, and the step
-/// of the chunk where the fall passed the tolerance.
-fn reversed(hist: &[(u64, f64)]) -> Option<(u64, f64, u64)> {
+/// of the chunk where the fall passed the tolerance. `quarter` is described at the start of the function body.
+fn reversed(hist: &[(u64, f64)], quarter: u64) -> Option<(u64, f64, u64)> {
     let mut top = (0u64, -1.0f64);
+    // The spin-up from rest is not watched: the detector starts at the first point within 5 % of the exact flow rate, or at `quarter`
+    // (a quarter of the channel's diffusion time, in steps; 0 starts at once), whichever comes first.
+    let mut on = false;
     for &(st, r) in hist {
+        on = on || st >= quarter || r.abs() <= 0.05;
+        if !on {
+            continue;
+        }
         if r > top.1 {
             top = (st, r);
         }
@@ -346,7 +353,11 @@ fn product_rows() {
     let tau_mh = env("TAU_MINUS_HALF", 5e-3);
     let sigma = env("SIGMA", 0.95);
     let label = if mrt { "mrt".to_string() } else { format!("hrr sigma {sigma}") };
-    let label = format!("{label}{}{}", if env("WALL_MRT", 0.0) != 0.0 { " +WALL_MRT" } else { "" }, if env("WALL_BULK", 0.0) > 0.0 { format!(" +WALL_BULK {}", env("WALL_BULK", 0.0)) } else { String::new() });
+    let label = format!(
+        "{label}{}{}",
+        if env("WALL_MRT", 0.0) != 0.0 { " +WALL_MRT" } else { "" },
+        if env("WALL_BULK", 0.0) > 0.0 { format!(" +WALL_BULK {}", env("WALL_BULK", 0.0)) } else { String::new() }
+    );
     let nu_lat = tau_mh / 3.0;
     // CASE: `channel`, `duct` or unset (both); CELLS: a comma list of widths in cells (default 8,16).
     let only = std::env::var("CASE").ok();
@@ -419,6 +430,8 @@ fn product_rows() {
             let mut settled = false;
             let mut drift_last_third = f64::NAN;
             let mut rho = rho0;
+            // a quarter of the diffusion time of the cross-section, w^2 / nu in lattice units (the departure detector ignores the spin-up before it)
+            let quarter = (w as f64 * w as f64 * 3.0 / tau_mh / 4.0) as u64;
             let mut along_hist: Vec<(u64, f64)> = Vec::new();
             let (mut pocket_max, mut pocket_last, mut first_flag) = (0.0f64, 0.0f64, None::<u64>);
             let mut pocket_hist: Vec<(u64, f64, f64)> = Vec::new();
@@ -464,7 +477,7 @@ fn product_rows() {
                         if drift_last_third < 5e-4
                             && range_after(&hist, t) < 5e-4
                             && jump_in_third.is_none()
-                            && reversed(&hist).is_none()
+                            && reversed(&hist, quarter).is_none()
                             && !recent_jump_back(&hist, 3)
                         {
                             settled = true;
@@ -486,7 +499,10 @@ fn product_rows() {
             }
             if pocket.is_some() {
                 let hist: Vec<String> = rho_hist.iter().map(|(st, d, alt)| format!("{st}:{d:+.3e}{}", if *alt { "*" } else { "" })).collect();
-                println!("PRODUCT-RHO-HISTORY collision {label} tau-1/2 {tau_mh:e} (step:signed rho-1 of the worst cell, * = alternates 2dx): {}", hist.join(" "));
+                println!(
+                    "PRODUCT-RHO-HISTORY collision {label} tau-1/2 {tau_mh:e} (step:signed rho-1 of the worst cell, * = alternates 2dx): {}",
+                    hist.join(" ")
+                );
                 if let Some((st, sc)) = &last_scan {
                     println!(
                         "PRODUCT-RHO collision {label} tau-1/2 {tau_mh:e} U_LAT {} last read at step {st}: worst |rho-1| {:.4e} (rho-1 {:+.4e}) at cell {:?}; neighbours (x-,x+,y-,y+,z-,z+) {:?}; alternates 2dx: {}; backend stop after step {}",
@@ -515,7 +531,7 @@ fn product_rows() {
                 "settled: under 0.05 %"
             } else if done < min_steps {
                 "below the minimum steps"
-            } else if reversed(&hist).is_some() {
+            } else if reversed(&hist, quarter).is_some() {
                 "NOT settled (left laminar)"
             } else if last_jump.is_some() {
                 "NOT settled (jump)"
@@ -527,7 +543,7 @@ fn product_rows() {
             let jumps = first_jump(&hist).map_or(String::new(), |j| format!(" [first JUMP at step {j}]"));
             let jumps = jumps + &first_jump_back(&hist).map_or(String::new(), |j| format!(" [first JUMP-BACK (5x the previous five) at step {j}]"));
             let jumps = jumps
-                + &reversed(&hist).map_or(String::new(), |(st, m, at)| {
+                + &reversed(&hist, quarter).map_or(String::new(), |(st, m, at)| {
                     format!(" [LEFT LAMINAR at step {at}: the error had risen to {:+.4} % at step {st}, final {:+.4} %]", 100.0 * m, 100.0 * last)
                 });
             let range = 100.0 * range_after(&hist, done * 2 / 3);
@@ -554,18 +570,26 @@ fn product_rows() {
 #[test]
 fn the_reversal_flag_fires_on_a_second_branch_and_not_on_a_smooth_run() {
     let smooth: Vec<(u64, f64)> = (1..40).map(|i| (i * 100, -0.20 + 0.18 * (1.0 - 0.9f64.powi(i as i32)))).collect();
-    assert!(reversed(&smooth).is_none());
+    assert!(reversed(&smooth, 0).is_none());
     let mut branch = smooth.clone();
     branch.extend((40..60).map(|i| (i * 100, -0.139)));
-    assert_eq!(reversed(&branch).map(|m| (m.0, m.2)), Some((3900, 4000)));
+    assert_eq!(reversed(&branch, 0).map(|m| (m.0, m.2)), Some((3900, 4000)));
     let rising: Vec<(u64, f64)> = (1..10).map(|i| (i * 16_000, -0.00349 - 0.0334 * (i > 1) as i32 as f64)).collect();
-    assert_eq!(reversed(&rising).map(|m| (m.0, m.2)), Some((16_000, 32_000)), "the first sample is the minimum, then it rises (c8 U0.10)");
-    assert!(reversed(&[(100, -0.5), (200, -0.3), (300, -0.3002)]).is_none(), "a rise under 0.05 points never tags");
+    assert_eq!(reversed(&rising, 0).map(|m| (m.0, m.2)), Some((16_000, 32_000)), "the first sample is the minimum, then it rises (c8 U0.10)");
+    assert!(reversed(&[(100, -0.5), (200, -0.3), (300, -0.3002)], 0).is_none(), "a rise under 0.05 points never tags");
     let crossing: Vec<(u64, f64)> = (1..30).map(|i| (i * 100, -0.27 + 1.40 * (1.0 - 0.8f64.powi(i as i32)))).collect();
-    assert!(reversed(&crossing).is_none(), "a rise through zero to +1.1 % is not a reversal (S1 duct rows)");
+    assert!(reversed(&crossing, 0).is_none(), "a rise through zero to +1.1 % is not a reversal (S1 duct rows)");
     let mut over = crossing.clone();
     over.push((3000, 1.0));
-    assert!(reversed(&over).is_some(), "a fall after the overshoot is");
+    assert!(reversed(&over, 0).is_some(), "a fall after the overshoot is");
+}
+
+#[test]
+fn the_reversal_flag_ignores_the_spin_up_before_a_quarter_of_the_diffusion_time() {
+    // a wobble while still far from the answer (-19.6 %), then a smooth rise: tagged at once, not once the detector starts
+    let spin: Vec<(u64, f64)> = vec![(10_000, -0.30), (12_500, -0.196), (15_000, -0.2), (20_000, -0.15), (50_000, -0.02), (60_000, 0.004)];
+    assert!(reversed(&spin, 0).is_some());
+    assert!(reversed(&spin, 38_400).is_none());
 }
 
 #[test]
