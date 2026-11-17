@@ -2589,6 +2589,53 @@ fn cell_moments(@builtin(local_invocation_index) lid: u32, @builtin(workgroup_id
     moments[cell] = vec4<f32>(u, rho);
 }
 
+// The links that crossed one plane in the last streaming (GpuFlow::population_flux). The host puts the axis, the layer the +axis links
+// arrive in and the layer the -axis links arrive in into params.ramp (yzw, as exact f32 integers). Thread e takes the cell e % T of
+// the layer chosen by e / T (T the cells of a layer), and writes into `moments`: x the sum of the signed deviations of its links
+// (the populations are stored as deviations from their weights), y the set of those links as a bit mask (as an exact f32), so the
+// host adds the weights in double precision. A link counts when its source cell is a fluid cell (a bounced-back one did not cross).
+@compute @workgroup_size(256)
+fn plane_flux(@builtin(local_invocation_index) lid: u32, @builtin(workgroup_id) wg: vec3<u32>) {
+    let e = cell_of(lid, wg);
+    let axis = u32(params.ramp.y);
+    let size = vec3<i32>(i32(params.nx), i32(params.ny), i32(params.nz));
+    let a1 = (axis + 1u) % 3u;
+    let a2 = (axis + 2u) % 3u;
+    let t = u32(size[a1] * size[a2]);
+    if e >= 2u * t { return; }
+    let low = e >= t;
+    let r = i32(e % t);
+    var p = vec3<i32>(0);
+    p[axis] = i32(select(params.ramp.z, params.ramp.w, low));
+    p[a1] = r % size[a1];
+    p[a2] = r / size[a1];
+    let cell = u32((p.z * size.y + p.y) * size.x + p.x);
+    var out = vec4<f32>(0.0);
+    if is_fluid(cell) {
+        let xyz = aa_coords(cell);
+        let want = select(1, -1, low);
+        var dev = 0.0;
+        var mask = 0u;
+        for (var q = 1u; q < Q; q = q + 1u) {
+            let cq = c_of(q);
+            if cq[axis] != want { continue; }
+            var s = p - cq;
+            var inside = true;
+            for (var a = 0u; a < 3u; a = a + 1u) {
+                if s[a] < 0 || s[a] >= size[a] {
+                    if params.periodic[a] == 0u { inside = false; }
+                    s[a] = (s[a] + size[a]) % size[a];
+                }
+            }
+            if !inside || !is_fluid(u32((s.z * size.y + s.y) * size.x + s.x)) { continue; }
+            dev = dev + population(q, cell, xyz);
+            mask = mask | (1u << q);
+        }
+        out = vec4<f32>(select(dev, -dev, low), f32(mask), 0.0, 0.0);
+    }
+    moments[e] = out;
+}
+
 // The wall model's cells as `fields` reports them: the velocity the last reconstruction imposed
 // (fieldcraft_lbm::wall::Walls::modelled), over `cell_moments`' streamed state, which the next
 // reconstruction overwrites. Dispatched only when the fields are read, after `cell_moments` and

@@ -220,6 +220,9 @@ pub struct GpuFlow {
     /// Which bind group's `f` holds the state.
     current: usize,
     n: usize,
+    /// The grid's cells along each axis and whether each axis is periodic (the plane flux's addressing).
+    dims: [usize; 3],
+    periodic_axes: [bool; 3],
     cells: (u32, u32),
     link_count: usize,
     links_groups: (u32, u32),
@@ -568,7 +571,7 @@ fn solid_data(solid: &fieldcraft_lbm::conduction::SolidHeat, t0: f64) -> Result<
 }
 
 /// The entry points of `lbm.wgsl` a flow dispatches.
-const KERNELS: [&str; 39] = [
+const KERNELS: [&str; 40] = [
     "clear_eddy",
     "gradient_velocity",
     "fan_partials",
@@ -590,6 +593,7 @@ const KERNELS: [&str; 39] = [
     "group_forces",
     "cell_moments",
     "wall_moments",
+    "plane_flux",
     "mass",
     "mean_velocity",
     "collide_thermal",
@@ -1570,6 +1574,8 @@ impl GpuFlow {
             bind,
             current: 0,
             n,
+            dims: flow.grid().cells,
+            periodic_axes: flow.periodic(),
             cells,
             link_count: links.len(),
             links_groups,
@@ -1948,6 +1954,76 @@ impl GpuFlow {
         }
         Ok(momentum)
     }
+    /// The net mass flux through the plane between the cell layers `plane - 1` and `plane` of `axis`, in the direction of `+axis`, in
+    /// lattice units per step, from the links that crossed it in the last streaming: the same quantity as
+    /// [`Flow::population_flux`], read from the device (f32 populations, the weights added in double precision). `cells` keeps the
+    /// arrival cells whose flag is set (indexed like the grid). One small dispatch and a readback of the two layers' cells, meant
+    /// for report intervals; the time step is not touched. Not with the on-node bounce, zones or an open boundary, whose links
+    /// the lattice rules rewrite after streaming.
+    pub fn population_flux(&self, axis: usize, plane: usize, cells: Option<&[bool]>) -> Result<f64> {
+        if self.on_node || self.zones.zones != 0 || self.open_count != 0 {
+            return Err(Error::Invalid("population_flux on the device supports only boxes without open boundaries, zones or on-node walls".into()));
+        }
+        let size = self.dims;
+        let n_axis = *size.get(axis).ok_or_else(|| Error::Invalid(format!("population_flux: axis {axis} is not 0, 1 or 2")))?;
+        let periodic = self.periodic_axes.get(axis).copied().unwrap_or(false);
+        let (low, high) = match (plane, periodic) {
+            (p, _) if p >= n_axis => {
+                return Err(Error::Invalid(format!("population_flux: plane {plane} is outside the {n_axis} layers of axis {axis}")));
+            }
+            (0, true) => (n_axis - 1, 0),
+            (0, false) => {
+                return Err(Error::Invalid("population_flux: plane 0 of a non-periodic axis is a face of the domain; use open_face_flux".into()));
+            }
+            (p, _) => (p - 1, p),
+        };
+        if let Some(m) = cells
+            && m.len() != self.n
+        {
+            return Err(Error::Invalid(format!("population_flux: the cell mask has {} entries, the grid {} cells", m.len(), self.n)));
+        }
+        let (a1, a2) = ((axis + 1) % 3, (axis + 2) % 3);
+        let (s1, s2) = (size.get(a1).copied().unwrap_or(1), size.get(a2).copied().unwrap_or(1));
+        let layer = s1 * s2;
+        let params = self.params.get(self.current).ok_or_else(|| gpu_error("no uniforms for a phase"))?;
+        let args = [axis as f32, high as f32, low as f32];
+        self.queue.write_buffer(params, RAMP + 4, &bytes_f32(&args));
+        self.submit("lbm plane flux", &[(self.current, "plane_flux", groups(2 * layer)?)])?;
+        let values = self.read_f32(&self.moments, 4 * 2 * layer)?;
+        let rows = values.as_chunks::<4>().0;
+        let mut total = 0.0;
+        for (e, row) in rows.iter().enumerate().take(2 * layer) {
+            let (is_low, r) = (e >= layer, e % layer);
+            let mut p = [0usize; 3];
+            p[axis] = if is_low { low } else { high };
+            p[a1] = r % s1;
+            p[a2] = r / s1;
+            let cell = p[0] + self.dims[0] * (p[1] + self.dims[1] * p[2]);
+            if !cells.is_none_or(|m| m.get(cell).copied().unwrap_or(false)) {
+                continue;
+            }
+            let mask = row[1] as u32;
+            let want = if is_low { -1 } else { 1 };
+            let sign = f64::from(want);
+            let weights: f64 =
+                (1..Q).filter(|q| mask >> q & 1 == 1 && C.get(*q).is_some_and(|c| c[axis] == want)).map(|q| W.get(q).copied().unwrap_or(0.0)).sum();
+            total += sign * weights + f64::from(row[0]);
+        }
+        if !total.is_finite() {
+            return Err(Error::Invalid("non-finite population flux".into()));
+        }
+        Ok(total)
+    }
+
+    /// The flux through a face of the domain, one cell inside it ([`Flow::open_face_flux`]), from the device.
+    pub fn open_face_flux(&self, axis: usize, high: bool, cells: Option<&[bool]>) -> Result<f64> {
+        let n = self.dims.get(axis).copied().ok_or_else(|| Error::Invalid(format!("open_face_flux: axis {axis} is not 0, 1 or 2")))?;
+        if n < 2 {
+            return Err(Error::Invalid(format!("open_face_flux: axis {axis} has {n} layer")));
+        }
+        self.population_flux(axis, if high { n - 1 } else { 1 }, cells)
+    }
+
     /// The moments of the current state into the moments buffer.
     fn compute_moments(&self) -> Result<()> {
         self.submit("lbm moments", &[(self.current, "cell_moments", self.cells)])
