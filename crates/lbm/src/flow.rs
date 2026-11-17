@@ -348,6 +348,20 @@ pub(crate) fn neighbour(grid: &Grid, periodic: [bool; 3], fluid: &[bool], p: [us
 
 /// The cell next to the cell at `p` along `axis` (towards `+axis` with `up`), fluid or not, across
 /// a periodic face its periodic image; `None` outside a face that is not periodic.
+/// Remove the share `eps` of the non-equilibrium density (trace) mode of the populations `post`: the Hermite component
+/// `H = |c|² − 1` (c_s² = 1/3, so the trace of the equilibrium second moment is ρ(1 + u²)). With `a = Σ post H − ρ u²` and
+/// `Σ w H² = 2/3`, the component is `1.5 a w H`; the density and the momentum are untouched (H is orthogonal to both).
+fn damp_density_mode(post: &mut [f64; Q], rho: f64, uu: f64, eps: f64) {
+    let h = |q: usize| {
+        let c = C[q];
+        f64::from(c[0] * c[0] + c[1] * c[1] + c[2] * c[2]) - 1.0
+    };
+    let a: f64 = post.iter().enumerate().map(|(q, v)| v * h(q)).sum::<f64>() - rho * uu;
+    for (q, v) in post.iter_mut().enumerate() {
+        *v -= eps * 1.5 * a * W[q] * h(q);
+    }
+}
+
 fn across(grid: &Grid, periodic: [bool; 3], p: [usize; 3], axis: usize, up: bool) -> Option<usize> {
     let n = *grid.cells.get(axis)?;
     let i = *p.get(axis)?;
@@ -690,6 +704,10 @@ pub struct Flow {
     /// A study: 1 gives σ = 1 in every fluid cell with a solid axis neighbour (the wall layer, the N = 2 rule), 2 gives σ = 1
     /// in every cell outside it (the blend only in the wall layer), 0 neither (the default).
     wall_layer_sigma_one: u8,
+    /// A study (off: 0): the share of the non-equilibrium density (trace) mode removed each step in the wall layer, after the collision.
+    wall_layer_bulk: f64,
+    /// A study (off): the wall layer collides with the two-relaxation-time MRT scheme instead of the regularised one.
+    wall_layer_mrt: bool,
     /// Whether σ is dynamic (set per cell from the subgrid model, [`crate::hrr`]), and then its
     /// smallest and mean value over the fluid cells in the last collision.
     dynamic: bool,
@@ -1812,6 +1830,8 @@ impl Flow {
             wall_gradient: false,
             wall_gap: 0.5,
             wall_layer_sigma_one: 0,
+            wall_layer_bulk: 0.0,
+            wall_layer_mrt: false,
             dynamic: setup.dynamic_sigma,
             sigma_stats: None,
             gradient_u: if setup.collision == Collision::Hrr || setup.vreman > 0.0 || setup.spalart_allmaras.is_some() {
@@ -2502,6 +2522,21 @@ impl Flow {
     /// A study: 1 sets σ = 1 in every cell with a solid neighbour along an axis, 2 sets σ = 1 in every other cell, 0 neither.
     pub fn set_wall_layer_sigma_one(&mut self, mode: u8) {
         self.wall_layer_sigma_one = mode;
+    }
+
+    /// A study (off by default, bit-identical off): in the wall layer (a fluid cell with a solid axis neighbour) the share `eps`
+    /// (0 to 1) of the non-equilibrium trace of the second moment, the density mode, is removed after each collision. Meant to
+    /// be combined with `set_wall_layer_sigma_one(1)`. A value outside 0..=1 (or not a number) is ignored.
+    pub fn set_wall_layer_bulk(&mut self, eps: f64) {
+        if (0.0..=1.0).contains(&eps) {
+            self.wall_layer_bulk = eps;
+        }
+    }
+
+    /// A study (off by default, bit-identical off): the wall layer collides with the MRT scheme at the cell's rate while the rest
+    /// of the flow keeps the regularised collision.
+    pub fn set_wall_layer_mrt(&mut self, on: bool) {
+        self.wall_layer_mrt = on;
     }
 
     /// The wall's distance from the cell centre the wall-aware gradient uses, in cells (default 0.5, half way): for studies.
@@ -3314,6 +3349,19 @@ impl Flow {
         let (sigma, gradient_u, grid, periodic, wall_gradient) = (self.sigma, &self.gradient_u, self.grid, self.periodic, self.wall_gradient);
         let wall_gap = self.wall_gap;
         let wall_layer_sigma_one = self.wall_layer_sigma_one;
+        let (wall_bulk, wall_mrt) = (self.wall_layer_bulk, self.wall_layer_mrt);
+        // The wall layer of the two remedy studies: fluid cells with a solid axis neighbour (empty when neither is on).
+        let layer: Vec<bool> = if (wall_bulk > 0.0 || wall_mrt) && regularized {
+            let solid = |c: usize| !self.fluid.get(c).copied().unwrap_or(true);
+            (0..self.grid.len())
+                .map(|c| {
+                    let p = self.grid.coords(c);
+                    !solid(c) && (0..3).any(|axis| [false, true].iter().any(|&up| across(&self.grid, self.periodic, p, axis, up).is_some_and(solid)))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         // Dynamic σ's cap on the von Kármán length: the box's shortest extent in cells.
         let l_max = self.grid.cells.iter().copied().min().unwrap_or(1) as f64;
         let (wp, wm) = (self.omega_plus, self.omega_minus);
@@ -3459,6 +3507,19 @@ impl Flow {
                     }
                     1.0 / tau
                 };
+                let in_layer = layer.get(b * block + i).copied().unwrap_or(false);
+                // The MRT study: the wall layer relaxes with MRT, at the rate the MRT branch below would use.
+                if regularized && wall_mrt && in_layer {
+                    let rate = wall_rate.or(explicit).unwrap_or(wp);
+                    if turbulent {
+                        eddy(from_rate(rate));
+                    }
+                    crate::mrt::collide(&fq, rho, u, force, rate, forced, &mut post);
+                    for (q, v) in post.iter().enumerate() {
+                        put(q, *v);
+                    }
+                    continue;
+                }
                 // A wall cell under the wall model relaxes with its viscosity instead.
                 if regularized {
                     // With dynamic σ the subgrid model sets σ and stays out of the rate: the
@@ -3518,9 +3579,7 @@ impl Flow {
                                 [false, true].iter().any(|&up| {
                                     let Some(c1) = across(&grid, periodic, p, axis, up) else { return false };
                                     // mode 3: the second layer too (a solid cell two away along the axis)
-                                    solid(c1)
-                                        || (wall_layer_sigma_one == 3
-                                            && across(&grid, periodic, grid.coords(c1), axis, up).is_some_and(solid))
+                                    solid(c1) || (wall_layer_sigma_one == 3 && across(&grid, periodic, grid.coords(c1), axis, up).is_some_and(solid))
                                 })
                             });
                             if in_layer == (wall_layer_sigma_one != 2) { 1.0 } else { cell_sigma }
@@ -3546,6 +3605,9 @@ impl Flow {
                         );
                     if turbulent {
                         eddy(nu_model.unwrap_or_else(|| from_rate(w)));
+                    }
+                    if wall_bulk > 0.0 && in_layer {
+                        damp_density_mode(&mut post, rho, uu, wall_bulk);
                     }
                     for (q, v) in post.iter().enumerate() {
                         put(q, *v);
@@ -4090,6 +4152,8 @@ impl crate::backend::Backend for Flow {
             wall_gradient: _,
             wall_gap: _,
             wall_layer_sigma_one: _,
+            wall_layer_bulk: _,
+            wall_layer_mrt: _,
             dynamic,
             sigma_stats,
             periodic,
