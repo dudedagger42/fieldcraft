@@ -360,6 +360,7 @@ fn slotted_channel_stability() {
     let mut settle_window: Option<(u64, u64)> = None;
     let (mut worst_u, mut worst_r) = (0.0f64, 0.0f64);
     let (mut t_gpu, mut t_cpu) = (0.0f64, 0.0f64);
+    let (mut pend_max, mut pend_last) = (0.0f64, 0.0f64);
     let fluid: Vec<bool> = (0..n).map(|c| Backend::is_fluid(&cpu, c)).collect();
     let grid = *cpu.grid();
     let print_every = env("PRINT", 2000.0) as u64;
@@ -440,6 +441,9 @@ fn slotted_channel_stability() {
                 cpu_ok = false;
             }
             t_cpu += t.elapsed().as_secs_f64();
+            // the mass the walls created at the last step and the spread has not taken back yet, per fluid cell (0 with MASSFIX 0 or 1)
+            pend_last = cpu.wall_mass_pending() / cpu.fluid_cells().max(1) as f64;
+            pend_max = pend_max.max(pend_last.abs());
         }
         done += c;
         let fa = if cpu_ok { Backend::fields(&mut cpu).ok() } else { None };
@@ -705,6 +709,7 @@ fn slotted_channel_stability() {
         }
     }
     println!("FRICTION {friction}");
+    println!("PENDING wall mass correction not yet taken back, per fluid cell, sampled at the end of each {chunk}-step chunk: largest |value| {pend_max:.3e}, last {pend_last:+.3e} (a settled run above about 1e-6 is distorted)");
     let steps_cap = steps;
     let steps = done;
     // the samples of the backend that ran (the CPU's, or the device's when CPU=0)
