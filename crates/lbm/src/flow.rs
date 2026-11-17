@@ -687,8 +687,9 @@ pub struct Flow {
     wall_gradient: bool,
     /// The wall's distance from the cell centre the gradient uses, in cells (0.5 half way).
     wall_gap: f64,
-    /// A study: σ = 1 in every fluid cell with a solid axis neighbour (the wall layer).
-    wall_layer_sigma_one: bool,
+    /// A study: 1 gives σ = 1 in every fluid cell with a solid axis neighbour (the wall layer, the N = 2 rule), 2 gives σ = 1
+    /// in every cell outside it (the blend only in the wall layer), 0 neither (the default).
+    wall_layer_sigma_one: u8,
     /// Whether σ is dynamic (set per cell from the subgrid model, [`crate::hrr`]), and then its
     /// smallest and mean value over the fluid cells in the last collision.
     dynamic: bool,
@@ -1810,7 +1811,7 @@ impl Flow {
             sigma: setup.sigma,
             wall_gradient: false,
             wall_gap: 0.5,
-            wall_layer_sigma_one: false,
+            wall_layer_sigma_one: 0,
             dynamic: setup.dynamic_sigma,
             sigma_stats: None,
             gradient_u: if setup.collision == Collision::Hrr || setup.vreman > 0.0 || setup.spalart_allmaras.is_some() {
@@ -2498,9 +2499,9 @@ impl Flow {
         self.wall_gradient = on;
     }
 
-    /// A study: σ = 1 in every cell with a solid neighbour along an axis.
-    pub fn set_wall_layer_sigma_one(&mut self, on: bool) {
-        self.wall_layer_sigma_one = on;
+    /// A study: 1 sets σ = 1 in every cell with a solid neighbour along an axis, 2 sets σ = 1 in every other cell, 0 neither.
+    pub fn set_wall_layer_sigma_one(&mut self, mode: u8) {
+        self.wall_layer_sigma_one = mode;
     }
 
     /// The wall's distance from the cell centre the wall-aware gradient uses, in cells (default 0.5, half way): for studies.
@@ -3508,17 +3509,16 @@ impl Flow {
                             crate::hrr::strain(g)
                         };
                         // A study: σ = 1 in the wall layer (a fluid cell with a solid axis neighbour).
-                        let cell_sigma = if wall_layer_sigma_one && {
+                        let cell_sigma = if wall_layer_sigma_one == 0 {
+                            cell_sigma
+                        } else {
                             let p = grid.coords(b * block + i);
-                            (0..3).any(|axis| {
+                            let in_layer = (0..3).any(|axis| {
                                 [false, true]
                                     .iter()
                                     .any(|&up| across(&grid, periodic, p, axis, up).is_some_and(|c| !fluid.get(c).copied().unwrap_or(true)))
-                            })
-                        } {
-                            1.0
-                        } else {
-                            cell_sigma
+                            });
+                            if in_layer == (wall_layer_sigma_one == 1) { 1.0 } else { cell_sigma }
                         };
                         (cell_sigma, strain)
                     });
