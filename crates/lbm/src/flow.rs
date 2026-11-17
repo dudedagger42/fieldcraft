@@ -2752,12 +2752,17 @@ impl Flow {
                             cell_sigma
                         } else {
                             let p = grid.coords(b * block + i);
+                            let solid = |c: usize| !fluid.get(c).copied().unwrap_or(true);
                             let in_layer = (0..3).any(|axis| {
-                                [false, true]
-                                    .iter()
-                                    .any(|&up| across(&grid, periodic, p, axis, up).is_some_and(|c| !fluid.get(c).copied().unwrap_or(true)))
+                                [false, true].iter().any(|&up| {
+                                    let Some(c1) = across(&grid, periodic, p, axis, up) else { return false };
+                                    // mode 3: the second layer too (a solid cell two away along the axis)
+                                    solid(c1)
+                                        || (wall_layer_sigma_one == 3
+                                            && across(&grid, periodic, grid.coords(c1), axis, up).is_some_and(solid))
+                                })
                             });
-                            if in_layer == (wall_layer_sigma_one == 1) { 1.0 } else { cell_sigma }
+                            if in_layer == (wall_layer_sigma_one != 2) { 1.0 } else { cell_sigma }
                         };
                         (cell_sigma, strain)
                     });
