@@ -66,6 +66,7 @@
 pub mod absorbing;
 pub mod backend;
 pub mod bounce;
+pub mod cell_list;
 pub mod checkpoint;
 pub mod conduction;
 pub mod ddes;

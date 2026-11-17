@@ -123,7 +123,11 @@ fn corner_cell() {
         env("WALL_CORNER", 0.0),
         env("MRT_ALL", 0.0)
     );
-    let probe = [("corner", [x0, floor_h, wall - cav_d]), ("corner_top", [x0, ny - floor_h - 1, wall - cav_d])];
+    // the corner (solid across x, y and z: faces at -x, -y, -z) and the neighbour across from its solid z face (the follower of the A8 pair)
+    let probe = [("corner", [x0, floor_h, wall - cav_d]), ("follower", [x0, floor_h, wall - cav_d + 1])];
+    for (name, p) in probe {
+        println!("CORNER probe {name} {p:?}: {} solid axis faces", faces_of(grid.index(p)));
+    }
     let mut done = 0u64;
     let mut stop = None::<String>;
     // the stream is held: the body force accelerates the duct to STREAM in `RAMP_STEPS` steps, then each chunk sets the force that
@@ -170,7 +174,13 @@ fn corner_cell() {
             }
         }
         mean_x = sum_x / n_x.max(1) as f64;
-        let reads: Vec<String> = probe.iter().map(|(n, p)| format!("{n} {:.3e}", speed(grid.index(*p)))).collect();
+        let reads: Vec<String> = probe
+            .iter()
+            .map(|(n, p)| {
+                let u = f.velocity[grid.index(*p)];
+                format!("{n} |u| {:.3e} ux {:+.2e} uy {:+.2e} uz {:+.2e}", speed(grid.index(*p)), u[0], u[1], u[2])
+            })
+            .collect();
         println!("CORNER step {done}: {} | jet mean {mean_x:.4} max {jet:.4} | all max {all:.4} at {at:?}", reads.join(" "));
         if !finite || all > 0.3 {
             stop = Some(format!("speed {all:.3} (or a non-finite number) at step {done}"));
