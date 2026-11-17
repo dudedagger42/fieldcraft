@@ -265,20 +265,18 @@ fn recent_jump_back(hist: &[(u64, f64)], n: usize) -> bool {
     (d.len().saturating_sub(n)..d.len()).any(|i| jump_back_at(&d, i))
 }
 
-/// LEFT LAMINAR: a run starts from rest and should approach the answer from one side, so the |flow-rate error| (from rest, -100 %, as sample 0) fell, then rose
-/// again by more than 0.05 points above its running minimum (the run left the first branch). Returns the step and value
-/// (fraction) of the running minimum, and the step of the chunk where the rise passed the tolerance.
+/// LEFT LAMINAR: a run starts from rest (flow-rate error -100 %, as sample 0) and should approach the answer from one side, so the
+/// signed error rises; it left that branch when it falls by more than 0.05 points below its running maximum. A rise through zero
+/// (an overshoot that ends monotone) is not a reversal. Returns the step and value (fraction) of the running maximum, and the step
+/// of the chunk where the fall passed the tolerance.
 fn reversed(hist: &[(u64, f64)]) -> Option<(u64, f64, u64)> {
-    // every run starts from rest (flow rate 0, error -100 %): that is sample 0, so even a first sample that is already the
-    // minimum is followed by a tag if the error then rises
-    let mut min = (0u64, 1.0f64);
+    let mut top = (0u64, -1.0f64);
     for &(st, r) in hist {
-        let a = r.abs();
-        if a < min.1 {
-            min = (st, a);
+        if r > top.1 {
+            top = (st, r);
         }
-        if a > min.1 + 5e-4 {
-            return Some((min.0, min.1, st));
+        if r < top.1 - 5e-4 {
+            return Some((top.0, top.1, st));
         }
     }
     None
@@ -461,7 +459,7 @@ fn product_rows() {
             let jumps = jumps + &first_jump_back(&hist).map_or(String::new(), |j| format!(" [first JUMP-BACK (5x the previous five) at step {j}]"));
             let jumps = jumps
                 + &reversed(&hist).map_or(String::new(), |(st, m, at)| {
-                    format!(" [LEFT LAMINAR at step {at}: |error| had fallen to {:.4} % at step {st}, final {:+.4} %]", 100.0 * m, 100.0 * last)
+                    format!(" [LEFT LAMINAR at step {at}: the error had risen to {:+.4} % at step {st}, final {:+.4} %]", 100.0 * m, 100.0 * last)
                 });
             let range = 100.0 * range_after(&hist, done * 2 / 3);
             let wall = if halfway_walls() { "halfway" } else { "interpolated" };
@@ -494,6 +492,11 @@ fn the_reversal_flag_fires_on_a_second_branch_and_not_on_a_smooth_run() {
     let rising: Vec<(u64, f64)> = (1..10).map(|i| (i * 16_000, -0.00349 - 0.0334 * (i > 1) as i32 as f64)).collect();
     assert_eq!(reversed(&rising).map(|m| (m.0, m.2)), Some((16_000, 32_000)), "the first sample is the minimum, then it rises (c8 U0.10)");
     assert!(reversed(&[(100, -0.5), (200, -0.3), (300, -0.3002)]).is_none(), "a rise under 0.05 points never tags");
+    let crossing: Vec<(u64, f64)> = (1..30).map(|i| (i * 100, -0.27 + 1.40 * (1.0 - 0.8f64.powi(i as i32)))).collect();
+    assert!(reversed(&crossing).is_none(), "a rise through zero to +1.1 % is not a reversal (S1 duct rows)");
+    let mut over = crossing.clone();
+    over.push((3000, 1.0));
+    assert!(reversed(&over).is_some(), "a fall after the overshoot is");
 }
 
 #[test]
