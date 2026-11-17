@@ -246,6 +246,8 @@ fn slit_corner() {
         }
     };
     flow.set_wall_layer_sigma_one(wall_sigma1);
+    flow.set_wall_layer_bulk(env("WALL_BULK", 0.0));
+    flow.set_wall_layer_mrt(env("WALL_MRT", 0.0) != 0.0);
     let n = flow.grid().len();
     let fluid: Vec<bool> = (0..n).map(|c| Backend::is_fluid(&flow, c)).collect();
     println!(
@@ -416,10 +418,12 @@ fn slit_stream() {
     let fills = fill_cells();
     let three_d = env("GEOM3", 1.0) != 0.0;
     let label = format!(
-        "{} stream peak {peak} angle {:.0} deg inlet row {} tau-1/2 {tau:e} sigma {sigma} WALL_SIGMA1 {wall_sigma1} fill {fills:?}",
+        "{} stream peak {peak} angle {:.0} deg inlet row {} tau-1/2 {tau:e} sigma {sigma} WALL_SIGMA1 {wall_sigma1} WALL_BULK {} WALL_MRT {} fill {fills:?}",
         if three_d { "GEOM3" } else { "2D" },
         angle.to_degrees(),
-        env("INLET_ROW", 0.0)
+        env("INLET_ROW", 0.0),
+        env("WALL_BULK", 0.0),
+        env("WALL_MRT", 0.0)
     );
     let case = match build(w, slit_w, slit_d, tau, peak, sigma, &fills, three_d) {
         Ok(c) => c,
@@ -436,6 +440,8 @@ fn slit_stream() {
         }
     };
     flow.set_wall_layer_sigma_one(wall_sigma1);
+    flow.set_wall_layer_bulk(env("WALL_BULK", 0.0));
+    flow.set_wall_layer_mrt(env("WALL_MRT", 0.0) != 0.0);
     let n = flow.grid().len();
     let fluid: Vec<bool> = (0..n).map(|c| Backend::is_fluid(&flow, c)).collect();
     let yb = w + slit_d - 1;
