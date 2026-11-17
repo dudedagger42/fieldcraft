@@ -252,6 +252,7 @@ fn slit_corner() {
     flow.set_wall_layer_sigma_one(wall_sigma1);
     flow.set_wall_layer_bulk(env("WALL_BULK", 0.0));
     flow.set_wall_layer_mrt(env("WALL_MRT", 0.0) != 0.0);
+    flow.set_wall_corner_relax(env("WALL_CORNER", 0.0) != 0.0);
     let n = flow.grid().len();
     let fluid: Vec<bool> = (0..n).map(|c| Backend::is_fluid(&flow, c)).collect();
     println!(
@@ -447,8 +448,33 @@ fn slit_stream() {
     flow.set_wall_layer_sigma_one(wall_sigma1);
     flow.set_wall_layer_bulk(env("WALL_BULK", 0.0));
     flow.set_wall_layer_mrt(env("WALL_MRT", 0.0) != 0.0);
+    flow.set_wall_corner_relax(env("WALL_CORNER", 0.0) != 0.0);
     let n = flow.grid().len();
     let fluid: Vec<bool> = (0..n).map(|c| Backend::is_fluid(&flow, c)).collect();
+    // the census of concave corners: fluid cells with 3 or more solid axis faces (a wrap counts across a periodic box)
+    {
+        let grid = *flow.grid();
+        let mut census = [0usize; 7];
+        let mut listed: Vec<([usize; 3], usize)> = Vec::new();
+        for cell in (0..n).filter(|&c| fluid[c]) {
+            let p = grid.coords(cell);
+            let mut faces = 0;
+            for axis in 0..3 {
+                for up in [false, true] {
+                    let mut q = p;
+                    q[axis] = if up { (p[axis] + 1) % grid.cells[axis] } else { (p[axis] + grid.cells[axis] - 1) % grid.cells[axis] };
+                    if !fluid.get(grid.index(q)).copied().unwrap_or(true) {
+                        faces += 1;
+                    }
+                }
+            }
+            census[faces] += 1;
+            if faces >= 3 && listed.len() < 24 {
+                listed.push((p, faces));
+            }
+        }
+        println!("SLIT-STREAM {label}: fluid cells by solid axis faces 0..6: {census:?}; first cells with 3+ (cell, faces): {listed:?}");
+    }
     let yb = w + slit_d - 1;
     let g0 = flow.acceleration()[0];
     let (mut t, mut stop) = (0u64, None::<String>);
