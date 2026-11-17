@@ -163,9 +163,13 @@ fn build(
     let hf = if three_d && free > 0 { (free + 1) as f64 } else { wf };
     let g_lat = 12.0 * nu_lat * mean / (hf * hf);
     d.acceleration = [g_lat * dx / (dt * dt), 0.0, 0.0];
-    let mut p = collide(1e6 * dt, dt, None, Collision::Hrr);
+    // MRT_ALL=1: the control with MRT everywhere (sigma unused)
+    let mrt_all = env("MRT_ALL", 0.0) != 0.0;
+    let mut p = collide(1e6 * dt, dt, None, if mrt_all { Collision::Mrt } else { Collision::Hrr });
     if let Procedure::Fluid { sigma: s, turbulence, .. } = &mut p {
-        *s = Some(HrrSigma::Value(sigma));
+        if !mrt_all {
+            *s = Some(HrrSigma::Value(sigma));
+        }
         if tau_minus_half < 5e-3 - 1e-12 {
             *turbulence = Some(Turbulence::SpalartAllmaras { prandtl: 0.9, wall_model: None, inflow_ratio: env("SA_SEED", 0.0), ddes: None });
         }
@@ -418,12 +422,13 @@ fn slit_stream() {
     let fills = fill_cells();
     let three_d = env("GEOM3", 1.0) != 0.0;
     let label = format!(
-        "{} stream peak {peak} angle {:.0} deg inlet row {} tau-1/2 {tau:e} sigma {sigma} WALL_SIGMA1 {wall_sigma1} WALL_BULK {} WALL_MRT {} fill {fills:?}",
+        "{} stream peak {peak} angle {:.0} deg inlet row {} tau-1/2 {tau:e} sigma {sigma} WALL_SIGMA1 {wall_sigma1} WALL_BULK {} WALL_MRT {} MRT_ALL {} fill {fills:?}",
         if three_d { "GEOM3" } else { "2D" },
         angle.to_degrees(),
         env("INLET_ROW", 0.0),
         env("WALL_BULK", 0.0),
-        env("WALL_MRT", 0.0)
+        env("WALL_MRT", 0.0),
+        env("MRT_ALL", 0.0)
     );
     let case = match build(w, slit_w, slit_d, tau, peak, sigma, &fills, three_d) {
         Ok(c) => c,
