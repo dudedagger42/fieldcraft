@@ -105,7 +105,8 @@ fn build(
         add("FloorSlitWall".into(), [x1, ho, zz(1)], [big, ly + dx, zz(FLOOR)]);
         add("FloorSlitLeftWall".into(), [-big, ho, zz(1)], [x0, ly + dx, zz(FLOOR)]);
         add("Lid".into(), [-big, -dx, zz(nz - 1)], [big, ly + dx, zz(nz) + dx]);
-        for k in FLOOR..nz - 1 {
+        let top = (env("FREE_TOP", (nz - 1) as f64) as usize).clamp(FLOOR + 1, nz - 1);
+        for k in FLOOR..top {
             let extra = if k >= WEDGE_AT { ((k - WEDGE_AT) / 2 + 1) as f64 * dx } else { 0.0 };
             add(format!("WallLeft{k}"), [-big, ho, zz(k)], [x0 - extra, ly + dx, zz(k + 1)]);
             add(format!("WallRight{k}"), [x1 + extra, ho, zz(k)], [big, ly + dx, zz(k + 1)]);
@@ -134,7 +135,10 @@ fn build(
     d.obstacles = obstacles.iter().map(|o| o.body.clone()).collect();
     // the body force of a plane channel for the mean speed (2/3 of the peak): 12 nu U / H^2
     let mean = peak * 2.0 / 3.0;
-    let g_lat = 12.0 * nu_lat * mean / (wf * wf);
+    // with FREE_TOP the walls stop below the lid and a free layer of height h carries the stream: the force is for that layer
+    let free = (nz - 1).saturating_sub(env("FREE_TOP", (nz - 1) as f64) as usize);
+    let hf = if three_d && free > 0 { (free + 1) as f64 } else { wf };
+    let g_lat = 12.0 * nu_lat * mean / (hf * hf);
     d.acceleration = [g_lat * dx / (dt * dt), 0.0, 0.0];
     let mut p = collide(1e6 * dt, dt, None, Collision::Hrr);
     if let Procedure::Fluid { sigma: s, turbulence, .. } = &mut p {
@@ -322,4 +326,148 @@ fn slit_corner() {
         );
     }
     let _ = case.base_acceleration;
+}
+
+/// The largest density difference between two axis-neighbouring fluid cells in the slit-tip region, with the pair, and the region's
+/// largest speed.
+fn pair_gap(flow: &mut Flow, fluid: &[bool], yb: usize) -> Option<(f64, [usize; 3], [usize; 3], f64, f64)> {
+    let f = Backend::fields(flow).ok()?;
+    let top = env("FREE_TOP", 99.0) as usize;
+    let mut inside = 0.0f64;
+    let g = *flow.grid();
+    let (mut best, mut pa, mut pb, mut speed) = (0.0f64, [0usize; 3], [0usize; 3], 0.0f64);
+    for x in 1..10.min(g.cells[0]) {
+        for y in yb.saturating_sub(6)..=yb.min(g.cells[1] - 1) {
+            for z in 0..g.cells[2] {
+                let a = [x, y, z];
+                let ca = g.index(a);
+                if !fluid.get(ca).copied().unwrap_or(false) {
+                    continue;
+                }
+                let ra = f.density.get(ca).copied().unwrap_or(f64::NAN);
+                if let Some(u) = f.velocity.get(ca) {
+                    let m = (u[0] * u[0] + u[1] * u[1] + u[2] * u[2]).sqrt();
+                    if z >= top {
+                        speed = speed.max(m);
+                    } else {
+                        inside = inside.max(m);
+                    }
+                }
+                for axis in 0..3 {
+                    let mut b = a;
+                    b[axis] += 1;
+                    if b[axis] >= g.cells[axis] {
+                        continue;
+                    }
+                    let cb = g.index(b);
+                    if !fluid.get(cb).copied().unwrap_or(false) {
+                        continue;
+                    }
+                    let d = (ra - f.density.get(cb).copied().unwrap_or(f64::NAN)).abs();
+                    if !d.is_finite() {
+                        return Some((f64::NAN, a, b, speed, inside));
+                    }
+                    if d > best {
+                        (best, pa, pb) = (d, a, b);
+                    }
+                }
+            }
+        }
+    }
+    Some((best, pa, pb, speed, inside))
+}
+
+/// A sustained stream at the slit mouth (GEOM3 or 2D): the body force ramps from zero to the target over `RAMP_STEPS` (default 1,000) at
+/// the angle `STREAM_ANGLE` (degrees from x, default 0: across the mouth; the y component points into the mouth), then holds for
+/// `HOLD_STEPS` (default 9,000). Every `SAMPLE` (default 50) steps the largest density gap between neighbouring fluid cells in the
+/// slit-tip region (y within six cells of the closed end) is logged with the pair's cells and the region's largest speed. `PEAK` is the
+/// nominal peak speed of the plane-channel parabola the force would give.
+#[test]
+#[ignore = "print-only study: see the module docs (cargo test --release -p fieldcraft-lbm --test slit_corner -- --ignored --nocapture slit_stream)"]
+fn slit_stream() {
+    let (w, slit_w, slit_d) = (env("CELLS", 8.0) as usize, env("SLIT_W", 2.0) as usize, env("SLIT_D", 30.0) as usize);
+    let (tau, peak, sigma) = (env("TAU_MINUS_HALF", 1.8e-4), env("PEAK", 0.11), env("SIGMA", 0.95));
+    let (ramp, hold, sample) = (env("RAMP_STEPS", 1000.0) as u64, env("HOLD_STEPS", 9000.0) as u64, (env("SAMPLE", 50.0) as u64).max(1));
+    let angle = env("STREAM_ANGLE", 0.0).to_radians();
+    let wall_sigma1 = env("WALL_SIGMA1", 1.0) as u8;
+    let fills = fill_cells();
+    let three_d = env("GEOM3", 1.0) != 0.0;
+    let label = format!(
+        "{} stream peak {peak} angle {:.0} deg tau-1/2 {tau:e} sigma {sigma} WALL_SIGMA1 {wall_sigma1} fill {fills:?}",
+        if three_d { "GEOM3" } else { "2D" },
+        angle.to_degrees()
+    );
+    let case = match build(w, slit_w, slit_d, tau, peak, sigma, &fills, three_d) {
+        Ok(c) => c,
+        Err(e) => {
+            println!("SLIT-STREAM {label}: setup refused: {e}");
+            return;
+        }
+    };
+    let mut flow = match Flow::new(&case.setup, &case.obstacles) {
+        Ok(f) => f,
+        Err(e) => {
+            println!("SLIT-STREAM {label}: refused: {e}");
+            return;
+        }
+    };
+    flow.set_wall_layer_sigma_one(wall_sigma1);
+    let n = flow.grid().len();
+    let fluid: Vec<bool> = (0..n).map(|c| Backend::is_fluid(&flow, c)).collect();
+    let yb = w + slit_d - 1;
+    let g0 = flow.acceleration()[0];
+    let (mut t, mut stop) = (0u64, None::<String>);
+    let mut hist: Vec<(u64, f64, [usize; 3], [usize; 3], f64, f64)> = Vec::new();
+    while t < ramp + hold && stop.is_none() {
+        let s = (t as f64 / ramp.max(1) as f64).min(1.0);
+        // STREAM_MODE 0: the force ramps up to the plane-channel force and holds (the flow develops over a diffusion time, far slower than
+        // the run); STREAM_MODE 1 (default): a constant force PEAK / RAMP_STEPS for RAMP_STEPS steps accelerates the free layer to about PEAK,
+        // then the force is zero and the stream coasts (it decays over tens of thousands of steps)
+        let a = if env("STREAM_MODE", 1.0) as u32 == 1 {
+            let m = if t < ramp { peak / ramp.max(1) as f64 } else { 0.0 };
+            [m * angle.cos(), m * angle.sin(), 0.0]
+        } else {
+            [g0 * s * angle.cos(), g0 * s * angle.sin(), 0.0]
+        };
+        if let Err(e) = Backend::set_acceleration(&mut flow, a) {
+            stop = Some(format!("acceleration refused: {e}"));
+            break;
+        }
+        let c = sample.min(ramp + hold - t);
+        if let Err(e) = Backend::advance(&mut flow, c) {
+            stop = Some(format!("solver stop after step {t}: {e}"));
+            break;
+        }
+        t += c;
+        match pair_gap(&mut flow, &fluid, yb) {
+            Some((d, a, b, sp, si)) if d.is_finite() => hist.push((t, d, a, b, sp, si)),
+            _ => stop = Some(format!("non-finite density or unreadable fields at step {t}")),
+        }
+    }
+    println!("SLIT-STREAM-LOG {label} (step: gap pair, largest speed in the free layer (z >= FREE_TOP) and below it, every {sample} steps):");
+    for (s, d, a, b, sp, si) in &hist {
+        println!("  {s}: {d:.3e} {a:?}-{b:?} stream {sp:.4} in-slit {si:.4}");
+    }
+    // growth over 150 steps (three samples at the default spacing) once the gap is large enough to matter
+    let lag = (150 / sample).max(1) as usize;
+    let mut worst = (0.0f64, 0u64);
+    let mut doublings = 0usize;
+    for i in lag..hist.len() {
+        let (Some(now), Some(before)) = (hist.get(i), hist.get(i - lag)) else { continue };
+        if before.1 >= 1e-3 {
+            let r = now.1 / before.1;
+            if r > worst.0 {
+                worst = (r, now.0);
+            }
+            doublings += usize::from(r >= 1.8);
+        }
+    }
+    let (gmax, gat) = hist.iter().fold((0.0f64, 0u64), |m, h| if h.1 > m.0 { (h.1, h.0) } else { m });
+    let last = hist.last().map(|h| h.1).unwrap_or(0.0);
+    println!(
+        "SLIT-STREAM {label}: largest gap {gmax:.3e} at step {gat}, last {last:.3e}; windows of 150 steps with gap >= 1e-3 and growth >= 1.8x: {doublings}, largest growth {:.2}x at step {}; {}",
+        worst.0,
+        worst.1,
+        stop.unwrap_or_else(|| "no stop".to_string())
+    );
 }
