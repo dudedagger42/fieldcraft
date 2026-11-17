@@ -59,6 +59,9 @@ pub struct WallMass {
     /// The steps run and the mass the walls created over them.
     steps: u64,
     created: f64,
+    /// SCRATCH: the share of the pending mass handed back each step, and the largest pending seen.
+    beta: f64,
+    max_pending: f64,
 }
 
 impl WallMass {
@@ -123,6 +126,8 @@ impl WallMass {
             receivers,
             steps: 0,
             created: 0.0,
+            beta: std::env::var("FIELDCRAFT_WALL_MASS_BETA").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0),
+            max_pending: 0.0,
         }
     }
 
@@ -135,7 +140,7 @@ impl WallMass {
             let &(a, b) = self.node_shares.get(n).unwrap_or(&(0, 0));
             for &(r, w) in self.shares.get(a as usize..b as usize).unwrap_or_default() {
                 if let Some(x) = self.received.get_mut(r as usize) {
-                    *x += d * w;
+                    *x += self.beta * d * w;
                 }
             }
         }
@@ -161,15 +166,20 @@ impl WallMass {
             }
             total += delta;
             if let Some(d) = self.delta.get_mut(n) {
-                *d = delta;
+                *d = (1.0 - self.beta) * *d + delta;
             }
         }
+        self.max_pending = self.max_pending.max(self.delta.iter().sum::<f64>().abs());
         self.created += total;
         self.steps += 1;
     }
 
     /// The mass the walls created at the last step that has not been taken back yet (the removal is
     /// one step late), in lattice units. Total mass less this is the conserved quantity.
+    pub fn max_pending(&self) -> f64 {
+        self.max_pending
+    }
+
     pub fn pending(&self) -> f64 {
         self.delta.iter().sum()
     }

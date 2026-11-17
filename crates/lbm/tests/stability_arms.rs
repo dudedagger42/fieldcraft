@@ -83,6 +83,17 @@ fn run(arm: Arm, tau_minus_half: f64, q: f64, steps: usize) -> Outcome {
         }
         (peak, k / fluid.len().max(1) as f64, row)
     };
+    let mass = |flow: &fieldcraft_lbm::flow::Flow| -> (f64, f64) {
+        let (mut m, mut u) = (0.0, 0.0);
+        for &c in &fluid {
+            if let Some((r, v)) = flow.moments(c) {
+                m += r;
+                u += v[0];
+            }
+        }
+        (m, u / fluid.len().max(1) as f64)
+    };
+    let mass0 = mass(&flow).0;
     let mut last = probe(&flow);
     for step in 1..=steps {
         if let Err(e) = flow.step() {
@@ -91,6 +102,11 @@ fn run(arm: Arm, tau_minus_half: f64, q: f64, steps: usize) -> Outcome {
         if step % 25 == 0 {
             last = probe(&flow);
         }
+    }
+    if std::env::var_os("SCAN_DIAG").is_some() {
+        let (m, u) = mass(&flow);
+        let (pend, maxp, created) = flow.wall_mass().map_or((0.0, 0.0, 0.0), |w| (flow.wall_mass_pending(), w.max_pending(), w.created().1));
+        eprintln!("DIAG {} q {q} tau-1/2 {tau_minus_half:.1e}: mean_ux {u:.5e}, mass drift {:.3e}, drift less pending {:.3e}, created {created:.3e}, pending {pend:.2e}, max pending {maxp:.2e}", arm.name, (m - mass0) / mass0, (m - pend - mass0) / mass0);
     }
     let end = probe(&flow);
     Outcome::Stable { peak: end.0, k: end.1, row: end.2 }
