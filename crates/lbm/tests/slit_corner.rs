@@ -472,6 +472,16 @@ fn slit_stream() {
             if faces >= 3 && listed.len() < 24 {
                 listed.push((p, faces));
             }
+            // PROBE_FACES="x,y,z;...": the number of solid faces of the named fluid cells
+            if let Ok(list) = std::env::var("PROBE_FACES") {
+                let named = list.split(';').any(|t| {
+                    let v: Vec<usize> = t.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+                    v.as_slice() == p.as_slice()
+                });
+                if named {
+                    println!("SLIT-STREAM probe {p:?}: {faces} solid axis faces");
+                }
+            }
         }
         println!("SLIT-STREAM {label}: fluid cells by solid axis faces 0..6: {census:?}; first cells with 3+ (cell, faces): {listed:?}");
     }
