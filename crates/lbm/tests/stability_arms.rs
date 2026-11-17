@@ -94,6 +94,10 @@ fn run(arm: Arm, tau_minus_half: f64, q: f64, steps: usize) -> Outcome {
         (m, u / fluid.len().max(1) as f64)
     };
     let mass0 = mass(&flow).0;
+    let report = |flow: &fieldcraft_lbm::flow::Flow, step: usize| {
+        let (m, u) = mass(flow);
+        eprintln!("DIAG {} q {q} tau-1/2 {tau_minus_half:.1e} step {step}: mean_ux {u:.5e}, mass drift {:.3e}", arm.name, (m - mass0) / mass0);
+    };
     let mut last = probe(&flow);
     for step in 1..=steps {
         if let Err(e) = flow.step() {
@@ -102,11 +106,17 @@ fn run(arm: Arm, tau_minus_half: f64, q: f64, steps: usize) -> Outcome {
         if step % 25 == 0 {
             last = probe(&flow);
         }
+        if std::env::var_os("SCAN_DRIFT").is_some() && (step == steps / 4 || step == steps / 2) {
+            report(&flow, step);
+        }
     }
     if std::env::var_os("SCAN_DIAG").is_some() {
         let (m, u) = mass(&flow);
         let (pend, maxp, created) = flow.wall_mass().map_or((0.0, 0.0, 0.0), |w| (flow.wall_mass_pending(), w.max_pending(), w.created().1));
         eprintln!("DIAG {} q {q} tau-1/2 {tau_minus_half:.1e}: mean_ux {u:.5e}, mass drift {:.3e}, drift less pending {:.3e}, created {created:.3e}, pending {pend:.2e}, max pending {maxp:.2e}", arm.name, (m - mass0) / mass0, (m - pend - mass0) / mass0);
+    }
+    if std::env::var_os("SCAN_DRIFT").is_some() {
+        report(&flow, steps);
     }
     let end = probe(&flow);
     Outcome::Stable { peak: end.0, k: end.1, row: end.2 }
@@ -150,6 +160,8 @@ fn the_stability_arms() {
         Arm { name: "HRR 1.0, quadratic", collision: Collision::Hrr, sigma: Some(1.0), walls: WallTreatment::InterpolatedQuadratic, halfway_above_half: false },
         Arm { name: "HRR 0.99, linear", collision: Collision::Hrr, sigma: Some(0.99), walls: lin, halfway_above_half: false },
         Arm { name: "HRR 0.99, quadratic", collision: Collision::Hrr, sigma: Some(0.99), walls: WallTreatment::InterpolatedQuadratic, halfway_above_half: false },
+        Arm { name: "MRT, half-way walls", collision: Collision::Mrt, sigma: None, walls: WallTreatment::Halfway, halfway_above_half: false },
+        Arm { name: "HRR 1.0, half-way walls", collision: Collision::Hrr, sigma: Some(1.0), walls: WallTreatment::Halfway, halfway_above_half: false },
         Arm { name: "HRR 0.95, half-way walls", collision: Collision::Hrr, sigma: Some(0.95), walls: WallTreatment::Halfway, halfway_above_half: false },
         Arm { name: "regularised, quadratic", collision: Collision::Regularized, sigma: None, walls: WallTreatment::InterpolatedQuadratic, halfway_above_half: false },
         Arm {
@@ -162,7 +174,8 @@ fn the_stability_arms() {
     ];
     let only = std::env::var("SCAN_ONLY").unwrap_or_default();
     for arm in arms.into_iter().filter(|a| (only.is_empty() || only.split(';').any(|o| a.name.contains(o))) && !a.halfway_above_half) {
-        for q in [0.75, 0.25] {
+        let qs: Vec<f64> = std::env::var("SCAN_Q").ok().map(|v| v.split(',').filter_map(|t| t.trim().parse().ok()).collect()).unwrap_or_else(|| vec![0.75, 0.25]);
+        for q in qs {
             let row: Vec<String> = taus
                 .iter()
                 .map(|&t| match run(arm, t, q, steps) {
