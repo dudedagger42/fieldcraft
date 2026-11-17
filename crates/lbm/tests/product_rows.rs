@@ -108,6 +108,23 @@ fn first_jump_back(hist: &[(u64, f64)]) -> Option<u64> {
     })
 }
 
+/// REVERSED: the |flow-rate error| fell, then rose again by more than 0.5 points above its running minimum (the run left the
+/// first branch). Returns the step and value (fraction) of the running minimum at the first such rise.
+fn reversed(hist: &[(u64, f64)]) -> Option<(u64, f64)> {
+    let mut min = (0u64, f64::INFINITY);
+    let first = hist.first()?.1.abs();
+    for &(st, r) in hist {
+        let a = r.abs();
+        if a < min.1 {
+            min = (st, a);
+        }
+        if min.1 < first && a > min.1 + 5e-3 {
+            return Some(min);
+        }
+    }
+    None
+}
+
 /// max - min of the flow rate over the history points after `from` (the last third of the run).
 fn range_after(hist: &[(u64, f64)], from: u64) -> f64 {
     let v: Vec<f64> = hist.iter().filter(|(s, _)| *s > from).map(|h| h.1).collect();
@@ -179,7 +196,7 @@ fn product_rows() {
                     if let Some(&(_, back)) = hist.iter().rev().find(|(s, _)| *s <= t) {
                         drift_last_third = (rate - back).abs() / (1.0 + rate).abs();
                         let jump_in_third = first_jump(&hist).filter(|j| *j > t);
-                        if drift_last_third < 5e-4 && range_after(&hist, t) < 5e-4 && jump_in_third.is_none() {
+                        if drift_last_third < 5e-4 && range_after(&hist, t) < 5e-4 && jump_in_third.is_none() && reversed(&hist).is_none() {
                             settled = true;
                             break;
                         }
@@ -197,6 +214,8 @@ fn product_rows() {
                 "settled: under 0.05 %"
             } else if done < min_steps {
                 "below the minimum steps"
+            } else if reversed(&hist).is_some() {
+                "NOT settled (left the first branch)"
             } else if last_jump.is_some() {
                 "NOT settled (jump)"
             } else if range_after(&hist, done * 2 / 3) >= 5e-4 {
@@ -206,6 +225,10 @@ fn product_rows() {
             };
             let jumps = first_jump(&hist).map_or(String::new(), |j| format!(" [first JUMP at step {j}]"));
             let jumps = jumps + &first_jump_back(&hist).map_or(String::new(), |j| format!(" [first JUMP-BACK (5x the previous five) at step {j}]"));
+            let jumps = jumps
+                + &reversed(&hist).map_or(String::new(), |(st, m)| {
+                    format!(" [REVERSED: |error| fell to {:.4} % at step {st}, final {:+.4} %]", 100.0 * m, 100.0 * last)
+                });
             let range = 100.0 * range_after(&hist, done * 2 / 3);
             println!(
                 "PRODUCT collision {label} tau-1/2 {tau_mh:e} U_LAT {} case {name} cells {w} steps {done} (minimum {min_steps}, cap {cap}): flow-rate error {:+.4} % (at 2/3 of the run {:+.4} %), change over the last third {:.4} %, max-min over it {range:.4} % ({status}){jumps}, range under the 1 % bar: {}, mean-density drift {:+.3e} per 10000 steps, largest nu_t/nu {max_ratio:.3e}{}",
@@ -219,4 +242,15 @@ fn product_rows() {
             );
         }
     }
+}
+
+#[test]
+fn the_reversal_flag_fires_on_a_second_branch_and_not_on_a_smooth_run() {
+    let smooth: Vec<(u64, f64)> = (1..40).map(|i| (i * 100, -0.20 + 0.18 * (1.0 - 0.9f64.powi(i as i32)))).collect();
+    assert!(reversed(&smooth).is_none());
+    let mut branch = smooth.clone();
+    branch.extend((40..60).map(|i| (i * 100, -0.139)));
+    assert_eq!(reversed(&branch).map(|m| m.0), Some(3900));
+    let rising: Vec<(u64, f64)> = (1..10).map(|i| (i * 100, 0.01 * i as f64)).collect();
+    assert!(reversed(&rising).is_none(), "an error that only grows never decreased first");
 }
