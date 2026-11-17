@@ -31,16 +31,40 @@
 //!
 //! # Known limits
 //!
-//! Measured on a laminar plane channel (ten cells across, impulsive start, no turbulence model, 80 000
-//! steps, walls cutting the links at q = 0.75): with the correction on, the hybrid recursive regularised
-//! collision (σ 0.95 and 1.0, which is the regularised collision) blows up below τ − ½ = 1.5e-2 with
-//! linear walls and below 4e-2 with quadratic walls, and between there and 5e-2 its velocity is
-//! silently wrong (peaks of two to several times the right value at some relaxation times). At
-//! q = 0.25 the same collisions, and the MRT collision at q = 0.75 and 0.25, run with the correction as
-//! designed. Switching it on with the regularised or the
-//! hybrid regularised collision below τ − ½ = 5e-2 is therefore refused
-//! ([`crate::flow::WALL_MASS_MIN_RELAXATION_EXCESS`]); handing back only part of the pending mass each
-//! step does not cure it (it spreads the distortion and delays the blow-up).
+//! A flow with the correction on cannot be checkpointed (the mass in flight is state a checkpoint does
+//! not carry yet).
+//!
+//! Stability. Measured on a one-dimensional laminar channel (ten cells across, impulsive start, no
+//! turbulence model, 80 000 steps, a wall link cut at q = 0.75 of a cell): with the regularised and the
+//! hybrid regularised collisions the correction makes the flow unstable at low viscosity, and not
+//! cleanly. Hybrid regularised at σ 0.95: the linear rule blows up at τ − ½ of about 1.3e-2, the
+//! quadratic rule at about 4e-2. At σ 1.0 and 0.99 the linear rule blows up below about 1.5e-2 and the
+//! quadratic rule below 4e-2; between there and 5e-2 the run finishes but the answer is wrong, with no
+//! error raised (linear rule, peak speed 0.0648 at σ 1.0 and 0.0757 at σ 0.99 at 5e-2, and 0.1367 and
+//! 0.1342 at 3e-2, against 0.0485 with the correction off, up to 2.8 times). A wall link cut at
+//! q = 0.25 stays stable in every arm, and with the correction off every arm is stable down to
+//! τ − ½ = 5e-3. The MRT collision is stable at all ten viscosities with the correction on and reaches
+//! the same steady state as with it off (the rows agree to every printed digit at 80 000 steps); the
+//! switch does act under MRT (it created 3.5e-6 to 8e-6 of mass over 2 000 steps), so what is claimed for
+//! MRT is "stable, same steady state". It has not been measured with the TRT collision. Handing back
+//! only part of the pending mass each step (a factor of 0.5, 0.25 or 0.1) does not remove the distortion:
+//! with 0.1 the linear rule is stable but the flow rate stays 1 to 6 % below the correction-off value,
+//! the quadratic rule up to 22 % below it, and with the quadratic rule 7, 5 and 1 of the ten viscosities
+//! blow up at 0.5, 0.25 and 0.1 (σ 1.0). On a sphere in a periodic box (linear rule, 80 000 steps)
+//! the same collisions with the correction on ran to the end at τ − ½ = 2e-2 and 5e-3. Switching the
+//! correction on with the regularised or the hybrid regularised collision below τ − ½ = 5e-2 is
+//! therefore refused ([`crate::flow::WALL_MASS_MIN_RELAXATION_EXCESS`]).
+//!
+//! What the correction is for: with it off, the mass leaked by a sphere grows through a run (up to
+//! 2.5e-2 of the mass at τ − ½ = 5e-3 for σ 0.95, 4.0e-2 for σ 1.0, 80 000 steps) where a straight
+//! channel leaks nothing visible (a flat 9e-7 at most with MRT, rounding level with the hybrid
+//! collision).
+//!
+//! Rounding. With the hybrid regularised collision the total mass drifts by about 1.1e-12 of itself
+//! per 20 000 steps whatever the walls, the correction, τ or σ (the MRT collision stays at 1e-15); it
+//! is a constant bias of about 5.5e-17 per step in that collision, not caused by the walls, and
+//! negligible next to the wall leak. Its source has not been traced.
+
 use crate::flow::{Interpolation, Link, Rule, interpolated_value};
 use crate::lattice::{Q, W, opposite};
 
