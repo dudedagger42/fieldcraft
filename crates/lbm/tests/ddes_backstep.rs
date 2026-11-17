@@ -1803,13 +1803,46 @@ pub(crate) fn t3_readings_of_restart(file: &std::path::Path, span: f64) -> Resul
     let mut window = Window::new(&flow, &step);
     window.restore(&saved);
     let mut shear = Shear::new(strips.len(), step.block);
-    samples.iter().for_each(|s| {
-        shear.push(s);
-    });
     let floor_x: Vec<f64> = strips.iter().filter(|s| s.floor).map(|s| 0.5 * (s.x.0 + s.x.1)).collect();
-    let floor: Vec<f64> = strips.iter().zip(shear.mean()).filter(|(s, _)| s.floor).map(|(_, t)| t).collect();
-    let readings = Readings::of(&floor_x, &floor, &window.floor);
-    Ok(format!("{} at step {steps}, {} shear samples in {} blocks: {readings}", file.display(), samples.len(), shear.blocks()))
+    let floor_of = |v: &[f64]| strips.iter().zip(v).filter(|(s, _)| s.floor).map(|(_, &t)| t).collect::<Vec<f64>>();
+    let mut blocks = Blocks::new(1, 0).map_err(|e| format!("{e}"))?;
+    let mut per_block = Vec::new();
+    for sample in &samples {
+        if shear.push(sample) {
+            let x_r = furthest_crossing(&floor_x, &floor_of(&shear.last_block()), PRIMARY_BEYOND).map(|(x, _)| x);
+            per_block.push(format!("{x_r:?}"));
+            if let Ok(x) = x_r {
+                blocks.push(x).map_err(|e| format!("{e}"))?;
+            }
+        }
+    }
+    let readings = Readings::of(&floor_x, &floor_of(&shear.mean()), &window.floor);
+    let stresses: Vec<String> = window
+        .layer
+        .stresses()
+        .iter()
+        .map(|s| match s {
+            Ok(s) => format!("resolved against modelled shear stress, {s}"),
+            Err(why) => format!("resolved against modelled shear stress: none ({why})"),
+        })
+        .collect();
+    let h_over_u = (step.cells_per_h as f64 / step.lattice_velocity).round();
+    Ok(format!(
+        "{} at step {steps} = {:.1} H/U; {} shear samples in {} blocks of 30 H/U; block x_r {}; reattachment blocks {} (mean-shear furthest crossing), mean {:.3} H, 95 % half-width {:.3}, lag-1 {:.2}
+{readings}
+{}",
+        file.display(),
+        steps as f64 / h_over_u,
+        samples.len(),
+        shear.blocks(),
+        per_block.join(", "),
+        blocks.means().len(),
+        blocks.mean(),
+        blocks.half_width(),
+        blocks.lag1(),
+        stresses.join("
+")
+    ))
 }
 
 /// The first completed block at which the running mean x_r differs by under 0.5 % from its value
