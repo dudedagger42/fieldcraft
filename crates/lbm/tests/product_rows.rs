@@ -377,12 +377,14 @@ fn product_rows() {
             let mut along_hist: Vec<(u64, f64)> = Vec::new();
             let (mut pocket_max, mut pocket_last, mut first_flag) = (0.0f64, 0.0f64, None::<u64>);
             let mut pocket_hist: Vec<(u64, f64, f64)> = Vec::new();
+            let mut backend_stop: Option<u64> = None;
             while done < cap {
                 // the first chunk is sampled ten times finer, so that a jump inside it is seen by the running minimum
                 let step = if done < chunk && pocket.is_none() { (chunk / 10).max(1) } else { chunk };
                 let chunk = step.min(cap - done);
                 if let Err(e) = Backend::advance(&mut flow, chunk) {
                     println!("PRODUCT collision {label} tau-1/2 {tau_mh:e} case {name} cells {w}: STOPPED by the backend at step {done}: {e}");
+                    backend_stop = Some(done);
                     break;
                 }
                 done += chunk;
@@ -434,8 +436,9 @@ fn product_rows() {
             if let Some((pw, pd)) = pocket {
                 let (none, lacking) = neighbour_counts(&flow, &fluid);
                 println!(
-                    "PRODUCT-POCKET collision {label} tau-1/2 {tau_mh:e} pocket {pw}x{pd} cells {w}: fluid cells with an axis without any fluid neighbour {none}, with an axis lacking one {lacking}; pocket max |u| at the end {pocket_last:.4e}, over the run {pocket_max:.4e}; first chunk with a speed over 0.3 or a non-finite number: {}",
-                    first_flag.map_or("none".to_string(), |s| s.to_string())
+                    "PRODUCT-POCKET collision {label} tau-1/2 {tau_mh:e} pocket {pw}x{pd} cells {w}: fluid cells with an axis without any fluid neighbour {none}, with an axis lacking one {lacking}; pocket max |u| at the end {pocket_last:.4e}, over the run {pocket_max:.4e}; first chunk with a speed over 0.3 or a non-finite number: {}; backend stop after step {}, last pocket max |u| before it {pocket_last:.4e}",
+                    first_flag.map_or("none".to_string(), |s| s.to_string()),
+                    backend_stop.map_or("none".to_string(), |s| s.to_string())
                 );
             }
             let last = hist.last().map_or(f64::NAN, |h| h.1);
@@ -464,8 +467,9 @@ fn product_rows() {
             let wall = if halfway_walls() { "halfway" } else { "interpolated" };
             let length = if duct { duct_length().to_string() } else { "8 (channel)".to_string() };
             println!(
-                "PRODUCT collision {label} tau-1/2 {tau_mh:e} WALL {wall} LENGTH {length} WALL_GRADIENT {} SEED_AMP {} U_LAT {} SA_SEED {} case {name} cells {w} steps {done} (minimum {min_steps}, cap {cap}): flow-rate error {:+.4} % (at 2/3 of the run {:+.4} %), change over the last third {:.4} %, max-min over it {range:.4} % ({status}){jumps}, range under the 1 % bar: {}, mean-density drift {:+.3e} per 10000 steps, largest nu_t/nu {max_ratio:.3e}{} ALONG_DUCT_MAX {along_max:.6e}",
+                "PRODUCT collision {label} tau-1/2 {tau_mh:e} WALL {wall} LENGTH {length} WALL_GRADIENT {} WALL_SIGMA1 {} SEED_AMP {} U_LAT {} SA_SEED {} case {name} cells {w} steps {done} (minimum {min_steps}, cap {cap}): flow-rate error {:+.4} % (at 2/3 of the run {:+.4} %), change over the last third {:.4} %, max-min over it {range:.4} % ({status}){jumps}, range under the 1 % bar: {}, mean-density drift {:+.3e} per 10000 steps, largest nu_t/nu {max_ratio:.3e}{} ALONG_DUCT_MAX {along_max:.6e}",
                 u8::from(wall_gradient()),
+                env("WALL_SIGMA1", 0.0) as u8,
                 seed_amp(),
                 u_lat(),
                 env("SA_SEED", 3.0),
