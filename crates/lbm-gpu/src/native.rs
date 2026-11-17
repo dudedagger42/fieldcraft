@@ -690,6 +690,8 @@ struct Variant {
     hrr: bool,
     vreman: bool,
     dynamic: bool,
+    /// The study knob WALL_SIGMA1 = 1: σ = 1 in the wall layer.
+    wall_sigma1: bool,
     /// Fans or porous zones.
     zones: bool,
     /// The Spalart–Allmaras model.
@@ -744,6 +746,7 @@ fn compile(device: &wgpu::Device, variant: Variant) -> Result<Kernels> {
                     ("HRR", if variant.hrr { 1.0 } else { 0.0 }),
                     ("VREMAN", if variant.vreman { 1.0 } else { 0.0 }),
                     ("DYNAMIC", if variant.dynamic { 1.0 } else { 0.0 }),
+                    ("WALL_SIGMA1", if variant.wall_sigma1 { 1.0 } else { 0.0 }),
                     ("ZONES", if variant.zones { 1.0 } else { 0.0 }),
                     ("SA", if variant.sa { 1.0 } else { 0.0 }),
                     ("MAX_SPEED", MAX_LATTICE_SPEED),
@@ -1294,6 +1297,9 @@ impl GpuFlow {
         // the driver rounds the rest differently: 1.5e-8 of 0.03 on the GB10).
         use fieldcraft_model::HrrSigma;
         let hybrid = flow.hybrid_sigma().filter(|s| *s != HrrSigma::Value(1.0));
+        if flow.wall_layer_sigma_one() > 1 || flow.wall_aware_gradient() {
+            return Err(Error::Invalid("not supported yet: the wall-layer sigma study modes 2 and 3 and the wall-aware gradient on the GPU; solve on the CPU".into()));
+        }
         let fixed_sigma = match hybrid {
             Some(HrrSigma::Value(s)) => s,
             _ => 1.0,
@@ -1452,6 +1458,7 @@ impl GpuFlow {
             hrr: hybrid.is_some(),
             vreman: flow.vreman() > 0.0,
             dynamic: hybrid == Some(HrrSigma::Dynamic),
+            wall_sigma1: hybrid.is_some() && flow.wall_layer_sigma_one() == 1,
             zones: zones.zones > 0,
             sa: sa_faces.is_some(),
         })?;
