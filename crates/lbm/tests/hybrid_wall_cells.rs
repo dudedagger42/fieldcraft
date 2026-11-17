@@ -174,13 +174,14 @@ fn the_hybrid_blend_stops_a_pocket_in_the_wall() {
         };
         let fluid: Vec<bool> = (0..flow.grid().len()).map(|c| Backend::is_fluid(&flow, c)).collect();
         let mut series = Vec::new();
-        let (mut done, mut stop) = (0u64, None::<String>);
+        let (mut done, mut stop, mut eddy) = (0u64, None::<String>, 0.0f64);
         while done < 8_000 && stop.is_none() {
             if let Err(e) = Backend::advance(&mut flow, 500) {
                 stop = Some(format!("stopped by the solver after step {done}: {e}"));
                 break;
             }
             done += 500;
+            eddy = eddy.max(flow.eddy_viscosity_ratio());
             match read(&mut flow, &fluid, reference) {
                 Ok((_, all, pocket, finite)) => {
                     series.push(format!("{done}:{pocket:.3e}"));
@@ -192,7 +193,7 @@ fn the_hybrid_blend_stops_a_pocket_in_the_wall() {
             }
         }
         println!(
-            "POCKET {} tau-1/2 {tau:e} (turbulence model {}) pocket 2x4 cells, width {W}: {}; pocket max |u| by step: {}",
+            "POCKET {} tau-1/2 {tau:e} (turbulence model {}, largest eddy viscosity over molecular {eddy:.3e}) pocket 2x4 cells, width {W}: {}; pocket max |u| by step: {}",
             scheme.label(),
             if vreman { "Vreman, zero in pure shear" } else { "none" },
             stop.unwrap_or_else(|| "ran to step 8000 without stopping".to_string()),
