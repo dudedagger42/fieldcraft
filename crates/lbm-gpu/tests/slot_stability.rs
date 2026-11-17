@@ -189,8 +189,9 @@ fn slotted_channel_stability() {
         Ok("none") => None,
         _ => Some(Turbulence::SpalartAllmaras { prandtl: 0.9, wall_model, inflow_ratio: 3.0, ddes: None }),
     };
-    // COLLISION: hrr (default, sigma 0.95) or mrt.
+    // COLLISION: hrr (default) or mrt. SIGMA: the hybrid collision's sigma (default 0.95; 1.0 is the fully regularised collision).
     let mrt = std::env::var("COLLISION").is_ok_and(|v| v == "mrt");
+    let hrr_sigma = env("SIGMA", 0.95);
     let p = Procedure::Fluid {
         domain: "Flow".into(),
         end_time: None,
@@ -198,7 +199,7 @@ fn slotted_channel_stability() {
         time_step: Some(dt),
         frames: 2,
         magic: None,
-        sigma: if mrt { None } else { Some(HrrSigma::Value(0.95)) },
+        sigma: if mrt { None } else { Some(HrrSigma::Value(hrr_sigma)) },
         collision: Some(if mrt { Collision::Mrt } else { Collision::Hrr }),
         turbulence: sa,
         steady: None,
@@ -272,7 +273,7 @@ fn slotted_channel_stability() {
         "CASE wall law {law}; slot {cells} cells; grid {nx}x{ny}x{nz} = {n} cells; tau+-1/2 {:.3e}; tau- -1/2 {:.3e}; {}; dt {dt:.5} s; velocity scale {scale:.4} m/s; steps {steps}; chunk {chunk}; layer {}",
         setup.tau_plus - 0.5,
         setup.tau_minus - 0.5,
-        if mrt { "MRT (no sigma)" } else { "sigma 0.95 HRR" },
+        if mrt { "MRT (no sigma)" } else { "HRR (sigma per SIGMA, default 0.95)" },
         std::env::var("LAYER_CELLS").map_or("default 10 cells".to_string(), |c| format!("{c} cells = {:.4} m", c.parse::<f64>().unwrap_or(0.0) * dx))
     );
     if surface {
