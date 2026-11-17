@@ -112,6 +112,16 @@ fn the_f32_floor_holds_over_t1s_last_blocks() {
     assert!(f.ok(), "the f32 floor is not met: {f:?}");
 }
 
+/// T3's readings from its restart file (`FIELDCRAFT_STEP_RESTART`, `FIELDCRAFT_STEP_SPAN`, `FIELDCRAFT_STEP_CELLS_PER_H`,
+/// `FIELDCRAFT_STEP_INLET_TABLE` as the run had them), through the current reader: seconds.
+#[test]
+#[ignore = "local: needs T3's restart file"]
+fn t3_readings_from_its_restart_file() {
+    let file = std::path::PathBuf::from(std::env::var("FIELDCRAFT_STEP_RESTART").expect("FIELDCRAFT_STEP_RESTART"));
+    let span: f64 = std::env::var("FIELDCRAFT_STEP_SPAN").ok().and_then(|v| v.parse().ok()).unwrap_or(4.0);
+    println!("READINGS {}", ddes_backstep::t3_readings_of_restart(&file, span).expect("the restart's readings"));
+}
+
 /// T1 itself on the device: the full-domain RANS step (`FIELDCRAFT_STEP_CELLS_PER_H`, `_MAX_STEPS`, `_CHECKPOINT`,
 /// `_PROFILE`), whose restart file and inlet profile T1s starts from.
 #[test]

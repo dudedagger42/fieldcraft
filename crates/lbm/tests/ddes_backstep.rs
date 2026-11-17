@@ -1783,6 +1783,35 @@ fn the_floor_crossing_of_a_restart_file() {
     println!("the floor shear's sign change over the next 500 steps: {:?}", reattachment(&x, &per_area));
 }
 
+/// T3's whole-window readings from a T3 restart file (`span` as the run's): the stored samples replayed into the strips' block
+/// means (blocks of 30 H/U), the near-wall rows' sums read back, and [`Readings`] formed as the run forms them, with the
+/// current reader. Seconds, no stepping.
+pub(crate) fn t3_readings_of_restart(file: &std::path::Path, span: f64) -> Result<String, String> {
+    let rans = sa_rans();
+    let Turbulence::SpalartAllmaras { prandtl, wall_model, inflow_ratio, .. } = rans else { return Err("sa_rans is Spalart–Allmaras".into()) };
+    let base = sa_step_in(rans, true, span);
+    let h = base.spacing();
+    let zone = fieldcraft_model::DdesZone { min: [-1.0, -1.0, -h], max: [12.0, span + 1.0, 3.0] };
+    let ddes =
+        Turbulence::SpalartAllmaras { prandtl, wall_model, inflow_ratio, ddes: Some(fieldcraft_model::Ddes { c_des: 0.65, zone: Some(zone) }) };
+    let mut step = sa_step_in(ddes, true, span);
+    let h_over_u = (step.cells_per_h as f64 / step.lattice_velocity).round() as u64;
+    step.sample = 100;
+    step.block = (30 * h_over_u).div_ceil(100) as usize;
+    let (mut flow, strips, _) = step.build();
+    let (steps, samples, saved) = load_all(file, &mut flow);
+    let mut window = Window::new(&flow, &step);
+    window.restore(&saved);
+    let mut shear = Shear::new(strips.len(), step.block);
+    samples.iter().for_each(|s| {
+        shear.push(s);
+    });
+    let floor_x: Vec<f64> = strips.iter().filter(|s| s.floor).map(|s| 0.5 * (s.x.0 + s.x.1)).collect();
+    let floor: Vec<f64> = strips.iter().zip(shear.mean()).filter(|(s, _)| s.floor).map(|(_, t)| t).collect();
+    let readings = Readings::of(&floor_x, &floor, &window.floor);
+    Ok(format!("{} at step {steps}, {} shear samples in {} blocks: {readings}", file.display(), samples.len(), shear.blocks()))
+}
+
 /// The first completed block at which the running mean x_r differs by under 0.5 % from its value
 /// at the block a fifth of the steps earlier: `(step, wall seconds, x_r, x_r a fifth earlier)`.
 /// `history` holds `(step, wall seconds, running mean x_r)` per block.
