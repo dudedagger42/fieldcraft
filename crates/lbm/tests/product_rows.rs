@@ -5,7 +5,7 @@
 //! The walls are interpolated (linear) on the CPU flow; the mass correction is off. SA is on where tau - 1/2 is below 5e-3.
 //!
 //! Environment: `COLLISION` = `hrr` (default) or `mrt`; `SIGMA` (default 0.95) is the hybrid collision's sigma (1.0 may be refused by the setup: the row then prints REFUSED); `TAU_MINUS_HALF` (default 5e-3: lattice viscosity is a
-//! third of it); `SCAN_STEPS` caps a row's steps (default four times its minimum). A row runs at least 1.5 W² / (tau - 1/2)
+//! third of it); `SA_SEED` (default 3.0) is SA's nu-tilde over nu at the start and at the inflows (0 starts the field at zero: the model's trivial solution); `U_LAT` (default 0.02) the exact mean speed in lattice units; `SCAN_STEPS` caps a row's steps (default four times its minimum). A row runs at least 1.5 W² / (tau - 1/2)
 //! steps (W the width in cells) and then until the flow rate changes by under 0.05 % over the last third of the run, or the cap.
 //!
 //! `COLLISION=hrr TAU_MINUS_HALF=5e-3 cargo test --release -p fieldcraft-lbm --test product_rows -- --ignored --nocapture product_rows`
@@ -21,7 +21,10 @@ use fieldcraft_lbm::interpolated::WallOrder;
 use fieldcraft_lbm::{Limits, Obstacle, Setup};
 use fieldcraft_model::{Collision, FaceCondition, HrrSigma, Procedure, Turbulence};
 
-const U_LAT: f64 = 0.02;
+/// The exact mean speed in lattice units: the force, and the reference the flow rate is read against, follow it (`U_LAT`, default 0.02).
+fn u_lat() -> f64 {
+    env("U_LAT", 0.02)
+}
 const PERIODIC: FaceCondition = FaceCondition::Periodic {};
 
 fn env(name: &str, default: f64) -> f64 {
@@ -58,7 +61,7 @@ fn build(duct: bool, w: usize, nu_lat: f64, mrt: bool, hrr_sigma: f64) -> Result
     }
     d.obstacles = obstacles.iter().map(|o| o.body.clone()).collect();
     // the body force that gives the exact mean speed U_LAT (plane channel: 12 nu U / H^2; duct: U nu / (c H^2), c from the series)
-    let g_lat = if duct { U_LAT * nu_lat / (duct_coefficient() * wf * wf) } else { 12.0 * nu_lat * U_LAT / (wf * wf) };
+    let g_lat = if duct { u_lat() * nu_lat / (duct_coefficient() * wf * wf) } else { 12.0 * nu_lat * u_lat() / (wf * wf) };
     d.acceleration = [g_lat * dx / (dt * dt), 0.0, 0.0];
     let mut p = collide(1e6 * dt, dt, None, if mrt { Collision::Mrt } else { Collision::Hrr });
     if let Procedure::Fluid { sigma, turbulence, .. } = &mut p {
@@ -67,13 +70,13 @@ fn build(duct: bool, w: usize, nu_lat: f64, mrt: bool, hrr_sigma: f64) -> Result
         }
         // SA below tau - 1/2 = 5e-3 (the setup refuses a no-model run there), idle if its eddy viscosity stays negligible
         if nu_lat * 3.0 < 5e-3 - 1e-12 {
-            *turbulence = Some(Turbulence::SpalartAllmaras { prandtl: 0.9, wall_model: None, inflow_ratio: 3.0, ddes: None });
+            *turbulence = Some(Turbulence::SpalartAllmaras { prandtl: 0.9, wall_model: None, inflow_ratio: env("SA_SEED", 3.0), ddes: None });
         }
     }
     let m = model(1.0, 1.0, d, p);
     let setup = Setup::new(&m, None, &obstacles, &Limits::default()).map_err(|e| format!("{e}"))?;
     // the flow rate reference per column of cells along x: the channel's width times the mean speed, or the duct's area times it
-    let (along, reference) = if duct { (hi_cells(hi[0], dx) * 1.0, U_LAT * wf * wf) } else { (hi_cells(hi[0], dx) * 4.0, U_LAT * wf) };
+    let (along, reference) = if duct { (hi_cells(hi[0], dx) * 1.0, u_lat() * wf * wf) } else { (hi_cells(hi[0], dx) * 4.0, u_lat() * wf) };
     Ok((setup, obstacles, [0.0; 3], along, reference))
 }
 
@@ -126,6 +129,7 @@ fn product_rows() {
             let mut drift_last_third = f64::NAN;
             let mut rho = rho0;
             while done < cap {
+                let chunk = chunk.min(cap - done);
                 if Backend::advance(&mut flow, chunk).is_err() {
                     println!("PRODUCT collision {label} tau-1/2 {tau_mh:e} case {name} cells {w}: STOPPED by the backend at step {done}");
                     break;
@@ -156,7 +160,9 @@ fn product_rows() {
             let last = hist.last().map_or(f64::NAN, |h| h.1);
             let third = hist.iter().rev().find(|(s, _)| *s <= done * 2 / 3).map_or(f64::NAN, |h| h.1);
             println!(
-                "PRODUCT collision {label} tau-1/2 {tau_mh:e} case {name} cells {w} steps {done} (minimum {min_steps}, cap {cap}): flow-rate error {:+.4} % (at 2/3 of the run {:+.4} %), change over the last third {:.4} % ({}), mean-density drift {:+.3e} per 10000 steps, largest nu_t/nu {max_ratio:.3e}{}",
+                "PRODUCT collision {label} tau-1/2 {tau_mh:e} U_LAT {} SA_SEED {} case {name} cells {w} steps {done} (minimum {min_steps}, cap {cap}): flow-rate error {:+.4} % (at 2/3 of the run {:+.4} %), change over the last third {:.4} % ({}), mean-density drift {:+.3e} per 10000 steps, largest nu_t/nu {max_ratio:.3e}{}",
+                u_lat(),
+                env("SA_SEED", 3.0),
                 100.0 * last,
                 100.0 * third,
                 100.0 * drift_last_third,
