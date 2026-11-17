@@ -63,6 +63,9 @@ fn run(arm: Arm, tau_minus_half: f64, q: f64, steps: usize) -> Outcome {
         Ok(f) => f,
         Err(_) => return Outcome::Refused("setup refused".into()),
     };
+    if std::env::var_os("SCAN_MASS").is_some() {
+        flow.set_wall_mass_correction(true).unwrap_or_else(|e| panic!("mass correction: {e}"));
+    }
     let grid = *flow.grid();
     let fluid: Vec<usize> = (0..grid.len()).filter(|&c| flow.is_fluid(c)).collect();
     let probe = |flow: &fieldcraft_lbm::flow::Flow| -> (f64, f64, usize) {
@@ -128,6 +131,7 @@ fn the_stability_arms() {
             halfway_above_half: false,
         },
         Arm { name: "HRR 0.95, half-way walls", collision: Collision::Hrr, sigma: Some(0.95), walls: WallTreatment::Halfway, halfway_above_half: false },
+        Arm { name: "regularised, quadratic", collision: Collision::Regularized, sigma: None, walls: WallTreatment::InterpolatedQuadratic, halfway_above_half: false },
         Arm {
             name: "MRT, quadratic",
             collision: Collision::Mrt,
@@ -137,7 +141,7 @@ fn the_stability_arms() {
         },
     ];
     let only = std::env::var("SCAN_ONLY").unwrap_or_default();
-    for arm in arms.into_iter().filter(|a| a.name.contains(only.as_str()) && !a.halfway_above_half) {
+    for arm in arms.into_iter().filter(|a| (only.is_empty() || only.split(';').any(|o| a.name.contains(o))) && !a.halfway_above_half) {
         for q in [0.75, 0.25] {
             let row: Vec<String> = taus
                 .iter()
