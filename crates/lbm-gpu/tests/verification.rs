@@ -67,7 +67,7 @@ impl DerefMut for Gpu {
 fn gpu(flow: &Flow, streaming: Streaming) -> Option<Gpu> {
     let policy = Policy::from_env().expect("FIELDCRAFT_GPU names a policy");
     let turn = turn();
-    match GpuFlow::with_options(flow, policy, Options { streaming, profile: false }) {
+    match GpuFlow::with_options(flow, policy, Options { streaming, profile: false, ..Options::default() }) {
         Ok(g) => {
             println!("GPU: {} ({streaming:?})", g.adapter_name());
             Some(Gpu { flow: g, _turn: turn })
@@ -568,7 +568,7 @@ fn concurrent_solves_on_the_shared_device_read_back() {
         let handles: Vec<_> = (0..4)
             .map(|_| {
                 scope.spawn(|| {
-                    let mut g = match GpuFlow::with_options(&flow, policy, Options { streaming: Streaming::InPlace, profile: false }) {
+                    let mut g = match GpuFlow::with_options(&flow, policy, Options { streaming: Streaming::InPlace, profile: false, ..Options::default() }) {
                         Ok(g) => g,
                         Err(e) if !gpu_required() && e.to_string().contains("no GPU device") => return None,
                         Err(e) => return Some(Err(e.to_string())),
