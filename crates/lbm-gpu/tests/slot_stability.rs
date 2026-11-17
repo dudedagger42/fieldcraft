@@ -222,6 +222,11 @@ fn slotted_channel_stability() {
     let wall_sigma1 = env("WALL_SIGMA1", 0.0) as u8;
     cpu.set_wall_layer_sigma_one(wall_sigma1);
     println!("CASE WALL_SIGMA1 {wall_sigma1}");
+    // WALL_MRT (default 0, off; CPU only, bit-identical off): the MRT collision in the wall-layer cells (a solid cell on an axis neighbour),
+    // the hybrid collision elsewhere.
+    let wall_mrt = env("WALL_MRT", 0.0) > 0.5;
+    cpu.set_wall_layer_mrt(wall_mrt);
+    println!("CASE WALL_MRT {wall_mrt}");
     // INTERP=1: the plates' links interpolate where the surface crosses them (QUAD=1 quadratic, else linear), MASSFIX 0 off, 1 local,
     // 2 spread (default 2); CPU only. FORCE_HALF_ABOVE=q (0 off): every link of q above it keeps the half-way rule (a diagnostic of where
     // an instability lives, not a scheme; needs the library switch).
