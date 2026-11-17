@@ -2084,6 +2084,89 @@ impl Flow {
         self.outlets = Outlets::new(&self.open, &View { flow: self, f: &self.f });
     }
 
+    /// The net mass flux, in lattice units per step, through the plane between the cell layers `plane - 1` and `plane` of `axis`, in the
+    /// direction of `+axis`, summed from the populations that crossed it in the last streaming: the links `f_q c_q·n` of the populations
+    /// now at the cells of layer `plane` (`c_q·n = +1`, they came from layer `plane - 1`) less those at the cells of layer `plane - 1`
+    /// (`c_q·n = -1`, they came from layer `plane`), each counted at its arrival cell. A link whose source cell is not a fluid cell
+    /// (a bounced-back population) did not cross and is skipped.
+    ///
+    /// `cells` restricts the sum to arrival cells whose flag is set (indexed like the grid; `None`: all). A periodic axis accepts
+    /// `plane` in `0..n` (0 is the seam between layer `n - 1` and layer 0), a non-periodic one `1..n`. The cells are summed in index
+    /// order, so the result is the same on every platform. This is the flux through the plane of the lattice, from the links that
+    /// crossed it; in a flow uniform along the axis it equals the plane's `sum rho u` of [`Flow::moments`], and in general it is what
+    /// the plane carries, which the cell-centred sum of a layer does not see.
+    pub fn population_flux(&self, axis: usize, plane: usize, cells: Option<&[bool]>) -> Result<f64> {
+        let n = *self.grid.cells.get(axis).ok_or_else(|| Error::Invalid(format!("population_flux: axis {axis} is not 0, 1 or 2")))?;
+        let periodic = self.periodic.get(axis).copied().unwrap_or(false);
+        let (low, high) = match (plane, periodic) {
+            (p, _) if p >= n => return Err(Error::Invalid(format!("population_flux: plane {plane} is outside the {n} layers of axis {axis}"))),
+            (0, true) => (n - 1, 0),
+            (0, false) => {
+                return Err(Error::Invalid("population_flux: plane 0 of a non-periodic axis is a face of the domain; use open_face_flux".into()));
+            }
+            (p, _) => (p - 1, p),
+        };
+        if let Some(m) = cells
+            && m.len() != self.grid.len()
+        {
+            return Err(Error::Invalid(format!("population_flux: the cell mask has {} entries, the grid {} cells", m.len(), self.grid.len())));
+        }
+        let populated = self.populated();
+        let mut total = 0.0;
+        for (layer, sign) in [(high, 1i32), (low, -1i32)] {
+            for c in 0..self.grid.len() {
+                let p = self.grid.coords(c);
+                if p.get(axis).copied() != Some(layer)
+                    || !populated.get(c).copied().unwrap_or(false)
+                    || !cells.is_none_or(|m| m.get(c).copied().unwrap_or(false))
+                {
+                    continue;
+                }
+                for q in 0..Q {
+                    let cq = C.get(q).copied().unwrap_or([0; 3]);
+                    if cq.get(axis).copied() != Some(sign) {
+                        continue;
+                    }
+                    // the link's source cell, a step back along c_q (periodic axes wrap)
+                    let mut src = p;
+                    let mut inside = true;
+                    for a in 0..3 {
+                        let na = self.grid.cells.get(a).copied().unwrap_or(1) as i64;
+                        let v = p.get(a).copied().unwrap_or(0) as i64 - i64::from(cq.get(a).copied().unwrap_or(0));
+                        let v = match (v, self.periodic.get(a).copied().unwrap_or(false)) {
+                            (v, _) if (0..na).contains(&v) => v,
+                            (v, true) => v.rem_euclid(na.max(1)),
+                            _ => {
+                                inside = false;
+                                0
+                            }
+                        };
+                        if let Some(slot) = src.get_mut(a) {
+                            *slot = v as usize;
+                        }
+                    }
+                    if !inside || !populated.get(self.grid.index(src)).copied().unwrap_or(false) {
+                        continue;
+                    }
+                    total += f64::from(sign) * self.f.get(q * self.stride + c).copied().unwrap_or(0.0);
+                }
+            }
+        }
+        Ok(total)
+    }
+
+    /// The flux through a face of the domain, taken one cell inside it (the plane between layers 0 and 1 for the low face, between
+    /// `n - 2` and `n - 1` for the high one), in the direction of `+axis`: the populations that left a boundary layer are not kept,
+    /// so the face's flux is read at the first plane the populations cross. In a steady state without sources or sinks in the
+    /// layer it is the face's flux. See [`Flow::population_flux`].
+    pub fn open_face_flux(&self, axis: usize, high: bool, cells: Option<&[bool]>) -> Result<f64> {
+        let n = *self.grid.cells.get(axis).ok_or_else(|| Error::Invalid(format!("open_face_flux: axis {axis} is not 0, 1 or 2")))?;
+        if n < 2 {
+            return Err(Error::Invalid(format!("open_face_flux: axis {axis} has {n} layer")));
+        }
+        self.population_flux(axis, if high { n - 1 } else { 1 }, cells)
+    }
+
     /// The density and velocity of a cell (lattice units), or `None` for a solid cell.
     pub fn moments(&self, cell: usize) -> Option<(f64, [f64; 3])> {
         if !self.populated().get(cell).copied().unwrap_or(false) {
