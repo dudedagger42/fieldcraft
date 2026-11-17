@@ -65,7 +65,7 @@ pub(crate) static DEVICE: std::sync::OnceLock<DeviceFactory> = std::sync::OnceLo
 /// The device's density, velocity and ν̃ set in the CPU flow (equilibrium populations at that state).
 fn mirror(flow: &mut Flow, device: &mut dyn Backend, for_save: bool) -> Result<(), String> {
     let f = device.fields().map_err(|e| format!("device fields: {e}"))?;
-    flow.set_equilibrium(|c| match (f.density.get(c), f.velocity.get(c)) {
+    flow.set_equilibrium_parallel(|c| match (f.density.get(c), f.velocity.get(c)) {
         (Some(r), Some(u)) if r.is_finite() && *r > 0.0 && u.iter().all(|v| v.is_finite()) => (*r, *u),
         _ => (1.0, [0.0; 3]),
     });
@@ -2126,6 +2126,35 @@ fn seed_disturbance(flow: &mut Flow, amplitude: f64, lattice_velocity: f64) {
         None => (1.0, [0.0; 3]),
     });
     println!("T3b: seeded {count} cells with a random velocity of {amplitude} of the lattice speed, means removed");
+}
+
+/// The parallel `set_equilibrium` (what the mirror of a device run uses) gives every population of every cell bit for
+/// bit the serial one's, with the DDES and wall-model flow of the study and a state that varies cell to cell (some cells
+/// non-finite, as a device's can be); prints both times.
+#[test]
+fn the_parallel_set_equilibrium_is_bit_identical_to_the_serial_one() {
+    let (mut a, _, _) = sa_step_in(sa_rans(), true, 1.0).build();
+    let (mut b, _, _) = sa_step_in(sa_rans(), true, 1.0).build();
+    let state = |c: usize| {
+        let x = c as f64;
+        if c.is_multiple_of(997) {
+            (1.0, [0.0; 3])
+        } else {
+            (1.0 + 1e-3 * (x * 0.37).sin(), [0.05 * (x * 0.11).cos(), 0.01 * (x * 0.23).sin(), 0.02 * (x * 0.07).cos()])
+        }
+    };
+    let t = std::time::Instant::now();
+    a.set_equilibrium(state);
+    let serial = t.elapsed().as_secs_f64();
+    let t = std::time::Instant::now();
+    b.set_equilibrium_parallel(state);
+    let parallel = t.elapsed().as_secs_f64();
+    println!("set_equilibrium over {} cells: serial {serial:.3} s, parallel {parallel:.3} s ({:.1}x)", a.grid().len(), serial / parallel);
+    for q in 0..19 {
+        for c in 0..a.grid().len() {
+            assert_eq!(a.population(q, c).to_bits(), b.population(q, c).to_bits(), "population {q} of cell {c}");
+        }
+    }
 }
 
 /// The incoming boundary layer at x = −4 H as a table, one line per row from the first fluid row

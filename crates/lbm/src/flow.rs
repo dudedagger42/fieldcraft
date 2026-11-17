@@ -2508,33 +2508,69 @@ impl Flow {
         self.f.get(q * self.stride + cell).copied().unwrap_or(0.0)
     }
 
+    /// Whether `set_equilibrium` fills `cell`: every fluid cell, the boundary nodes of the on-node bounce included; not a gas cell.
+    fn equilibrium_cell_populated(&self, cell: usize) -> bool {
+        self.surface.as_ref().map_or(self.fluid.get(cell).copied().unwrap_or(false), |s| s.active.get(cell).copied().unwrap_or(false))
+    }
+
+    /// The populations `set_equilibrium` gives `cell` at density `rho` and velocity `u` (as defined with the half force).
+    fn equilibrium_populations(&self, cell: usize, rho: f64, u: [f64; 3]) -> [f64; Q] {
+        let a = self.force_at(cell);
+        let mut force = a.map(|c| rho * c);
+        if let Some(z) = cell_action(self.action_at(cell), self.liquid_fraction(cell)) {
+            let speed = (u[0] * u[0] + u[1] * u[1] + u[2] * u[2]).sqrt();
+            for k in 0..3 {
+                force[k] += z.push[k] - rho * (z.alpha + z.beta * speed) * u[k];
+            }
+        }
+        let bare = [0, 1, 2].map(|k| u[k] - 0.5 * force[k] / rho);
+        std::array::from_fn(|q| equilibrium(q, rho, bare))
+    }
+
     /// Set every fluid cell to the equilibrium of `state(cell) = (density, velocity)` in lattice
     /// units (velocity as defined with the half force).
     pub fn set_equilibrium(&mut self, state: impl Fn(usize) -> (f64, [f64; 3])) {
-        let n = self.n;
         let s = self.stride;
-        // every fluid cell, the boundary nodes of the on-node bounce included; not a gas cell
-        let populated = |cell: usize| {
-            self.surface.as_ref().map_or(self.fluid.get(cell).copied().unwrap_or(false), |s| s.active.get(cell).copied().unwrap_or(false))
-        };
-        for cell in 0..n {
-            if !populated(cell) {
+        for cell in 0..self.n {
+            if !self.equilibrium_cell_populated(cell) {
                 continue;
             }
             let (rho, u) = state(cell);
-            let a = self.force_at(cell);
-            let mut force = a.map(|c| rho * c);
-            if let Some(z) = cell_action(self.action_at(cell), self.liquid_fraction(cell)) {
-                let speed = (u[0] * u[0] + u[1] * u[1] + u[2] * u[2]).sqrt();
-                for k in 0..3 {
-                    force[k] += z.push[k] - rho * (z.alpha + z.beta * speed) * u[k];
-                }
-            }
-            let bare = [0, 1, 2].map(|k| u[k] - 0.5 * force[k] / rho);
-            for q in 0..Q {
-                self.f[q * s + cell] = equilibrium(q, rho, bare);
+            let populations = self.equilibrium_populations(cell, rho, u);
+            for (q, p) in populations.iter().enumerate() {
+                self.f[q * s + cell] = *p;
             }
         }
+        self.outlets = Outlets::new(&self.open, &View { flow: self, f: &self.f });
+    }
+
+    /// [`Flow::set_equilibrium`] with the cells in blocks on the threads: each cell is independent, so the populations are
+    /// bit for bit those of the serial version whatever the number of threads. `state` must be `Sync`.
+    pub fn set_equilibrium_parallel(&mut self, state: impl Fn(usize) -> (f64, [f64; 3]) + Sync) {
+        let (n, s) = (self.n, self.stride);
+        // The populations leave `self` while the cells are filled (a cell's force and zone action read `self`).
+        let mut f = std::mem::take(&mut self.f);
+        {
+            let flow: &Flow = self;
+            let mut blocks = cell_blocks(&mut f, s, n, OPEN_BLOCK);
+            parallel::for_each_mut(&mut blocks, |b, g| {
+                let len = g.first().map_or(0, |d| d.len());
+                for i in 0..len {
+                    let cell = b * OPEN_BLOCK + i;
+                    if !flow.equilibrium_cell_populated(cell) {
+                        continue;
+                    }
+                    let (rho, u) = state(cell);
+                    let populations = flow.equilibrium_populations(cell, rho, u);
+                    for (q, p) in populations.iter().enumerate() {
+                        if let Some(slot) = g.get_mut(q).and_then(|d| d.get_mut(i)) {
+                            *slot = *p;
+                        }
+                    }
+                }
+            });
+        }
+        self.f = f;
         self.outlets = Outlets::new(&self.open, &View { flow: self, f: &self.f });
     }
 
