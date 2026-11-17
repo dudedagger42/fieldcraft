@@ -2412,6 +2412,16 @@ impl Flow {
         self.wall_gradient = on;
     }
 
+    /// Whether the wall-aware strain gradient study is on ([`Flow::set_wall_aware_gradient`]).
+    pub fn wall_aware_gradient(&self) -> bool {
+        self.wall_gradient
+    }
+
+    /// The mode [`Flow::set_wall_layer_sigma_one`] set (0 off).
+    pub fn wall_layer_sigma_one(&self) -> u8 {
+        self.wall_layer_sigma_one
+    }
+
     /// A study: 1 sets σ = 1 in every cell with a solid neighbour along an axis, 2 sets σ = 1 in every other cell, 0 neither.
     pub fn set_wall_layer_sigma_one(&mut self, mode: u8) {
         self.wall_layer_sigma_one = mode;
