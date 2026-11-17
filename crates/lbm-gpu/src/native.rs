@@ -219,6 +219,8 @@ pub struct GpuFlow {
     wall_count: usize,
     /// The interpolated walls' mass correction runs after every step's links.
     wall_mass: bool,
+    /// What the mass correction's mode resolved to on the flow this one was made from.
+    wall_mass_choice: Option<fieldcraft_lbm::WallMassChoice>,
     /// Its per-cell shares (x) and gate (y), the wall nodes' cells with their weight sums, and the
     /// dispatch over the nodes.
     wall_shares: wgpu::Buffer,
@@ -1325,6 +1327,7 @@ impl GpuFlow {
             walls: walls_buf,
             wall_count,
             wall_mass,
+            wall_mass_choice: flow.wall_mass_choice().cloned(),
             wall_node_groups: groups(wall_nodes.len())?,
             wall_nodes,
             wall_shares,
@@ -1691,6 +1694,10 @@ impl GpuFlow {
 }
 
 impl Backend for GpuFlow {
+    fn wall_mass_choice(&self) -> Option<fieldcraft_lbm::WallMassChoice> {
+        self.wall_mass_choice.clone()
+    }
+
     fn eddy_viscosity_ratio(&self) -> f64 {
         self.eddy_ratio
     }

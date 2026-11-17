@@ -380,6 +380,24 @@ fn the_walls_mass_correction_matches_the_cpu_and_holds_the_mass() {
     }
 }
 
+/// A flow starts in the automatic mode of the walls' mass correction: the device takes the CPU flow's choice (ON or OFF with its
+/// reason), and where the choice is ON the correction runs there (a pending-mass readout exists and is finite).
+#[test]
+fn the_automatic_choice_of_the_mass_correction_reaches_the_device() {
+    for walls in [WallTreatment::Interpolated, WallTreatment::InterpolatedQuadratic] {
+        for (collision, streaming) in cases() {
+            let (setup, flow) = sphere_flow(collision, walls, None);
+            let chosen = flow.wall_mass_choice().cloned().expect("a flow with interpolated walls says what it chose");
+            assert_eq!(chosen.on, flow.wall_mass().is_some(), "{chosen:?}");
+            let Some((_cpu, gpu)) = both(&setup, flow, streaming) else { continue };
+            assert_eq!(Backend::wall_mass_choice(&*gpu), Some(chosen.clone()), "{walls:?} {collision:?}");
+            if chosen.on {
+                assert!(gpu.wall_mass_pending().expect("the correction runs on the device").is_finite(), "{walls:?} {collision:?}");
+            }
+        }
+    }
+}
+
 /// Halfway walls, the default, stay halfway on the GPU: no link interpolates, and the sphere's
 /// GPU drag is the CPU's halfway drag within the tolerance, which interpolated walls move by
 /// far more than it (so the check tells the two apart).
