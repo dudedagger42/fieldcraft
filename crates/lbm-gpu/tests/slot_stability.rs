@@ -217,6 +217,11 @@ fn slotted_channel_stability() {
         }
     };
     let mut cpu = fieldcraft_lbm::Flow::new(&setup, &obstacles).unwrap();
+    // WALL_SIGMA1 (default 0, off; CPU only): sigma = 1 in cells with a solid axis neighbour (1, the N = 2 rule), the complement (2) or
+    // within two cells (3); a study of the hybrid collision's wall layer.
+    let wall_sigma1 = env("WALL_SIGMA1", 0.0) as u8;
+    cpu.set_wall_layer_sigma_one(wall_sigma1);
+    println!("CASE WALL_SIGMA1 {wall_sigma1}");
     // INTERP=1: the plates' links interpolate where the surface crosses them (QUAD=1 quadratic, else linear), MASSFIX 0 off, 1 local,
     // 2 spread (default 2); CPU only. FORCE_HALF_ABOVE=q (0 off): every link of q above it keeps the half-way rule (a diagnostic of where
     // an instability lives, not a scheme; needs the library switch).
