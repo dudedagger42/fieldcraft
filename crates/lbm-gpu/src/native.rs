@@ -31,6 +31,8 @@ const OUTLET: usize = fieldcraft_lbm::memory::DEVICE_OUTLET_WORDS;
 const NODE: u32 = 2;
 /// The flag bit of a fluid cell in the wall layer (lbm.wgsl `LAYER_BIT`).
 const LAYER_BIT: u32 = 1 << 31;
+/// The flag bit of a fluid cell with three or more solid axis faces (lbm.wgsl `CORNER_BIT`).
+const CORNER_BIT: u32 = 1 << 30;
 /// The floats of one wall model wall cell in `walls`: four rows (lbm.wgsl).
 const WALL_ROW: usize = 16;
 /// The scalar lattice's directions (the first seven of D3Q19) and weights.
@@ -696,6 +698,8 @@ struct Variant {
     wall_sigma1: bool,
     /// The study knob WALL_MRT: MRT in the wall layer.
     wall_mrt: bool,
+    /// The study knob WALL_CORNER: full relaxation to equilibrium in cells with three or more solid axis faces.
+    wall_corner: bool,
     /// Fans or porous zones.
     zones: bool,
     /// The Spalart–Allmaras model.
@@ -752,6 +756,7 @@ fn compile(device: &wgpu::Device, variant: Variant) -> Result<Kernels> {
                     ("DYNAMIC", if variant.dynamic { 1.0 } else { 0.0 }),
                     ("WALL_SIGMA1", if variant.wall_sigma1 { 1.0 } else { 0.0 }),
                     ("WALL_MRT", if variant.wall_mrt { 1.0 } else { 0.0 }),
+                    ("WALL_CORNER", if variant.wall_corner { 1.0 } else { 0.0 }),
                     ("ZONES", if variant.zones { 1.0 } else { 0.0 }),
                     ("SA", if variant.sa { 1.0 } else { 0.0 }),
                     ("MAX_SPEED", MAX_LATTICE_SPEED),
@@ -1011,7 +1016,7 @@ impl GpuFlow {
                 let Some(second) = second else { continue };
                 let row = u32::try_from(wall_rows.len() / WALL_ROW + 1)
                     .ok()
-                    .filter(|r| *r < 1 << 30)
+                    .filter(|r| *r < 1 << 29)
                     .ok_or_else(|| Error::Limit("too many wall cells for the GPU's flags".into()))?;
                 let second = u32::try_from(second).map_err(|_| Error::Limit("too many cells for the GPU solver".into()))?;
                 if let Some(u) = fluid_u32.get_mut(cell) {
@@ -1315,6 +1320,11 @@ impl GpuFlow {
                 "not supported yet: WALL_MRT without the hybrid collision (sigma below 1) on the GPU; solve on the CPU".into(),
             ));
         }
+        if flow.wall_corner_relax() && hybrid.is_none() {
+            return Err(Error::Invalid(
+                "not supported yet: the corner study (WALL_CORNER) without the hybrid collision (sigma below 1) on the GPU; solve on the CPU".into(),
+            ));
+        }
         let fixed_sigma = match hybrid {
             Some(HrrSigma::Value(s)) => s,
             _ => 1.0,
@@ -1378,8 +1388,8 @@ impl GpuFlow {
         });
         // The WALL_MRT study's wall layer, marked once here: a fluid cell with a solid axis neighbour (a step out of a
         // non-periodic box is not solid) carries `LAYER_BIT`, which the kernel reads instead of probing six neighbours.
-        if hybrid.is_some() && flow.wall_layer_mrt() {
-            mark_wall_layer(flow.grid(), flow.periodic(), on_node, &mut fluid_u32);
+        if hybrid.is_some() && (flow.wall_layer_mrt() || flow.wall_corner_relax()) {
+            mark_wall_flags(flow.grid(), flow.periodic(), on_node, &mut fluid_u32, flow.wall_layer_mrt(), flow.wall_corner_relax());
         }
         let fluid_buf = storage("lbm fluid", &bytes_u32(&fluid_u32));
         let walls_buf = storage("lbm walls", &bytes_f32(&wall_rows));
@@ -1480,6 +1490,7 @@ impl GpuFlow {
             dynamic: hybrid == Some(HrrSigma::Dynamic),
             wall_sigma1: hybrid.is_some() && flow.wall_layer_sigma_one() == 1,
             wall_mrt: hybrid.is_some() && flow.wall_layer_mrt(),
+            wall_corner: hybrid.is_some() && flow.wall_corner_relax(),
             zones: zones.zones > 0,
             sa: sa_faces.is_some(),
         })?;
@@ -2321,36 +2332,46 @@ impl Backend for GpuFlow {
     }
 }
 
-/// Sets `LAYER_BIT` on every fluid cell that has a solid cell beside it along an axis (the kernel's `is_fluid`: bit 0 under
-/// the on-node bounce, any flag otherwise). The flags are read before any is set, so the marks never feed each other.
-fn mark_wall_layer(grid: &fieldcraft_lbm::voxel::Grid, periodic: [bool; 3], on_node: bool, flags: &mut [u32]) {
+/// Sets `LAYER_BIT` (with `layer`) on every fluid cell that has a solid cell beside it along an axis, and `CORNER_BIT` (with `corner`)
+/// on every fluid cell with three or more solid axis faces (the kernel's `is_fluid`: bit 0 under the on-node bounce, any flag
+/// otherwise; a step out of a non-periodic box is not solid). The flags are read before any is set, so the marks never feed each other.
+fn mark_wall_flags(grid: &fieldcraft_lbm::voxel::Grid, periodic: [bool; 3], on_node: bool, flags: &mut [u32], layer: bool, corner: bool) {
     let solid_word = |w: u32| if on_node { w & 1 == 0 } else { w == 0 };
-    let marks: Vec<usize> = (0..grid.len().min(flags.len()))
+    let faces_of = |c: usize| -> usize {
+        let p = grid.coords(c);
+        let mut faces = 0;
+        for axis in 0..3 {
+            for up in [false, true] {
+                let mut q = p;
+                let n = grid.cells.get(axis).copied().unwrap_or(1);
+                let v = match (q.get(axis).copied().unwrap_or(0), up) {
+                    (x, true) if x + 1 < n => x + 1,
+                    (_, true) if periodic.get(axis).copied().unwrap_or(false) => 0,
+                    (x, false) if x > 0 => x - 1,
+                    (_, false) if periodic.get(axis).copied().unwrap_or(false) => n.saturating_sub(1),
+                    _ => continue,
+                };
+                if let Some(slot) = q.get_mut(axis) {
+                    *slot = v;
+                }
+                if flags.get(grid.index(q)).is_some_and(|w| solid_word(*w)) {
+                    faces += 1;
+                }
+            }
+        }
+        faces
+    };
+    let marks: Vec<(usize, u32)> = (0..grid.len().min(flags.len()))
         .filter(|&c| flags.get(c).is_some_and(|w| !solid_word(*w)))
-        .filter(|&c| {
-            let p = grid.coords(c);
-            (0..3).any(|axis| {
-                [false, true].iter().any(|&up| {
-                    let mut q = p;
-                    let n = grid.cells.get(axis).copied().unwrap_or(1);
-                    let v = match (q.get(axis).copied().unwrap_or(0), up) {
-                        (x, true) if x + 1 < n => x + 1,
-                        (_, true) if periodic.get(axis).copied().unwrap_or(false) => 0,
-                        (x, false) if x > 0 => x - 1,
-                        (_, false) if periodic.get(axis).copied().unwrap_or(false) => n.saturating_sub(1),
-                        _ => return false,
-                    };
-                    if let Some(slot) = q.get_mut(axis) {
-                        *slot = v;
-                    }
-                    flags.get(grid.index(q)).is_some_and(|w| solid_word(*w))
-                })
-            })
+        .filter_map(|c| {
+            let faces = faces_of(c);
+            let bits = if layer && faces >= 1 { LAYER_BIT } else { 0 } | if corner && faces >= 3 { CORNER_BIT } else { 0 };
+            (bits != 0).then_some((c, bits))
         })
         .collect();
-    for c in marks {
+    for (c, bits) in marks {
         if let Some(w) = flags.get_mut(c) {
-            *w |= LAYER_BIT;
+            *w |= bits;
         }
     }
 }
@@ -2524,7 +2545,7 @@ mod tests {
                 *flag = 0;
             }
         }
-        mark_wall_layer(&grid, [true, false, true], false, &mut flags);
+        mark_wall_flags(&grid, [true, false, true], false, &mut flags, true, false);
         for (c, flag) in flags.iter().enumerate() {
             let y = grid.coords(c)[1];
             let want = if y == 0 || y == 4 {
@@ -2538,12 +2559,12 @@ mod tests {
         }
         // an open box edge is not solid
         let mut open = vec![1u32; grid.len()];
-        mark_wall_layer(&grid, [false; 3], false, &mut open);
+        mark_wall_flags(&grid, [false; 3], false, &mut open, true, false);
         assert!(open.iter().all(|w| *w == 1));
         // a solid cell beside the periodic seam is seen across it
         let mut seam = vec![1u32; grid.len()];
         seam[grid.index([2, 2, 0])] = 0;
-        mark_wall_layer(&grid, [true, false, false], false, &mut seam);
+        mark_wall_flags(&grid, [true, false, false], false, &mut seam, true, false);
         assert_eq!(seam[grid.index([0, 2, 0])], 1 | LAYER_BIT);
         assert_eq!(seam[grid.index([1, 2, 0])], 1 | LAYER_BIT);
         assert_eq!(seam[grid.index([0, 3, 0])], 1);

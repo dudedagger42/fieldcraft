@@ -165,6 +165,8 @@ fn parity(name: &str, case: Result<Case, String>) -> Result<(), String> {
     let mut cpu = fieldcraft_lbm::Flow::new(&case.setup, &case.obstacles).map_err(|e| e.to_string())?;
     let on = env("WALL_MRT", 1.0) != 0.0 && env("MRT_ALL", 0.0) == 0.0;
     cpu.set_wall_layer_mrt(on);
+    // WALL_CORNER=1: the corner study (cells with three or more solid axis faces relax to equilibrium), read by the device too
+    cpu.set_wall_corner_relax(env("WALL_CORNER", 0.0) != 0.0 && env("MRT_ALL", 0.0) == 0.0);
     let mut gpu = GpuFlow::with_options(&cpu, Policy::from_env().map_err(|e| e.to_string())?, Options::default()).map_err(|e| e.to_string())?;
     let (tol_u, tol_r) = (env("PARITY_DU", 2e-5), env("PARITY_DRHO", 1e-6));
     let chunk = env("PARITY_CHUNK", 250.0) as u64;

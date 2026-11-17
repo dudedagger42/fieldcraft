@@ -602,6 +602,8 @@ pub struct Flow {
     wall_layer_bulk: f64,
     /// A study (off): the wall layer collides with the two-relaxation-time MRT scheme instead of the regularised one.
     wall_layer_mrt: bool,
+    /// The corner study: fluid cells with three or more solid axis faces relax fully to equilibrium (see `set_wall_corner_relax`).
+    wall_corner_relax: bool,
     /// Whether σ is dynamic (set per cell from the subgrid model, [`crate::hrr`]), and then its
     /// smallest and mean value over the fluid cells in the last collision.
     dynamic: bool,
@@ -1429,6 +1431,7 @@ impl Flow {
             wall_layer_sigma_one: 0,
             wall_layer_bulk: 0.0,
             wall_layer_mrt: false,
+            wall_corner_relax: false,
             dynamic: setup.dynamic_sigma,
             sigma_stats: None,
             gradient_u: if setup.collision == Collision::Hrr || setup.vreman > 0.0 || setup.spalart_allmaras.is_some() {
@@ -1853,6 +1856,18 @@ impl Flow {
     /// The share the wall-layer density-mode study removes ([`Flow::set_wall_layer_bulk`]; 0 off).
     pub fn wall_layer_bulk(&self) -> f64 {
         self.wall_layer_bulk
+    }
+
+    /// A study (off by default, bit-identical off): a fluid cell with three or more solid axis faces (a concave corner) relaxes
+    /// fully to equilibrium each step (single relaxation at rate 1, Guo's half force kept) instead of its usual collision.
+    /// Cells with one or two solid faces (channel walls, duct edges) are not touched. Hybrid collision only.
+    pub fn set_wall_corner_relax(&mut self, on: bool) {
+        self.wall_corner_relax = on;
+    }
+
+    /// Whether the corner study is on ([`Flow::set_wall_corner_relax`]).
+    pub fn wall_corner_relax(&self) -> bool {
+        self.wall_corner_relax
     }
 
     /// The wall's distance from the cell centre the wall-aware gradient uses, in cells (default 0.5, half way): for studies.
@@ -2621,6 +2636,21 @@ impl Flow {
         } else {
             Vec::new()
         };
+        // The corner study's cells: fluid with three or more solid axis faces (empty when off).
+        let corner: Vec<bool> = if self.wall_corner_relax && regularized {
+            let solid = |c: usize| !self.fluid.get(c).copied().unwrap_or(true);
+            (0..self.grid.len())
+                .map(|c| {
+                    let p = self.grid.coords(c);
+                    let faces = (0..3)
+                        .map(|axis| [false, true].iter().filter(|&&up| across(&self.grid, self.periodic, p, axis, up).is_some_and(solid)).count())
+                        .sum::<usize>();
+                    !solid(c) && faces >= 3
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         // Dynamic σ's cap on the von Kármán length: the box's shortest extent in cells.
         let l_max = self.grid.cells.iter().copied().min().unwrap_or(1) as f64;
         let (wp, wm) = (self.omega_plus, self.omega_minus);
@@ -2767,6 +2797,17 @@ impl Flow {
                     1.0 / tau
                 };
                 let in_layer = layer.get(b * block + i).copied().unwrap_or(false);
+                // The corner study: full relaxation to equilibrium (rate 1; Guo's half force stays in the rebuild).
+                if regularized && corner.get(b * block + i).copied().unwrap_or(false) {
+                    if turbulent {
+                        eddy(from_rate(1.0));
+                    }
+                    crate::regularized::rebuild(&fq, rho, u, force, forced, None, &mut post, |_| 1.0);
+                    for (q, v) in post.iter().enumerate() {
+                        put(q, *v);
+                    }
+                    continue;
+                }
                 // The MRT study: the wall layer relaxes with MRT, at the rate the MRT branch below would use.
                 if regularized && wall_mrt && in_layer {
                     let rate = wall_rate.or(explicit).unwrap_or(wp);
@@ -3311,6 +3352,7 @@ impl crate::backend::Backend for Flow {
             wall_layer_sigma_one: _,
             wall_layer_bulk: _,
             wall_layer_mrt: _,
+            wall_corner_relax: _,
             dynamic,
             sigma_stats,
             periodic,
