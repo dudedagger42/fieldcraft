@@ -115,9 +115,10 @@ fn first_jump_back(hist: &[(u64, f64)]) -> Option<u64> {
     })
 }
 
-/// REVERSED: the |flow-rate error| fell, then rose again by more than 0.5 points above its running minimum (the run left the
-/// first branch). Returns the step and value (fraction) of the running minimum at the first such rise.
-fn reversed(hist: &[(u64, f64)]) -> Option<(u64, f64)> {
+/// LEFT LAMINAR: a run starts from rest and should approach the answer from one side, so the |flow-rate error| fell, then rose
+/// again by more than 0.05 points above its running minimum (the run left the first branch). Returns the step and value
+/// (fraction) of the running minimum, and the step of the chunk where the rise passed the tolerance.
+fn reversed(hist: &[(u64, f64)]) -> Option<(u64, f64, u64)> {
     let mut min = (0u64, f64::INFINITY);
     let first = hist.first()?.1.abs();
     for &(st, r) in hist {
@@ -125,8 +126,8 @@ fn reversed(hist: &[(u64, f64)]) -> Option<(u64, f64)> {
         if a < min.1 {
             min = (st, a);
         }
-        if min.1 < first && a > min.1 + 5e-3 {
-            return Some(min);
+        if min.1 < first && a > min.1 + 5e-4 {
+            return Some((min.0, min.1, st));
         }
     }
     None
@@ -223,7 +224,7 @@ fn product_rows() {
             } else if done < min_steps {
                 "below the minimum steps"
             } else if reversed(&hist).is_some() {
-                "NOT settled (left the first branch)"
+                "NOT settled (left laminar)"
             } else if last_jump.is_some() {
                 "NOT settled (jump)"
             } else if range_after(&hist, done * 2 / 3) >= 5e-4 {
@@ -234,8 +235,8 @@ fn product_rows() {
             let jumps = first_jump(&hist).map_or(String::new(), |j| format!(" [first JUMP at step {j}]"));
             let jumps = jumps + &first_jump_back(&hist).map_or(String::new(), |j| format!(" [first JUMP-BACK (5x the previous five) at step {j}]"));
             let jumps = jumps
-                + &reversed(&hist).map_or(String::new(), |(st, m)| {
-                    format!(" [REVERSED: |error| fell to {:.4} % at step {st}, final {:+.4} %]", 100.0 * m, 100.0 * last)
+                + &reversed(&hist).map_or(String::new(), |(st, m, at)| {
+                    format!(" [LEFT LAMINAR at step {at}: |error| had fallen to {:.4} % at step {st}, final {:+.4} %]", 100.0 * m, 100.0 * last)
                 });
             let range = 100.0 * range_after(&hist, done * 2 / 3);
             println!(
@@ -259,7 +260,7 @@ fn the_reversal_flag_fires_on_a_second_branch_and_not_on_a_smooth_run() {
     assert!(reversed(&smooth).is_none());
     let mut branch = smooth.clone();
     branch.extend((40..60).map(|i| (i * 100, -0.139)));
-    assert_eq!(reversed(&branch).map(|m| m.0), Some(3900));
+    assert_eq!(reversed(&branch).map(|m| (m.0, m.2)), Some((3900, 4000)));
     let rising: Vec<(u64, f64)> = (1..10).map(|i| (i * 100, 0.01 * i as f64)).collect();
     assert!(reversed(&rising).is_none(), "an error that only grows never decreased first");
 }
