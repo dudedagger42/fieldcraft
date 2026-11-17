@@ -110,6 +110,41 @@ pub fn gradient(u: [f64; 3], nb: &Neighbours) -> [[f64; 3]; 3] {
     })
 }
 
+/// The distance (in cells) from a cell's centre to the wall towards `-axis` and `+axis`, `[axis][up]`: `Some` where that
+/// neighbour is a solid cell (a wall between the two centres), `None` otherwise.
+pub type WallGaps = [[Option<f64>; 2]; 3];
+
+/// [`gradient`] with the walls in it: a velocity of 0 at the wall (a wall at rest), `gap` cells from the cell's centre along an
+/// axis whose neighbour on that side is solid. Per axis, with the fluid neighbour on the other side at one cell: the
+/// parabola through the wall point, the cell and that neighbour (exact for a quadratic profile); a wall on each side: the
+/// parabola through the two wall points and the cell; a wall and nothing on the other side (outside a face): the line from
+/// the wall point to the cell. Without a wall on an axis it is [`gradient`]'s rule (centred, one-sided, or 0).
+/// A gap of 0.5 is the half-way bounce-back wall. Not for moving walls.
+#[inline(always)]
+pub fn gradient_walled(u: [f64; 3], nb: &Neighbours, gaps: &WallGaps) -> [[f64; 3]; 3] {
+    let mut g = gradient(u, nb);
+    for (axis, row) in g.iter_mut().enumerate() {
+        let [wm, wp] = gaps[axis];
+        let [m, p] = nb[axis];
+        let toward_wall = |d: f64, fluid: Option<[f64; 3]>| -> [f64; 3] {
+            // derivative towards the wall at distance `d`: wall point (+d, 0), the cell (0, u), the neighbour (−1, u_f)
+            match fluid {
+                Some(f) => [0, 1, 2].map(|b| -d / (1.0 + d) * f[b] - (1.0 - d) / d * u[b]),
+                None => [0, 1, 2].map(|b| -u[b] / d),
+            }
+        };
+        *row = match (wm, wp) {
+            (Some(a), Some(b)) if a > 0.0 && b > 0.0 => [0, 1, 2].map(|c| u[c] * (b - a) / (a * b)),
+            (None, Some(d)) if d > 0.0 && m.is_some() => toward_wall(d, m),
+            (Some(d), None) if d > 0.0 && p.is_some() => toward_wall(d, p).map(|x| -x),
+            (None, Some(d)) if d > 0.0 && m.is_none() => toward_wall(d, None),
+            (Some(d), None) if d > 0.0 && p.is_none() => toward_wall(d, None).map(|x| -x),
+            _ => *row,
+        };
+    }
+    g
+}
+
 /// The squared norm `α_ij α_ij` of gradient `g`.
 #[inline(always)]
 pub fn norm2(g: &[[f64; 3]; 3]) -> f64 {
@@ -328,5 +363,39 @@ mod tests {
         let mut half = nb;
         half[1][1] = None;
         assert_eq!(laplacian(quad(1.0, 2.0), &half), [2.0, 0.0, 0.0]);
+    }
+
+    /// The wall-aware gradient is exact for a parabola between half-way walls, with a wall on each side too, and is
+    /// [`gradient`]'s own where there is no wall.
+    #[test]
+    fn the_wall_aware_gradient_is_exact_for_a_parabola_between_half_way_walls() {
+        // Poiseuille between walls at y = ±n/2 (cell faces): u = a (h² − y²), h = n/2, cell centres at y = j + ½ − h.
+        let (n, a) = (8usize, 0.003);
+        let h = n as f64 / 2.0;
+        let u_at = |j: usize| {
+            let y = j as f64 + 0.5 - h;
+            [a * (h * h - y * y), 0.0, 0.0]
+        };
+        let du = |j: usize| -2.0 * a * (j as f64 + 0.5 - h);
+        for j in 0..n {
+            let nb: Neighbours =
+                [[None, None], [if j > 0 { Some(u_at(j - 1)) } else { None }, if j + 1 < n { Some(u_at(j + 1)) } else { None }], [None, None]];
+            let gaps: WallGaps = [[None; 2], [(j == 0).then_some(0.5), (j + 1 == n).then_some(0.5)], [None; 2]];
+            let g = gradient_walled(u_at(j), &nb, &gaps);
+            // ∂_y u_x is row 1, column 0
+            assert!((g[1][0] - du(j)).abs() < 1e-15, "row {j}: {} against {}", g[1][0], du(j));
+            if j > 0 && j + 1 < n {
+                assert_eq!(g, gradient(u_at(j), &nb), "no wall: the same bits");
+            }
+        }
+        // one cell between two walls: the profile's slope at its centre is 0 (the two wall points are symmetric)
+        let g = gradient_walled([0.01, 0.0, 0.0], &[[None; 2]; 3], &[[None; 2], [Some(0.5), Some(0.5)], [None; 2]]);
+        assert_eq!(g[1][0], 0.0);
+        // unequal gaps: the parabola through (−a, 0), (0, u), (b, 0)
+        let g = gradient_walled([0.01, 0.0, 0.0], &[[None; 2]; 3], &[[None; 2], [Some(0.25), Some(0.75)], [None; 2]]);
+        assert!((g[1][0] - 0.01 * (0.75 - 0.25) / (0.25 * 0.75)).abs() < 1e-15);
+        // a wall and nothing across the face: the line from the wall point
+        let g = gradient_walled([0.01, 0.0, 0.0], &[[None; 2]; 3], &[[None; 2], [None, Some(0.5)], [None; 2]]);
+        assert!((g[1][0] + 0.02).abs() < 1e-15);
     }
 }
