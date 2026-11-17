@@ -714,6 +714,34 @@ fn slotted_channel_stability() {
     let steps = done;
     // the samples of the backend that ran (the CPU's, or the device's when CPU=0)
     let run_samples = if sc.is_empty() { &sg } else { &sc };
+    // KHISTORY: K (on the inlet peak speed) as the mean of each WIN-step window, at most 40 points, and KJUMP-BACK: the first window
+    // whose change exceeds 5 times the median of the previous five (at least three; skipped when that median is under 1e-4 of K)
+    {
+        let nw = (done / win_steps.max(1)) as usize;
+        let k_of = |w: usize| {
+            let v: Vec<f64> = run_samples.iter().filter(|x| x.0 > w as u64 * win_steps && x.0 <= (w as u64 + 1) * win_steps).map(|x| x.7).collect();
+            v.iter().sum::<f64>() / v.len().max(1) as f64 / (0.5 * u_in * u_in)
+        };
+        let ks: Vec<f64> = (0..nw).map(k_of).collect();
+        if ks.len() >= 2 && win_steps > 0 {
+            let every = (ks.len() / 40).max(1);
+            let hist: Vec<String> = ks.iter().enumerate().step_by(every).map(|(w, k)| format!("{}:{k:.3}", (w as u64 + 1) * win_steps)).collect();
+            println!("KHISTORY K per window of {win_steps} steps (window end step:K): {}", hist.join(" "));
+            let d: Vec<f64> = ks.windows(2).map(|w| (w[1] - w[0]).abs()).collect();
+            let jump = (3..d.len()).find(|&i| {
+                let mut prev: Vec<f64> = d[i.saturating_sub(5)..i].to_vec();
+                prev.sort_by(f64::total_cmp);
+                let med = prev[prev.len() / 2];
+                med >= 1e-4 * ks[i] && d[i] > 5.0 * med
+            });
+            let kmax = ks.iter().cloned().fold(f64::MIN, f64::max);
+            let kmin = ks.iter().cloned().fold(f64::MAX, f64::min);
+            println!(
+                "KJUMP-BACK {}; K over all windows from {kmin:.3} to {kmax:.3}",
+                jump.map_or("none".to_string(), |i| format!("at the window ending step {}: K {:.3} -> {:.3}", (i as u64 + 2) * win_steps, ks[i], ks[i + 1]))
+            );
+        }
+    }
     let host = std::env::var("COMPUTERNAME").or_else(|_| std::env::var("HOSTNAME")).unwrap_or_else(|_| "unknown".into());
     println!(
         "RUN ended after {steps} of {steps_cap} steps: {}; settle window {}; host {host}; mean density at step 0 {rho_step0:.5}, first sample (step {}) {:.5}, middle {:.5}, end {:.5}",
