@@ -188,6 +188,13 @@ fn open_duct_plane_flux_over_time() {
     }
     let (a, b) = (cpu.population_flux_parts(1, 5, Some(&window)).expect("cpu"), gpu.population_flux_parts(1, 5, Some(&window)).expect("gpu"));
     assert!(a.skipped > 0 && a.skipped == b.skipped, "{} {}", a.skipped, b.skipped);
+    // a passage-style mask: the cells of the plane's high layer only (net flux, both backends)
+    let one_layer: Vec<bool> = (0..n).map(|c| g.coords(c)[0] == 12 && (3..g.cells[1] - 3).contains(&g.coords(c)[1])).collect();
+    let (a, b) = (cpu.population_flux(0, 12, Some(&one_layer)).expect("cpu"), gpu.population_flux(0, 12, Some(&one_layer)).expect("gpu"));
+    let both: Vec<bool> = (0..n).map(|c| (3..g.cells[1] - 3).contains(&g.coords(c)[1])).collect();
+    let c2 = cpu.population_flux(0, 12, Some(&both)).expect("cpu");
+    println!("DUCT-FLUX one-layer mask: cpu {a:+.6e} device {b:+.6e} both layers {c2:+.6e}");
+    assert!((a - c2).abs() < 1e-12 && (a - b).abs() / reference.max(1e-9) < 1e-5 && a.abs() > 0.1, "{a} {b} {c2}");
     let moved = seen.windows(2).filter(|w| (w[0] - w[1]).abs() > 1e-9).count();
     println!("DUCT-FLUX worst diff/flux {worst:.2e}, device value changed in {moved} of {} prints", seen.len() - 1);
     assert!(moved > 10 && worst < 1e-4, "moved {moved}, worst {worst}");

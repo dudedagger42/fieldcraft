@@ -2101,7 +2101,9 @@ impl Flow {
     /// the open boundary after streaming, not streamed: those arrival cells are left out of the sum (their number is
     /// [`PlaneFlux::skipped`], see [`Flow::population_flux_parts`]). A source cell that is an open cell is fine.
     ///
-    /// `cells` restricts the sum to arrival cells whose flag is set (indexed like the grid; `None`: all). A periodic axis accepts
+    /// `cells` restricts the sum to the lateral positions of the plane that are flagged in either of its two layers (indexed like the
+    /// grid; `None`: all): a position counts with both its arrival cells, so a mask that lists only the cells of layer `plane` (a
+    /// passage's cells) gives the net flux, not the one-way sum. A periodic axis accepts
     /// `plane` in `0..n` (0 is the seam between layer `n - 1` and layer 0), a non-periodic one `1..n`. The cells are summed in index
     /// order, so the result is the same on every platform. This is the flux through the plane of the lattice, from the links that
     /// crossed it; in a flow uniform along the axis it equals the plane's `sum rho u` of [`Flow::moments`], and in general it is what
@@ -2139,10 +2141,14 @@ impl Flow {
         for (layer, sign) in [(high, 1i32), (low, -1i32)] {
             for c in 0..self.grid.len() {
                 let p = self.grid.coords(c);
-                if p.get(axis).copied() != Some(layer)
-                    || !populated.get(c).copied().unwrap_or(false)
-                    || !cells.is_none_or(|m| m.get(c).copied().unwrap_or(false))
-                {
+                if p.get(axis).copied() != Some(layer) || !populated.get(c).copied().unwrap_or(false) {
+                    continue;
+                }
+                let mut mate = p;
+                if let Some(slot) = mate.get_mut(axis) {
+                    *slot = if layer == high { low } else { high };
+                }
+                if !cells.is_none_or(|m| m.get(c).copied().unwrap_or(false) || m.get(self.grid.index(mate)).copied().unwrap_or(false)) {
                     continue;
                 }
                 if open.get(c).copied().unwrap_or(false) {

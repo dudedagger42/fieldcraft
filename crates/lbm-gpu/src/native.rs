@@ -1971,7 +1971,7 @@ impl GpuFlow {
     /// The net mass flux through the plane between the cell layers `plane - 1` and `plane` of `axis`, in the direction of `+axis`, in
     /// lattice units per step, from the links that crossed it in the last streaming: the same quantity as
     /// [`Flow::population_flux`], read from the device (f32 populations, the weights added in double precision). `cells` keeps the
-    /// arrival cells whose flag is set (indexed like the grid). One small dispatch and a readback of the two layers' cells, meant
+    /// lateral positions flagged in either layer of the plane (indexed like the grid; see [`Flow::population_flux`]). One small dispatch and a readback of the two layers' cells, meant
     /// for report intervals; the time step is not touched. The inlet and outlet arrival cells (inside `cells`) are left out (the
     /// open boundary sets those populations after streaming; their number is in [`PlaneFlux::skipped`]). A flow with a slip face
     /// (reflected links) is refused.
@@ -2020,7 +2020,10 @@ impl GpuFlow {
             p[a1] = r % s1;
             p[a2] = r / s1;
             let cell = p[0] + self.dims[0] * (p[1] + self.dims[1] * p[2]);
-            if !cells.is_none_or(|m| m.get(cell).copied().unwrap_or(false)) {
+            let mut mate = p;
+            mate[axis] = if is_low { high } else { low };
+            let mate = mate[0] + self.dims[0] * (mate[1] + self.dims[1] * mate[2]);
+            if !cells.is_none_or(|m| m.get(cell).copied().unwrap_or(false) || m.get(mate).copied().unwrap_or(false)) {
                 continue;
             }
             if self.open_mask.get(cell).copied().unwrap_or(false) && self.fluid.get(cell).copied().unwrap_or(false) {

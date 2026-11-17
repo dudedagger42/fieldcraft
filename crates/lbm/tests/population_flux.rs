@@ -122,7 +122,16 @@ fn open_channel_flux_is_the_injected_flux() {
     assert!(beside.skipped > 0, "the inlet cells arrive in the plane");
     let inside: Vec<bool> = (0..n).map(|c| g.coords(c)[0] >= 1 && g.coords(c)[0] + 1 < g.cells[0]).collect();
     let masked = flow.population_flux_parts(0, 1, Some(&inside)).expect("masked");
-    assert_eq!((masked.skipped, masked.flux.to_bits()), (0, beside.flux.to_bits()), "a mask without the open layer reads what the skip reads");
+    assert_eq!(
+        (masked.skipped, masked.flux.to_bits()),
+        (beside.skipped, beside.flux.to_bits()),
+        "a mask spanning the plane reads what no mask reads"
+    );
+    // a mask that lists only the cells of layer `plane` (a passage's cells) gives the net flux through the plane, not the one-way sum
+    let one_layer: Vec<bool> = (0..n).map(|c| g.coords(c)[0] == 10 && g.coords(c)[1] < 6).collect();
+    let half: Vec<bool> = (0..n).map(|c| g.coords(c)[1] < 6).collect();
+    let (a, b) = (flow.population_flux(0, 10, Some(&one_layer)).expect("one layer"), flow.population_flux(0, 10, Some(&half)).expect("half"));
+    assert_eq!(a.to_bits(), b.to_bits(), "{a} {b}");
     for plane in [2usize, 5, 10, 15, g.cells[0] - 2] {
         let q = flow.population_flux(0, plane, None).expect("interior plane");
         assert!((q / injected - 1.0).abs() < 2e-3, "plane {plane}: {q} against the injected {injected}");
