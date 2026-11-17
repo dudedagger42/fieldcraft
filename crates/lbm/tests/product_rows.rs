@@ -187,6 +187,48 @@ fn speeds(flow: &mut fieldcraft_lbm::Flow, fluid: &[bool], w: usize) -> (f64, f6
     (all, inside, finite)
 }
 
+/// The largest |rho - 1| over the fluid cells: its cell, its signed value, the signed values of the fluid cells next to it along each
+/// axis (lower, upper; NaN where not fluid), and whether it alternates cell to cell (2 dx): along some axis both neighbours have the
+/// opposite sign and at least half its size.
+struct RhoScan {
+    cell: [usize; 3],
+    dev: f64,
+    neighbours: [[f64; 2]; 3],
+    alternates: bool,
+}
+
+fn rho_scan(flow: &mut fieldcraft_lbm::Flow, fluid: &[bool]) -> Option<RhoScan> {
+    let f = Backend::fields(flow).ok()?;
+    let g = *flow.grid();
+    let (mut best, mut best_dev) = (None::<usize>, -1.0f64);
+    for c in (0..fluid.len()).filter(|&c| fluid[c]) {
+        let d = (f.density.get(c)? - 1.0).abs();
+        if d.is_finite() && d > best_dev {
+            best = Some(c);
+            best_dev = d;
+        }
+    }
+    let c = best?;
+    let p = g.coords(c);
+    let dev = f.density[c] - 1.0;
+    let mut neighbours = [[f64::NAN; 2]; 3];
+    let mut alternates = false;
+    for a in 0..3 {
+        for (k, up) in [false, true].into_iter().enumerate() {
+            let mut q = p;
+            let n = g.cells[a];
+            q[a] = if up { (p[a] + 1) % n } else { (p[a] + n - 1) % n };
+            let ci = g.index(q);
+            if fluid.get(ci).copied().unwrap_or(false) {
+                neighbours[a][k] = f.density[ci] - 1.0;
+            }
+        }
+        let [lo, hi] = neighbours[a];
+        alternates |= lo * dev < 0.0 && hi * dev < 0.0 && lo.abs() >= 0.5 * dev.abs() && hi.abs() >= 0.5 * dev.abs();
+    }
+    Some(RhoScan { cell: p, dev, neighbours, alternates })
+}
+
 /// Fluid cells with an axis whose two neighbours are both missing (solid), and with an axis with one missing (all faces periodic).
 fn neighbour_counts(flow: &fieldcraft_lbm::Flow, fluid: &[bool]) -> (usize, usize) {
     let g = *flow.grid();
@@ -375,6 +417,8 @@ fn product_rows() {
             let mut along_hist: Vec<(u64, f64)> = Vec::new();
             let (mut pocket_max, mut pocket_last, mut first_flag) = (0.0f64, 0.0f64, None::<u64>);
             let mut pocket_hist: Vec<(u64, f64, f64)> = Vec::new();
+            let mut rho_hist: Vec<(u64, f64, bool)> = Vec::new();
+            let mut last_scan: Option<(u64, RhoScan)> = None;
             let mut backend_stop: Option<u64> = None;
             while done < cap {
                 // the first chunk is sampled ten times finer, so that a jump inside it is seen by the running minimum
@@ -396,6 +440,10 @@ fn product_rows() {
                     pocket_max = pocket_max.max(inside);
                     pocket_hist.push((done, inside, all));
                     pocket_last = inside;
+                    if let Some(sc) = rho_scan(&mut flow, &fluid) {
+                        rho_hist.push((done, sc.dev, sc.alternates));
+                        last_scan = Some((done, sc));
+                    }
                     if first_flag.is_none() && (!finite || all > 0.3) {
                         first_flag = Some(done);
                     }
@@ -430,6 +478,22 @@ fn product_rows() {
             if pocket.is_some() {
                 let series: Vec<String> = pocket_hist.iter().map(|(st, i, a)| format!("{st}:{i:.3e}/{a:.3e}")).collect();
                 println!("PRODUCT-POCKET-HISTORY collision {label} tau-1/2 {tau_mh:e} case {name} cells {w}: {}", series.join(" "));
+            }
+            if pocket.is_some() {
+                let hist: Vec<String> = rho_hist.iter().map(|(st, d, alt)| format!("{st}:{d:+.3e}{}", if *alt { "*" } else { "" })).collect();
+                println!("PRODUCT-RHO-HISTORY collision {label} tau-1/2 {tau_mh:e} (step:signed rho-1 of the worst cell, * = alternates 2dx): {}", hist.join(" "));
+                if let Some((st, sc)) = &last_scan {
+                    println!(
+                        "PRODUCT-RHO collision {label} tau-1/2 {tau_mh:e} U_LAT {} last read at step {st}: worst |rho-1| {:.4e} (rho-1 {:+.4e}) at cell {:?}; neighbours (x-,x+,y-,y+,z-,z+) {:?}; alternates 2dx: {}; backend stop after step {}",
+                        u_lat(),
+                        sc.dev.abs(),
+                        sc.dev,
+                        sc.cell,
+                        sc.neighbours.iter().flatten().map(|v| format!("{v:+.3e}")).collect::<Vec<_>>(),
+                        sc.alternates,
+                        backend_stop.map_or("none".to_string(), |s| s.to_string())
+                    );
+                }
             }
             if let Some((pw, pd)) = pocket {
                 let (none, lacking) = neighbour_counts(&flow, &fluid);
