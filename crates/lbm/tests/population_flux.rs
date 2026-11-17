@@ -88,5 +88,44 @@ fn walled_channel_flux_matches_the_cell_sum() {
     // nothing crosses the wall: the plane between the last fluid row and the first solid one, over the fluid cells
     let in_channel: Vec<bool> = (0..n).map(|c| g.coords(c)[1] < w).collect();
     assert!(flow.population_flux(1, w, Some(&in_channel)).expect("flux").abs() < 1e-9);
-    assert!(flow.open_face_flux(0, false, None).expect("flux") > 0.0);
+    assert!(flow.open_face_flux(0, false, 0, None).expect("flux") > 0.0);
+}
+
+/// A 2D open box of 24 x 12 cells (periodic and one cell deep in z): a uniform velocity inlet at x min, a convective pressure outlet
+/// at x max, slip floor and roof. In its steady state the flux through every interior plane is the injected flux.
+#[test]
+fn open_channel_flux_is_the_injected_flux() {
+    use fieldcraft_lbm::Target;
+    use fieldcraft_model::{Outflow, Profile};
+    let dx = 1.0 / 12.0;
+    let (lx, ly) = (2.0, 1.0);
+    let mut d = domain([0.0; 3], [lx, ly, dx], dx);
+    d.faces.x_min = FaceCondition::Velocity { velocity: [0.5, 0.0, 0.0], profile: Profile::Uniform };
+    d.faces.x_max = FaceCondition::Pressure { pressure: 0.0, outflow: Outflow::Convective };
+    d.faces.y_min = FaceCondition::Slip {};
+    d.faces.y_max = FaceCondition::Slip {};
+    d.faces.z_min = FaceCondition::Periodic {};
+    d.faces.z_max = FaceCondition::Periodic {};
+    let dt = 0.05 * dx / 0.5;
+    let m = model(1.0, 0.02, d, collide(3000.0 * dt, dt, None, Collision::Hrr));
+    let (_, mut flow) = prepare(&m, &[]);
+    let g = *flow.grid();
+    let n = g.len();
+    let injected: f64 = flow.open_cells().iter().filter_map(|oc| if let Target::Velocity(u) = oc.target { Some(u[0]) } else { None }).sum();
+    assert!(injected > 0.0);
+    // start from the uniform flow the inlet injects, so that the steady state is the start and only its settling is run
+    let u_lat = injected / g.cells[1] as f64;
+    flow.set_equilibrium(|_| (1.0, [u_lat, 0.0, 0.0]));
+    Backend::advance(&mut flow, 1500).expect("advance");
+    // the open layers are refused, the planes beside them are not
+    assert!(flow.population_flux(0, 1, None).is_err(), "the plane next to the inlet layer reads the inlet cells' arrivals");
+    let inside: Vec<bool> = (0..n).map(|c| g.coords(c)[0] >= 1 && g.coords(c)[0] + 1 < g.cells[0]).collect();
+    assert!(flow.population_flux(0, 1, Some(&inside)).is_ok());
+    for plane in [2usize, 5, 10, 15, g.cells[0] - 2] {
+        let q = flow.population_flux(0, plane, None).expect("interior plane");
+        assert!((q / injected - 1.0).abs() < 2e-3, "plane {plane}: {q} against the injected {injected}");
+    }
+    let (lo, hi) = (flow.open_face_flux(0, false, 1, None).expect("inlet side"), flow.open_face_flux(0, true, 1, None).expect("outlet side"));
+    assert!((lo / injected - 1.0).abs() < 2e-3 && (hi / injected - 1.0).abs() < 2e-3, "{lo} {hi} against {injected}");
+    assert!(flow.open_face_flux(0, false, 0, None).is_err() && flow.open_face_flux(0, true, 0, None).is_err());
 }

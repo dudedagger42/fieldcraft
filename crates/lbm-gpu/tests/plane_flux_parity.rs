@@ -71,8 +71,8 @@ fn plane_flux_parity() {
         gpu.population_flux(1, 8, Some(&fluid_rows)).expect("gpu"),
     );
     check("z plane 2", cpu.population_flux(2, 2, None).expect("cpu"), gpu.population_flux(2, 2, None).expect("gpu"));
-    check("x low face", cpu.open_face_flux(0, false, None).expect("cpu"), gpu.open_face_flux(0, false, None).expect("gpu"));
-    check("x high face", cpu.open_face_flux(0, true, None).expect("cpu"), gpu.open_face_flux(0, true, None).expect("gpu"));
+    check("x low face", cpu.open_face_flux(0, false, 0, None).expect("cpu"), gpu.open_face_flux(0, false, 0, None).expect("gpu"));
+    check("x high face", cpu.open_face_flux(0, true, 0, None).expect("cpu"), gpu.open_face_flux(0, true, 0, None).expect("gpu"));
     // the cost: a call against a chunk of steps
     let t = Instant::now();
     let calls = 50;
@@ -94,4 +94,50 @@ fn plane_flux_parity() {
     Backend::advance(&mut cpu, 50).expect("cpu");
     check("x plane 3 after 50 more steps", cpu.population_flux(0, 3, None).expect("cpu"), gpu.population_flux(0, 3, None).expect("gpu"));
     assert!(worst.get() < 1e-5, "{}", worst.get());
+}
+
+/// A 24 x 12 cell open box (one cell deep, periodic in z): a velocity inlet at x min, a convective pressure outlet at x max, no-slip
+/// floor and roof. The planes beside the open layers read the same on both backends and the open layers are refused.
+#[test]
+#[ignore = "GPU: run on the machine whose device is to be checked, alone on it (see the module docs)"]
+fn open_channel_plane_flux_parity() {
+    use fieldcraft_model::{Outflow, Profile};
+    let dx = 1.0 / 12.0;
+    let mut d = domain([0.0; 3], [2.0, 1.0, dx], dx);
+    d.faces.x_min = FaceCondition::Velocity { velocity: [0.5, 0.0, 0.0], profile: Profile::Uniform };
+    d.faces.x_max = FaceCondition::Pressure { pressure: 0.0, outflow: Outflow::Convective };
+    d.faces.y_min = FaceCondition::Wall {};
+    d.faces.y_max = FaceCondition::Wall {};
+    d.faces.z_min = FaceCondition::Periodic {};
+    d.faces.z_max = FaceCondition::Periodic {};
+    let dt = 0.05 * dx / 0.5;
+    let m = model(1.0, 0.02, d, collide(1e6 * dt, dt, None, Collision::Hrr));
+    let setup = Setup::new(&m, None, &[], &Limits::default()).expect("setup");
+    let mut cpu = Flow::new(&setup, &[]).expect("flow");
+    let mut gpu = GpuFlow::with_options(&cpu, Policy::from_env().expect("policy"), Options::default()).expect("device flow");
+    for _ in 0..8 {
+        Backend::advance(&mut cpu, 250).expect("cpu");
+        Backend::advance(&mut gpu, 250).expect("gpu");
+    }
+    let g = *cpu.grid();
+    let n = g.len();
+    let mut worst = 0.0f64;
+    let reference = cpu.population_flux(0, 12, None).expect("cpu").abs();
+    for plane in [2usize, 6, 12, 18, g.cells[0] - 2] {
+        let (a, b) = (cpu.population_flux(0, plane, None).expect("cpu"), gpu.population_flux(0, plane, None).expect("gpu"));
+        println!("OPEN-PLANE-FLUX x plane {plane}: cpu {a:+.6e} device {b:+.6e}");
+        worst = worst.max((a - b).abs() / reference);
+    }
+    for high in [false, true] {
+        let (a, b) = (cpu.open_face_flux(0, high, 1, None).expect("cpu"), gpu.open_face_flux(0, high, 1, None).expect("gpu"));
+        println!("OPEN-PLANE-FLUX face high={high}: cpu {a:+.6e} device {b:+.6e}");
+        worst = worst.max((a - b).abs() / reference);
+    }
+    let inside: Vec<bool> = (0..n).map(|c| g.coords(c)[0] >= 1 && g.coords(c)[0] + 1 < g.cells[0]).collect();
+    let (a, b) = (cpu.population_flux(0, 1, Some(&inside)).expect("cpu"), gpu.population_flux(0, 1, Some(&inside)).expect("gpu"));
+    worst = worst.max((a - b).abs() / reference);
+    assert!(cpu.population_flux(0, 1, None).is_err() && gpu.population_flux(0, 1, None).is_err());
+    assert!(cpu.open_face_flux(0, false, 0, None).is_err() && gpu.open_face_flux(0, false, 0, None).is_err());
+    println!("OPEN-PLANE-FLUX worst diff/flux {worst:.2e}");
+    assert!(worst < 1e-5, "{worst}");
 }

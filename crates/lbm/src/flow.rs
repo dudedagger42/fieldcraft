@@ -2088,7 +2088,9 @@ impl Flow {
     /// direction of `+axis`, summed from the populations that crossed it in the last streaming: the links `f_q c_q·n` of the populations
     /// now at the cells of layer `plane` (`c_q·n = +1`, they came from layer `plane - 1`) less those at the cells of layer `plane - 1`
     /// (`c_q·n = -1`, they came from layer `plane`), each counted at its arrival cell. A link whose source cell is not a fluid cell
-    /// (a bounced-back population) did not cross and is skipped.
+    /// (a bounced-back population) did not cross and is skipped. The populations that arrive in an inlet or outlet cell are set by
+    /// the open boundary after streaming, not streamed: a plane whose arrival cells (inside `cells`) include one is refused with an
+    /// error, so a mask that leaves the open layer out reads the planes beside it. A source cell that is an open cell is fine.
     ///
     /// `cells` restricts the sum to arrival cells whose flag is set (indexed like the grid; `None`: all). A periodic axis accepts
     /// `plane` in `0..n` (0 is the seam between layer `n - 1` and layer 0), a non-periodic one `1..n`. The cells are summed in index
@@ -2112,6 +2114,12 @@ impl Flow {
             return Err(Error::Invalid(format!("population_flux: the cell mask has {} entries, the grid {} cells", m.len(), self.grid.len())));
         }
         let populated = self.populated();
+        let mut open = vec![false; self.grid.len()];
+        for oc in &self.open {
+            if let Some(slot) = open.get_mut(oc.cell as usize) {
+                *slot = true;
+            }
+        }
         let mut total = 0.0;
         for (layer, sign) in [(high, 1i32), (low, -1i32)] {
             for c in 0..self.grid.len() {
@@ -2121,6 +2129,11 @@ impl Flow {
                     || !cells.is_none_or(|m| m.get(c).copied().unwrap_or(false))
                 {
                     continue;
+                }
+                if open.get(c).copied().unwrap_or(false) {
+                    return Err(Error::Invalid(format!(
+                        "population_flux: cell {c} of the plane is an inlet or outlet cell, whose populations the open boundary sets; leave it out of `cells` or read a plane further inside"
+                    )));
                 }
                 for q in 0..Q {
                     let cq = C.get(q).copied().unwrap_or([0; 3]);
@@ -2145,7 +2158,18 @@ impl Flow {
                             *slot = v as usize;
                         }
                     }
-                    if !inside || !populated.get(self.grid.index(src)).copied().unwrap_or(false) {
+                    // a link the lattice rules set: a bounce-back arrives from the cell itself (nothing crossed), a reflection or a
+                    // pulled link from the cell it names
+                    let first = self.links.partition_point(|l| (l.cell as usize) < c);
+                    let rule = self.links.iter().skip(first).take_while(|l| l.cell as usize == c).find(|l| usize::from(l.q) == q).map(|l| l.rule);
+                    let source = match rule {
+                        None => inside.then(|| self.grid.index(src)),
+                        Some(Rule::Pull { from }) | Some(Rule::Reflect { from, .. }) => Some(from as usize),
+                        Some(Rule::Bounce { .. }) | Some(Rule::Open) => None,
+                    };
+                    let Some(source) = source else { continue };
+                    let expected = if sign == 1 { low } else { high };
+                    if self.grid.coords(source).get(axis).copied() != Some(expected) || !populated.get(source).copied().unwrap_or(false) {
                         continue;
                     }
                     total += f64::from(sign) * self.f.get(q * self.stride + c).copied().unwrap_or(0.0);
@@ -2155,16 +2179,17 @@ impl Flow {
         Ok(total)
     }
 
-    /// The flux through a face of the domain, taken one cell inside it (the plane between layers 0 and 1 for the low face, between
-    /// `n - 2` and `n - 1` for the high one), in the direction of `+axis`: the populations that left a boundary layer are not kept,
-    /// so the face's flux is read at the first plane the populations cross. In a steady state without sources or sinks in the
-    /// layer it is the face's flux. See [`Flow::population_flux`].
-    pub fn open_face_flux(&self, axis: usize, high: bool, cells: Option<&[bool]>) -> Result<f64> {
+    /// The flux through a face of the domain, read `layers_in` layers inside it, in the direction of `+axis`: with 0 the plane
+    /// between layers 0 and 1 for the low face (between `n - 2` and `n - 1` for the high one), with 1 the next one in, and so on. The
+    /// populations that left a boundary layer are not kept, and an open face's layer is refused by [`Flow::population_flux`], so an
+    /// open face is read with `layers_in` 1 or more. In a steady state without sources or sinks in between it is the face's flux.
+    pub fn open_face_flux(&self, axis: usize, high: bool, layers_in: usize, cells: Option<&[bool]>) -> Result<f64> {
         let n = *self.grid.cells.get(axis).ok_or_else(|| Error::Invalid(format!("open_face_flux: axis {axis} is not 0, 1 or 2")))?;
         if n < 2 {
             return Err(Error::Invalid(format!("open_face_flux: axis {axis} has {n} layer")));
         }
-        self.population_flux(axis, if high { n - 1 } else { 1 }, cells)
+        let plane = if high { (n - 1).checked_sub(layers_in) } else { Some(1 + layers_in) };
+        self.population_flux(axis, plane.ok_or_else(|| Error::Invalid("open_face_flux: layers_in reaches past the other face".into()))?, cells)
     }
 
     /// The density and velocity of a cell (lattice units), or `None` for a solid cell.
