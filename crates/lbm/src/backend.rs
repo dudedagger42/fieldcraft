@@ -26,6 +26,10 @@ pub struct Fields {
 
 /// A stepper of one prepared flow.
 pub trait Backend {
+    /// What the interpolated walls' mass correction resolved to and why (`None` without interpolated walls).
+    fn wall_mass_choice(&self) -> Option<crate::flow::WallMassChoice> {
+        None
+    }
     /// Final baffle side diagnostics (SI); unsupported backends refuse sheets at setup.
     fn baffles(&self) -> Vec<crate::baffle::BaffleResult> {
         Vec::new()

@@ -29,6 +29,8 @@ fn hash_after(walls: WallTreatment) -> u64 {
     d.obstacles = vec!["Wall".into()];
     let proc = with_walls(step(steps as f64 * dt, dt, None), walls);
     let (_, mut flow) = prepare(&model(1.0, 1.0, d, proc), &obstacles);
+    // explicit off: a flow starts in the automatic mode, which switches the correction on for TRT
+    flow.set_wall_mass_correction(false).unwrap();
     for _ in 0..steps {
         flow.step().unwrap();
     }

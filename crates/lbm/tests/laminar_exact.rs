@@ -94,7 +94,10 @@ fn periodic_flow(n: [usize; 3], obstacles: &[Obstacle], accel: [f64; 3], walls: 
     let p = with_walls(collide(STEPS as f64 * dt, dt, None, Collision::Trt), walls);
     let m = model(1.0, 1.0, d, p);
     let setup = Setup::new(&m, None, obstacles, &Limits::default()).expect("setup");
-    fieldcraft_lbm::Flow::new(&setup, obstacles).expect("flow")
+    let mut flow = fieldcraft_lbm::Flow::new(&setup, obstacles).expect("flow");
+    // explicit off: a flow starts in the automatic mode (the rows are recorded without the correction)
+    flow.set_wall_mass_correction(false).expect("off");
+    flow
 }
 
 /// Run STEPS and measure the flow rate: the sum of the velocity along `direction` over the fluid cells, per cell
@@ -188,7 +191,8 @@ fn square_duct(cells: usize) -> Measured {
     d.acceleration = [g_lat * dx / (dt * dt), 0.0, 0.0];
     let m = model(1.0, 1.0, d, collide(STEPS as f64 * dt, dt, None, Collision::Trt));
     let setup = Setup::new(&m, None, &obstacles, &Limits::default()).expect("setup");
-    let flow = fieldcraft_lbm::Flow::new(&setup, &obstacles).expect("flow");
+    let mut flow = fieldcraft_lbm::Flow::new(&setup, &obstacles).expect("flow");
+    flow.set_wall_mass_correction(false).expect("off");
     let gx = flow.grid().cells[0] as f64;
     measure(flow, [1.0, 0.0, 0.0], gx, U_LAT * hh * hh)
 }
@@ -343,6 +347,7 @@ fn open_channel() -> (f64, f64, f64) {
     let m = model(1.0, 1.0, d, p);
     let setup = Setup::new(&m, None, &obstacles, &Limits::default()).expect("setup");
     let mut flow = fieldcraft_lbm::Flow::new(&setup, &obstacles).expect("flow");
+    flow.set_wall_mass_correction(false).expect("off");
     let grid = *flow.grid();
     let [gx, gy, gz] = grid.cells;
     let fluid: Vec<bool> = (0..gx * gy * gz).map(|c| Backend::is_fluid(&flow, c)).collect();

@@ -146,8 +146,13 @@ from three nodes; checked against the continuity at q = ½ and a parabola, not t
 the fluid's mass drifts. In the verification cases below the drift is 10⁻¹⁰ to 10⁻⁷ of the mass
 over a run; `mass.relative_change` in the reply shows it for yours.
 
-A library user can take the mass back: `Flow::set_wall_mass_correction(true)` (off by default; not
-reachable from `solve.fluid` yet) makes each wall node hand what its links created to itself and its
+The mass correction is chosen automatically (`WallMassMode::Auto`, a flow's start): ON with the MRT and TRT
+collisions at any τ tested, and with the regularised and hybrid regularised collisions at τ − ½ of 5e-2 or more;
+OFF below that limit, where it destabilises them, with a note in the run's warnings that gives the reason and says
+where the drift is read (the `mass` of each frame). Every run with interpolated walls carries one line saying which
+state was chosen and why. A checkpointed run switches an automatic ON off, with a note (a flow with the correction on
+cannot be checkpointed yet). `Flow::set_wall_mass_correction(true)` or `false` chooses explicitly (on is refused
+below the limit as before; not reachable from `solve.fluid` yet). With it on, each wall node hands what its links created to itself and its
 fluid neighbours with the lattice weights, and the receivers remove it one step later (see
 `crates/lbm/src/wall_mass.rs`). On the turned channels the mean density then holds to round-off
 (1e-12 per 10 000 steps against up to 2.7e-2) with the flow rate where the wall rule puts it; in an

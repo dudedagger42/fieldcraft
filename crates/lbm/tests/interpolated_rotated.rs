@@ -95,9 +95,8 @@ fn rotated_channel((a, b): (usize, usize), cells: usize, phase: f64, walls: Wall
     d.acceleration = [g * dir[0], g * dir[1], 0.0];
     let proc = with_walls(step(STEPS as f64 * dt, dt, None), walls);
     let (_, mut flow) = prepare(&model(1.0, 1.0, d, proc), &obstacles);
-    if correct {
-        flow.set_wall_mass_correction(true).unwrap();
-    }
+    // explicit: a flow starts in the automatic mode, and these rows mean the correction on or off
+    flow.set_wall_mass_correction(correct).unwrap();
     let fluid: Vec<usize> = (0..flow.grid().len()).filter(|&c| flow.is_fluid(c)).collect();
     // The mass the correction has handed out and not yet taken back is in the box: leave it out.
     let mean_density = |flow: &fieldcraft_lbm::Flow| {

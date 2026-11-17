@@ -614,6 +614,40 @@ impl ThermalState {
 /// distorted (measured on a laminar plane channel, [`crate::wall_mass`]).
 pub const WALL_MASS_MIN_RELAXATION_EXCESS: f64 = 5e-2;
 
+/// How the interpolated walls' mass correction is chosen ([`Flow::set_wall_mass_mode`]). A flow starts in
+/// [`WallMassMode::Auto`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WallMassMode {
+    /// On where the collision and τ are in the range shown safe (MRT and TRT, and the regularised and hybrid
+    /// regularised collisions at τ − ½ of [`WALL_MASS_MIN_RELAXATION_EXCESS`] or more), off below it with a note.
+    Auto,
+    /// On, or an error where it is not supported (the guard of [`Flow::set_wall_mass_correction`]).
+    On,
+    /// Off.
+    Off,
+}
+
+/// What the correction's mode resolved to for a flow with interpolated walls, and why: the run header and the run's
+/// warnings print it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WallMassChoice {
+    /// The mode asked for.
+    pub mode: WallMassMode,
+    /// Whether the correction is on.
+    pub on: bool,
+    /// The state and the reason, one line; for an automatic switch-off it carries the guard's message and where the
+    /// drift readout is.
+    pub reason: String,
+}
+
+/// The guard's refusal text (also the automatic switch-off's reason).
+fn wall_mass_guard_message(collision: Collision, excess: f64) -> String {
+    format!(
+        "the walls' mass correction is not supported with the {} collision at τ − ½ = {excess:.2e} (below {WALL_MASS_MIN_RELAXATION_EXCESS:.0e}):                  it makes the flow unstable there, with a flow rate that is silently wrong before it blows up;                  use the MRT or TRT collision, or leave the correction off",
+        collision.name()
+    )
+}
+
 /// The flow state.
 #[derive(Debug, Clone)]
 pub struct Flow {
@@ -669,6 +703,8 @@ pub struct Flow {
     wall_links: Option<WallLinks>,
     /// The mass correction of the interpolated walls, when switched on ([`Flow::set_wall_mass_correction`]).
     wall_mass: Option<crate::wall_mass::WallMass>,
+    /// What the mass correction's mode resolved to (`None` without interpolated walls).
+    wall_mass_choice: Option<WallMassChoice>,
     /// The interpolated links' data, by slot.
     interpolations: Vec<Interpolation>,
     /// Per direction, the index offset of the neighbour a population streams from.
@@ -1359,6 +1395,7 @@ impl Flow {
             wall_velocity: wall_velocities,
             wall_links,
             wall_mass: None,
+            wall_mass_choice: None,
             interpolations,
             offset,
             fluid_cells,
@@ -1387,6 +1424,7 @@ impl Flow {
         if let Some(s) = &mut flow.surface {
             s.initial_mass = s.total_mass(&flow.f, flow.stride);
         }
+        flow.set_wall_mass_mode(WallMassMode::Auto)?;
         Ok(flow)
     }
 
@@ -1686,20 +1724,63 @@ impl Flow {
     /// regularised and hybrid regularised collisions below [`WALL_MASS_MIN_RELAXATION_EXCESS`]: the
     /// correction destabilises them there (see [`crate::wall_mass`]).
     pub fn set_wall_mass_correction(&mut self, on: bool) -> Result<()> {
-        if !on {
-            self.wall_mass = None;
-            return Ok(());
-        }
+        self.set_wall_mass_mode(if on { WallMassMode::On } else { WallMassMode::Off })
+    }
+
+    /// Choose the mass correction's mode: [`WallMassMode::Auto`] (a flow's start), `On` (explicit, with the guard's
+    /// refusal) or `Off` (explicit). With no interpolated walls `Off` and `Auto` do nothing and `On` is refused.
+    pub fn set_wall_mass_mode(&mut self, mode: WallMassMode) -> Result<()> {
+        let interpolated = !self.interpolations.is_empty();
         let excess = 1.0 / self.omega_plus - 0.5;
-        if matches!(self.collision, Collision::Regularized | Collision::Hrr) && (excess < WALL_MASS_MIN_RELAXATION_EXCESS || excess.is_nan()) {
-            return Err(Error::Invalid(format!(
-                "the walls' mass correction is not supported with the {} collision at τ − ½ = {excess:.2e} (below {WALL_MASS_MIN_RELAXATION_EXCESS:.0e}):                  it makes the flow unstable there, with a flow rate that is silently wrong before it blows up;                  use the MRT or TRT collision, or leave the correction off",
-                self.collision.name()
-            )));
+        let regularised = matches!(self.collision, Collision::Regularized | Collision::Hrr);
+        let below = regularised && (excess < WALL_MASS_MIN_RELAXATION_EXCESS || excess.is_nan());
+        match mode {
+            WallMassMode::Off => {
+                self.wall_mass = None;
+                self.wall_mass_choice = interpolated.then(|| WallMassChoice {
+                    mode,
+                    on: false,
+                    reason: "walls' mass correction OFF (chosen explicitly); the interpolated walls may leak mass: the drift is the `mass` of each frame of the result (`Flow::mass`)".into(),
+                });
+                return Ok(());
+            }
+            WallMassMode::Auto if !interpolated => {
+                self.wall_mass = None;
+                self.wall_mass_choice = None;
+                return Ok(());
+            }
+            WallMassMode::Auto if below => {
+                self.wall_mass = None;
+                self.wall_mass_choice = Some(WallMassChoice {
+                    mode,
+                    on: false,
+                    reason: format!(
+                        "walls' mass correction switched OFF automatically (auto mode): {}. With it off the interpolated walls may leak mass; the drift is the `mass` of each frame of the result (`Flow::mass`, the mean-density drift of the product rows)",
+                        wall_mass_guard_message(self.collision, excess)
+                    ),
+                });
+                return Ok(());
+            }
+            WallMassMode::On if below => return Err(Error::Invalid(wall_mass_guard_message(self.collision, excess))),
+            _ => {}
         }
-        if self.interpolations.is_empty() {
+        if !interpolated {
             return Err(Error::Invalid("this flow has no interpolated walls to correct the mass of".into()));
         }
+        let why = if regularised {
+            format!("the {} collision at τ − ½ = {excess:.2e} is at or above {WALL_MASS_MIN_RELAXATION_EXCESS:.0e}", self.collision.name())
+        } else {
+            format!("the {} collision is stable with it at every τ tested", self.collision.name())
+        };
+        self.wall_mass_choice = Some(WallMassChoice {
+            mode,
+            on: true,
+            reason: if mode == WallMassMode::Auto {
+                format!("walls' mass correction ON (auto mode: {why})")
+            } else {
+                "walls' mass correction ON (chosen explicitly)".into()
+            },
+        });
         let (grid, periodic) = (self.grid, self.periodic);
         let mut open = vec![false; self.n];
         for cell in &self.open {
@@ -1715,6 +1796,24 @@ impl Flow {
         };
         self.wall_mass = Some(crate::wall_mass::WallMass::new(&self.links, target));
         Ok(())
+    }
+
+    /// What the mass correction's mode resolved to, and why (`None` without interpolated walls).
+    pub fn wall_mass_choice(&self) -> Option<&WallMassChoice> {
+        self.wall_mass_choice.as_ref()
+    }
+
+    /// A checkpointed run cannot carry the correction's mass in flight: an automatic choice of ON becomes OFF with a note;
+    /// an explicit one is left (and refused at the first checkpoint, as before).
+    pub fn wall_mass_auto_for_checkpoint(&mut self) {
+        if self.wall_mass.is_some() && self.wall_mass_choice.as_ref().is_some_and(|c| c.mode == WallMassMode::Auto) {
+            self.wall_mass = None;
+            self.wall_mass_choice = Some(WallMassChoice {
+                mode: WallMassMode::Auto,
+                on: false,
+                reason: "walls' mass correction switched OFF automatically (auto mode): the run is checkpointed and a flow with the correction on cannot be checkpointed yet; the interpolated walls may leak mass; the drift is the `mass` of each frame of the result (`Flow::mass`)".into(),
+            });
+        }
     }
 
     /// The mass correction of the interpolated walls, when it is on.
@@ -2989,6 +3088,10 @@ fn thermal_rule(g: &[f64], s: usize, groups: &[ThermalCondition], cell: usize, q
 }
 
 impl crate::backend::Backend for Flow {
+    fn wall_mass_choice(&self) -> Option<WallMassChoice> {
+        self.wall_mass_choice.clone()
+    }
+
     fn baffles(&self) -> Vec<crate::baffle::BaffleResult> {
         self.baffles.iter().map(|b| b.result.clone()).collect()
     }
@@ -3034,6 +3137,7 @@ impl crate::backend::Backend for Flow {
             wall_velocity: _,
             wall_links: _,
             wall_mass: _,
+            wall_mass_choice: _,
             interpolations,
             offset: _,
             fluid_cells: _,

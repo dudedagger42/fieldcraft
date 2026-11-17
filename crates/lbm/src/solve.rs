@@ -354,6 +354,8 @@ pub fn solve_fluid_checkpointed(
         return Err(Error::Limit("CPU checkpoint run plus streaming buffer exceeds the memory bound".into()));
     }
     let mut flow = Flow::new(&setup, obstacles)?;
+    // A flow with the walls' mass correction on cannot be checkpointed yet: an automatic choice of ON becomes OFF, with a note.
+    flow.wall_mass_auto_for_checkpoint();
     // A restart fills one rebuilt flow in place, never keeps a second snapshot or file buffer.
     // Include retained histories and monitor windows, which the ordinary frame estimate omits.
     let groups = flow.groups().len() as u64;
@@ -640,6 +642,9 @@ fn run_checkpointed(
     }
 
     let mut warnings = setup.warnings.clone();
+    // The interpolated walls' mass correction: which state was chosen and why, on every run with such walls (an automatic
+    // switch-off is a warning, never a debug line).
+    warnings.extend(flow.wall_mass_choice().map(|c| c.reason));
     let steady = monitor.map(Monitor::report);
     if let Some(r) = &steady {
         match r.reason {

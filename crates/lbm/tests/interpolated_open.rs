@@ -59,9 +59,8 @@ fn open_channel(walls: WallTreatment, correct: bool) -> Open {
     d.obstacles = vec!["Wall".into()];
     let proc = with_walls(step(STEPS as f64 * dt, dt, None), walls);
     let (_, mut flow) = prepare(&model(1.0, 1.0, d, proc), &obstacles);
-    if correct {
-        flow.set_wall_mass_correction(true).unwrap();
-    }
+    // explicit: a flow starts in the automatic mode, and these rows mean the correction on or off
+    flow.set_wall_mass_correction(correct).unwrap();
     for _ in 0..STEPS {
         flow.step().unwrap();
     }

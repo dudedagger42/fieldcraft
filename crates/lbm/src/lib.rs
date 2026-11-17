@@ -87,7 +87,7 @@ pub mod wall;
 pub mod wall_mass;
 
 pub use backend::{Backend, Choice, Fields, device_available, register_backend};
-pub use flow::{Flow, Group, Interpolation, Link, OpenCell, Rule, Target, ThermalState, WallLinks, ZoneSample};
+pub use flow::{Flow, Group, Interpolation, Link, OpenCell, Rule, Target, ThermalState, WallLinks, WallMassChoice, WallMassMode, ZoneSample};
 pub use memory::{DeviceBuffer, Memory};
 pub use ports::{FaceMean, Port, PortProperties, Stream};
 pub use setup::{ContactSetup, PhaseSetup, SolidSetup, SurfaceSetup, ThermalSetup};
