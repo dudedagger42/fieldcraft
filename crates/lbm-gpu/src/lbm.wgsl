@@ -126,7 +126,9 @@ override DYNAMIC: bool = false;
 override WALL_SIGMA1: bool = false;
 // The study knob WALL_MRT (Flow::set_wall_layer_mrt, with HRR): the wall layer collides with the MRT scheme, the rest keeps the hybrid collision.
 override WALL_MRT: bool = false;
-// The study knob WALL_CORNER (Flow::set_wall_corner_relax, with HRR): a fluid cell with three or more solid axis faces relaxes fully to equilibrium.
+// The study knob WALL_CORNER (Flow::set_wall_corner_relax, with HRR): a pure concave corner (one solid face neighbour on each axis)
+// relaxes every non-conserved moment fully to equilibrium. It rides the wall layer's MRT path: the host flags those cells with
+// LAYER_BIT and CORNER_BIT, and `collide_mrt` reads the rates of the full relaxation from the corner tables instead.
 override WALL_CORNER: bool = false;
 // Fans and porous zones (fieldcraft_lbm::flow's zone actions, data in `fluid`: zones.rs); likewise.
 override ZONES: bool = false;
@@ -407,7 +409,7 @@ const NODE_FLAG: u32 = 2u;
 // The top bit of a cell's flag word marks a fluid cell with a solid axis neighbour (the wall layer of the WALL_MRT study,
 // set once on the host); every other reader sees the word without it.
 const LAYER_BIT: u32 = 0x80000000u;
-// The next bit marks a fluid cell with three or more solid axis faces (the WALL_CORNER study).
+// The next bit marks a corner cell of the WALL_CORNER study (it also carries LAYER_BIT).
 const CORNER_BIT: u32 = 0x40000000u;
 fn cell_word(cell: u32) -> u32 { return fluid[cell] & ~(LAYER_BIT | CORNER_BIT); }
 fn in_corner(cell: u32) -> bool { return (fluid[cell] & CORNER_BIT) != 0u; }
@@ -1705,15 +1707,11 @@ fn collide_cell(cell: u32, lid: u32) {
     var g = Gradient(vec3<f32>(0.0), vec3<f32>(0.0), vec3<f32>(0.0), vec3<f32>(0.0));
     if collision_gradient() { g = fd_gradient(cell); }
     if REGULARIZED {
-        if WALL_CORNER && HRR && in_corner(cell) {
-            collide_regularized(cell, lid, xyz, &fq, drho, rho, u, force, forced, g, true);
-            return;
-        }
-        if WALL_MRT && HRR && in_wall_layer(cell) {
+        if (WALL_MRT || WALL_CORNER) && HRR && in_wall_layer(cell) {
             collide_mrt(cell, lid, xyz, &fq, drho, rho, u, force, forced, g);
             return;
         }
-        collide_regularized(cell, lid, xyz, &fq, drho, rho, u, force, forced, g, false);
+        collide_regularized(cell, lid, xyz, &fq, drho, rho, u, force, forced, g);
         return;
     }
     if MRT {
@@ -1819,6 +1817,10 @@ const MRT_EE_FIXED: array<f32, 100> = array<f32, 100>(1.24736842, -0.205263158, 
 const MRT_EE_STRESS: array<f32, 100> = array<f32, 100>(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.222222222, -0.111111111, -0.111111111, 0.111111111, 0.111111111, 0.111111111, 0.111111111, -0.222222222, -0.222222222, 0.0, -0.111111111, 0.222222222, -0.111111111, 0.111111111, 0.111111111, -0.222222222, -0.222222222, 0.111111111, 0.111111111, 0.0, -0.111111111, -0.111111111, 0.222222222, -0.222222222, -0.222222222, 0.111111111, 0.111111111, 0.111111111, 0.111111111, 0.0, 0.111111111, 0.111111111, -0.222222222, 0.722222222, -0.277777778, -0.111111111, -0.111111111, -0.111111111, -0.111111111, 0.0, 0.111111111, 0.111111111, -0.222222222, -0.277777778, 0.722222222, -0.111111111, -0.111111111, -0.111111111, -0.111111111, 0.0, 0.111111111, -0.222222222, 0.111111111, -0.111111111, -0.111111111, 0.722222222, -0.277777778, -0.111111111, -0.111111111, 0.0, 0.111111111, -0.222222222, 0.111111111, -0.111111111, -0.111111111, -0.277777778, 0.722222222, -0.111111111, -0.111111111, 0.0, -0.222222222, 0.111111111, 0.111111111, -0.111111111, -0.111111111, -0.111111111, -0.111111111, 0.722222222, -0.277777778, 0.0, -0.222222222, 0.111111111, 0.111111111, -0.111111111, -0.111111111, -0.111111111, -0.111111111, -0.277777778, 0.722222222);
 const MRT_OO: array<f32, 81> = array<f32, 81>(0.96, 0.0, 0.0, -0.24, -0.24, -0.24, -0.24, 0.0, 0.0, 0.0, 0.96, 0.0, -0.24, 0.24, 0.0, 0.0, -0.24, -0.24, 0.0, 0.0, 0.96, 0.0, 0.0, -0.24, 0.24, -0.24, 0.24, -0.24, -0.24, 0.0, 1.11, 0.0, -0.435, -0.435, -0.435, -0.435, -0.24, 0.24, 0.0, 0.0, 1.11, -0.435, -0.435, 0.435, 0.435, -0.24, 0.0, -0.24, -0.435, -0.435, 1.11, 0.0, -0.435, 0.435, -0.24, 0.0, 0.24, -0.435, -0.435, 0.0, 1.11, 0.435, -0.435, 0.0, -0.24, -0.24, -0.435, 0.435, -0.435, 0.435, 1.11, 0.0, 0.0, -0.24, 0.24, -0.435, 0.435, 0.435, -0.435, 0.0, 1.11);
 
+// The same matrices for the corner study (every non-conserved mode at rate 1, the stresses' share then taken with omega = 1):
+const MRT_EE_FIXED_CORNER: array<f32, 100> = array<f32, 100>(0.947368421, -0.105263158, -0.105263158, -0.105263158, -0.105263158, -0.105263158, -0.105263158, -0.105263158, -0.105263158, -0.105263158, -0.0526315789, 0.67251462, 0.00584795322, 0.00584795322, -0.216374269, -0.216374269, -0.216374269, -0.216374269, 0.116959064, 0.116959064, -0.0526315789, 0.00584795322, 0.67251462, 0.00584795322, -0.216374269, -0.216374269, 0.116959064, 0.116959064, -0.216374269, -0.216374269, -0.0526315789, 0.00584795322, 0.00584795322, 0.67251462, 0.116959064, 0.116959064, -0.216374269, -0.216374269, -0.216374269, -0.216374269, -0.0526315789, -0.216374269, -0.216374269, 0.116959064, 0.17251462, 0.17251462, 0.00584795322, 0.00584795322, 0.00584795322, 0.00584795322, -0.0526315789, -0.216374269, -0.216374269, 0.116959064, 0.17251462, 0.17251462, 0.00584795322, 0.00584795322, 0.00584795322, 0.00584795322, -0.0526315789, -0.216374269, 0.116959064, -0.216374269, 0.00584795322, 0.00584795322, 0.17251462, 0.17251462, 0.00584795322, 0.00584795322, -0.0526315789, -0.216374269, 0.116959064, -0.216374269, 0.00584795322, 0.00584795322, 0.17251462, 0.17251462, 0.00584795322, 0.00584795322, -0.0526315789, 0.116959064, -0.216374269, -0.216374269, 0.00584795322, 0.00584795322, 0.00584795322, 0.00584795322, 0.17251462, 0.17251462, -0.0526315789, 0.116959064, -0.216374269, -0.216374269, 0.00584795322, 0.00584795322, 0.00584795322, 0.00584795322, 0.17251462, 0.17251462);
+const MRT_OO_CORNER: array<f32, 81> = array<f32, 81>(0.8, 0.0, 0.0, -0.2, -0.2, -0.2, -0.2, 0.0, 0.0, 0.0, 0.8, 0.0, -0.2, 0.2, 0.0, 0.0, -0.2, -0.2, 0.0, 0.0, 0.8, 0.0, 0.0, -0.2, 0.2, -0.2, 0.2, -0.2, -0.2, 0.0, 0.6, 0.0, -0.2, -0.2, -0.2, -0.2, -0.2, 0.2, 0.0, 0.0, 0.6, -0.2, -0.2, 0.2, 0.2, -0.2, 0.0, -0.2, -0.2, -0.2, 0.6, 0.0, -0.2, 0.2, -0.2, 0.0, 0.2, -0.2, -0.2, 0.0, 0.6, 0.2, -0.2, 0.0, -0.2, -0.2, -0.2, 0.2, -0.2, 0.2, 0.6, 0.0, 0.0, -0.2, 0.2, -0.2, 0.2, 0.2, -0.2, 0.0, 0.6);
+
 // The D3Q19 multiple-relaxation-time collision with Guo forcing (fieldcraft_lbm::mrt) as constant matrices. With A = M⁻¹ S M
 // (S the relaxation rates of d'Humières et al. 2002's basis, the stresses' at the cell's rate ω) the moment-space update
 // f* = f + Σ_k r_k [−s_k (m_k − eq_k) + (1 − s_k/2) mf_k] / |r_k|² is f* = f + F − A (f − f_eq + F/2), F the Guo source of the
@@ -1842,6 +1844,9 @@ fn collide_mrt(cell: u32, lid: u32, xyz: vec3<i32>, fq: ptr<function, array<f32,
         }
         record_eddy(cell, lid, omega, u);
     }
+    // The corner study's cells relax fully (a select on a cell flag, not a branch: the same code runs in every cell).
+    let corner = WALL_CORNER && in_corner(cell);
+    if corner { omega = 1.0; }
     let uu = dot(u, u);
     let uf = dot(u, force);
     // The pairs' even and odd parts of f − f_eq + F/2 and of F; the rest's equilibrium is δρ less the others' (see collide_cell, #776).
@@ -1879,7 +1884,7 @@ fn collide_mrt(cell: u32, lid: u32, xyz: vec3<i32>, fq: ptr<function, array<f32,
     for (var r = 0u; r < 10u; r = r + 1u) {
         var a = 0.0;
         for (var c = 0u; c < 10u; c = c + 1u) {
-            a = a + (MRT_EE_FIXED[10u * r + c] + omega * MRT_EE_STRESS[10u * r + c]) * e[c];
+            a = a + (select(MRT_EE_FIXED[10u * r + c], MRT_EE_FIXED_CORNER[10u * r + c], corner) + omega * MRT_EE_STRESS[10u * r + c]) * e[c];
         }
         ae[r] = a;
     }
@@ -1887,7 +1892,7 @@ fn collide_mrt(cell: u32, lid: u32, xyz: vec3<i32>, fq: ptr<function, array<f32,
     for (var p = 0u; p < 9u; p = p + 1u) {
         var ao = 0.0;
         for (var c = 0u; c < 9u; c = c + 1u) {
-            ao = ao + MRT_OO[9u * p + c] * o[c];
+            ao = ao + select(MRT_OO[9u * p + c], MRT_OO_CORNER[9u * p + c], corner) * o[c];
         }
         let q = 2u * p + 1u;
         let even = se[p + 1u] - ae[p + 1u];
@@ -1909,14 +1914,12 @@ fn collide_mrt(cell: u32, lid: u32, xyz: vec3<i32>, fq: ptr<function, array<f32,
 // ω the rate the cell relaxes with, skipped exactly where σ = 1. With DYNAMIC, σ per cell from
 // the subgrid model's ν_t (Smagorinsky's from its implicit rate, or Vreman's), which then stays
 // out of the rate; a wall cell under the wall model keeps σ = 1 and its own rate.
-fn collide_regularized(cell: u32, lid: u32, xyz: vec3<i32>, fq: ptr<function, array<f32, 19>>, drho: f32, rho: f32, u: vec3<f32>, force: vec3<f32>, forced: bool, g: Gradient, to_equilibrium: bool) {
+fn collide_regularized(cell: u32, lid: u32, xyz: vec3<i32>, fq: ptr<function, array<f32, 19>>, drho: f32, rho: f32, u: vec3<f32>, force: vec3<f32>, forced: bool, g: Gradient) {
     var p = flux(fq, drho, rho, u, force, forced);
     var omega = params.omega_plus;
     var sigma = 1.0;
     if HRR && !DYNAMIC { sigma = params.les.x; }
-    // The corner study: full relaxation, rate 1, no blend and no model (f* = f^eq + F_q/2).
-    if to_equilibrium { omega = 1.0; }
-    if turbulent() && !to_equilibrium {
+    if turbulent() {
         var wall = -1.0;
         if WALL_MODEL { wall = wall_omega(cell); }
         if wall > 0.0 {
@@ -1942,7 +1945,6 @@ fn collide_regularized(cell: u32, lid: u32, xyz: vec3<i32>, fq: ptr<function, ar
         }
     }
     if WALL_SIGMA1 && HRR && wall_layer(coords(cell)) { sigma = 1.0; }
-    if to_equilibrium { sigma = 1.0; }
     if HRR && sigma != 1.0 {
         let s = strain(g);
         let fd = -2.0 * (1.0 / 3.0) * rho / omega;

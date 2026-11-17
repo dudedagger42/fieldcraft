@@ -602,8 +602,11 @@ pub struct Flow {
     wall_layer_bulk: f64,
     /// A study (off): the wall layer collides with the two-relaxation-time MRT scheme instead of the regularised one.
     wall_layer_mrt: bool,
-    /// The corner study: fluid cells with three or more solid axis faces relax fully to equilibrium (see `set_wall_corner_relax`).
+    /// The corner study (see `set_wall_corner_relax`): on or off, an explicit cell set that replaces the pure-corner test, and the
+    /// cells excluded from it.
     wall_corner_relax: bool,
+    wall_corner_cells: Option<Vec<usize>>,
+    wall_corner_exclude: Vec<usize>,
     /// Whether σ is dynamic (set per cell from the subgrid model, [`crate::hrr`]), and then its
     /// smallest and mean value over the fluid cells in the last collision.
     dynamic: bool,
@@ -1432,6 +1435,8 @@ impl Flow {
             wall_layer_bulk: 0.0,
             wall_layer_mrt: false,
             wall_corner_relax: false,
+            wall_corner_cells: None,
+            wall_corner_exclude: Vec::new(),
             dynamic: setup.dynamic_sigma,
             sigma_stats: None,
             gradient_u: if setup.collision == Collision::Hrr || setup.vreman > 0.0 || setup.spalart_allmaras.is_some() {
@@ -1858,11 +1863,63 @@ impl Flow {
         self.wall_layer_bulk
     }
 
-    /// A study (off by default, bit-identical off): a fluid cell with three or more solid axis faces (a concave corner) relaxes
-    /// fully to equilibrium each step (single relaxation at rate 1, Guo's half force kept) instead of its usual collision.
-    /// Cells with one or two solid faces (channel walls, duct edges) are not touched. Hybrid collision only.
+    /// A study (off by default, bit-identical off): a pure concave corner, a fluid cell with exactly one solid face neighbour on each of
+    /// the three axes, relaxes every non-conserved moment fully to equilibrium (rate 1, Guo's force kept) instead of its usual
+    /// collision. Cells with walls on both sides of an axis (slots, throats), and cells with one or two solid axes, are not touched.
+    /// Hybrid collision only. [`Flow::set_wall_corner_cells`] replaces the pure-corner test with a given set and
+    /// [`Flow::set_wall_corner_exclude`] removes cells from either.
     pub fn set_wall_corner_relax(&mut self, on: bool) {
         self.wall_corner_relax = on;
+    }
+
+    /// The corner study's cell set, replacing its own pure-corner test (fluid cells only are used); `None` returns to the test.
+    pub fn set_wall_corner_cells(&mut self, cells: Option<Vec<usize>>) {
+        self.wall_corner_cells = cells;
+    }
+
+    /// Cells the corner study leaves on their usual collision (the exclusion mask).
+    pub fn set_wall_corner_exclude(&mut self, cells: Vec<usize>) {
+        self.wall_corner_exclude = cells;
+    }
+
+    /// The corner study's cells: per grid cell whether it is a fluid cell the study collides to equilibrium (empty when the study is off).
+    pub fn wall_corner_mask(&self) -> Vec<bool> {
+        if !self.wall_corner_relax {
+            return Vec::new();
+        }
+        let n = self.grid.len();
+        let fluid = |c: usize| self.fluid.get(c).copied().unwrap_or(false);
+        let solid = |c: usize| !self.fluid.get(c).copied().unwrap_or(true);
+        let mut mask: Vec<bool> = match &self.wall_corner_cells {
+            Some(list) => {
+                let mut m = vec![false; n];
+                for &c in list {
+                    if let Some(slot) = m.get_mut(c) {
+                        *slot = true;
+                    }
+                }
+                m
+            }
+            None => (0..n)
+                .map(|c| {
+                    let p = self.grid.coords(c);
+                    (0..3).all(|axis| {
+                        let below = across(&self.grid, self.periodic, p, axis, false).is_some_and(solid);
+                        let above = across(&self.grid, self.periodic, p, axis, true).is_some_and(solid);
+                        below != above
+                    })
+                })
+                .collect(),
+        };
+        for (c, slot) in mask.iter_mut().enumerate() {
+            *slot = *slot && fluid(c);
+        }
+        for &c in &self.wall_corner_exclude {
+            if let Some(slot) = mask.get_mut(c) {
+                *slot = false;
+            }
+        }
+        mask
     }
 
     /// Whether the corner study is on ([`Flow::set_wall_corner_relax`]).
@@ -2636,21 +2693,8 @@ impl Flow {
         } else {
             Vec::new()
         };
-        // The corner study's cells: fluid with three or more solid axis faces (empty when off).
-        let corner: Vec<bool> = if self.wall_corner_relax && regularized {
-            let solid = |c: usize| !self.fluid.get(c).copied().unwrap_or(true);
-            (0..self.grid.len())
-                .map(|c| {
-                    let p = self.grid.coords(c);
-                    let faces = (0..3)
-                        .map(|axis| [false, true].iter().filter(|&&up| across(&self.grid, self.periodic, p, axis, up).is_some_and(solid)).count())
-                        .sum::<usize>();
-                    !solid(c) && faces >= 3
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
+        // The corner study's cells (empty when off).
+        let corner: Vec<bool> = if regularized { self.wall_corner_mask() } else { Vec::new() };
         // Dynamic σ's cap on the von Kármán length: the box's shortest extent in cells.
         let l_max = self.grid.cells.iter().copied().min().unwrap_or(1) as f64;
         let (wp, wm) = (self.omega_plus, self.omega_minus);
@@ -2797,12 +2841,12 @@ impl Flow {
                     1.0 / tau
                 };
                 let in_layer = layer.get(b * block + i).copied().unwrap_or(false);
-                // The corner study: full relaxation to equilibrium (rate 1; Guo's half force stays in the rebuild).
+                // The corner study: every non-conserved moment relaxes fully to equilibrium (Guo's force kept).
                 if regularized && corner.get(b * block + i).copied().unwrap_or(false) {
                     if turbulent {
                         eddy(from_rate(1.0));
                     }
-                    crate::regularized::rebuild(&fq, rho, u, force, forced, None, &mut post, |_| 1.0);
+                    crate::mrt::collide_full(&fq, rho, u, force, forced, &mut post);
                     for (q, v) in post.iter().enumerate() {
                         put(q, *v);
                     }
@@ -3353,6 +3397,8 @@ impl crate::backend::Backend for Flow {
             wall_layer_bulk: _,
             wall_layer_mrt: _,
             wall_corner_relax: _,
+            wall_corner_cells: _,
+            wall_corner_exclude: _,
             dynamic,
             sigma_stats,
             periodic,

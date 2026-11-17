@@ -134,6 +134,17 @@ fn equilibrium(rho: f64, u: [f64; 3]) -> [f64; Q] {
 /// cell's under Smagorinsky's model or the wall model).
 #[inline(always)]
 pub fn collide(fq: &[f64; Q], rho: f64, u: [f64; 3], force: [f64; 3], omega: f64, forced: bool, out: &mut [f64; Q]) {
+    collide_rates(fq, rho, u, force, forced, out, |k| if VISCOUS.contains(&k) { omega } else { RATES[k] });
+}
+
+/// The corner study's collision: every moment but the conserved ones relaxes fully to its equilibrium (rate 1), Guo's force in the
+/// momentum and, with `(1 - 1/2)`, in the rest.
+pub fn collide_full(fq: &[f64; Q], rho: f64, u: [f64; 3], force: [f64; 3], forced: bool, out: &mut [f64; Q]) {
+    collide_rates(fq, rho, u, force, forced, out, |k| if RATES[k] == 0.0 && !VISCOUS.contains(&k) { 0.0 } else { 1.0 });
+}
+
+#[inline(always)]
+fn collide_rates(fq: &[f64; Q], rho: f64, u: [f64; 3], force: [f64; 3], forced: bool, out: &mut [f64; Q], rate: impl Fn(usize) -> f64) {
     let eq = equilibrium(rho, u);
     // Guo's force in the populations, w_q (3 (c − u) + 9 (c·u) c)·F, then its moments.
     let mut source = [0.0f64; Q];
@@ -154,7 +165,7 @@ pub fn collide(fq: &[f64; Q], rho: f64, u: [f64; 3], force: [f64; 3], omega: f64
             m += f64::from(row[q]) * fq[q];
             mf += f64::from(row[q]) * source[q];
         }
-        let s = if VISCOUS.contains(&k) { omega } else { RATES[k] };
+        let s = rate(k);
         change[k] = (-s * (m - eq[k]) + (1.0 - 0.5 * s) * mf) / f64::from(NORM[k]);
     }
     for q in 0..Q {

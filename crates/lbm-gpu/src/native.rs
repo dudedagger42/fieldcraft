@@ -1389,7 +1389,7 @@ impl GpuFlow {
         // The WALL_MRT study's wall layer, marked once here: a fluid cell with a solid axis neighbour (a step out of a
         // non-periodic box is not solid) carries `LAYER_BIT`, which the kernel reads instead of probing six neighbours.
         if hybrid.is_some() && (flow.wall_layer_mrt() || flow.wall_corner_relax()) {
-            mark_wall_flags(flow.grid(), flow.periodic(), on_node, &mut fluid_u32, flow.wall_layer_mrt(), flow.wall_corner_relax());
+            mark_wall_flags(flow.grid(), flow.periodic(), on_node, &mut fluid_u32, flow.wall_layer_mrt(), &flow.wall_corner_mask());
         }
         let fluid_buf = storage("lbm fluid", &bytes_u32(&fluid_u32));
         let walls_buf = storage("lbm walls", &bytes_f32(&wall_rows));
@@ -2332,10 +2332,10 @@ impl Backend for GpuFlow {
     }
 }
 
-/// Sets `LAYER_BIT` (with `layer`) on every fluid cell that has a solid cell beside it along an axis, and `CORNER_BIT` (with `corner`)
-/// on every fluid cell with three or more solid axis faces (the kernel's `is_fluid`: bit 0 under the on-node bounce, any flag
-/// otherwise; a step out of a non-periodic box is not solid). The flags are read before any is set, so the marks never feed each other.
-fn mark_wall_flags(grid: &fieldcraft_lbm::voxel::Grid, periodic: [bool; 3], on_node: bool, flags: &mut [u32], layer: bool, corner: bool) {
+/// Sets `LAYER_BIT` (with `layer`) on every fluid cell that has a solid cell beside it along an axis, and `CORNER_BIT` with `LAYER_BIT`
+/// on every cell `corner` names (the corner study's cells; empty for none) (the kernel's `is_fluid`: bit 0 under the on-node bounce,
+/// any flag otherwise; a step out of a non-periodic box is not solid). The flags are read before any is set, so the marks never feed each other.
+fn mark_wall_flags(grid: &fieldcraft_lbm::voxel::Grid, periodic: [bool; 3], on_node: bool, flags: &mut [u32], layer: bool, corner: &[bool]) {
     let solid_word = |w: u32| if on_node { w & 1 == 0 } else { w == 0 };
     let faces_of = |c: usize| -> usize {
         let p = grid.coords(c);
@@ -2365,7 +2365,8 @@ fn mark_wall_flags(grid: &fieldcraft_lbm::voxel::Grid, periodic: [bool; 3], on_n
         .filter(|&c| flags.get(c).is_some_and(|w| !solid_word(*w)))
         .filter_map(|c| {
             let faces = faces_of(c);
-            let bits = if layer && faces >= 1 { LAYER_BIT } else { 0 } | if corner && faces >= 3 { CORNER_BIT } else { 0 };
+            let is_corner = corner.get(c).copied().unwrap_or(false);
+            let bits = if (layer && faces >= 1) || is_corner { LAYER_BIT } else { 0 } | if is_corner { CORNER_BIT } else { 0 };
             (bits != 0).then_some((c, bits))
         })
         .collect();
@@ -2545,7 +2546,7 @@ mod tests {
                 *flag = 0;
             }
         }
-        mark_wall_flags(&grid, [true, false, true], false, &mut flags, true, false);
+        mark_wall_flags(&grid, [true, false, true], false, &mut flags, true, &[]);
         for (c, flag) in flags.iter().enumerate() {
             let y = grid.coords(c)[1];
             let want = if y == 0 || y == 4 {
@@ -2559,14 +2560,34 @@ mod tests {
         }
         // an open box edge is not solid
         let mut open = vec![1u32; grid.len()];
-        mark_wall_flags(&grid, [false; 3], false, &mut open, true, false);
+        mark_wall_flags(&grid, [false; 3], false, &mut open, true, &[]);
         assert!(open.iter().all(|w| *w == 1));
         // a solid cell beside the periodic seam is seen across it
         let mut seam = vec![1u32; grid.len()];
         seam[grid.index([2, 2, 0])] = 0;
-        mark_wall_flags(&grid, [true, false, false], false, &mut seam, true, false);
+        mark_wall_flags(&grid, [true, false, false], false, &mut seam, true, &[]);
         assert_eq!(seam[grid.index([0, 2, 0])], 1 | LAYER_BIT);
         assert_eq!(seam[grid.index([1, 2, 0])], 1 | LAYER_BIT);
         assert_eq!(seam[grid.index([0, 3, 0])], 1);
+    }
+
+    /// A corner cell carries both bits (and the layer's, even with the layer off); the others keep what the layer gives them.
+    #[test]
+    fn corner_cells_carry_the_layer_and_corner_bits() {
+        let grid = fieldcraft_lbm::voxel::Grid { origin: [0.0; 3], spacing: 1.0, cells: [4, 4, 1] };
+        let mut flags = vec![1u32; grid.len()];
+        flags[grid.index([0, 0, 0])] = 0;
+        let mut corner = vec![false; grid.len()];
+        corner[grid.index([1, 1, 0])] = true;
+        let mut with_layer = flags.clone();
+        mark_wall_flags(&grid, [false; 3], false, &mut with_layer, true, &corner);
+        assert_eq!(with_layer[grid.index([1, 1, 0])], 1 | LAYER_BIT | CORNER_BIT);
+        assert_eq!(with_layer[grid.index([1, 0, 0])], 1 | LAYER_BIT);
+        assert_eq!(with_layer[grid.index([0, 1, 0])], 1 | LAYER_BIT);
+        assert_eq!(with_layer[grid.index([3, 3, 0])], 1);
+        let mut no_layer = flags.clone();
+        mark_wall_flags(&grid, [false; 3], false, &mut no_layer, false, &corner);
+        assert_eq!(no_layer[grid.index([1, 1, 0])], 1 | LAYER_BIT | CORNER_BIT);
+        assert_eq!(no_layer[grid.index([1, 0, 0])], 1);
     }
 }
