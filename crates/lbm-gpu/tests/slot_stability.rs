@@ -68,6 +68,16 @@ fn rounded_plate(x: [f64; 2], z: [f64; 2], y: [f64; 2], r: f64, slot_above: bool
     surface(positions, tris, tags, move |c, _| [c[0] - centre[0], c[1] - centre[1], c[2] - centre[2]])
 }
 
+/// The device options: `FIELDCRAFT_GPU_SUBMIT_STEPS` (0, the default: a whole chunk per submission; N: submissions of N steps each waited for)
+/// and `FIELDCRAFT_GPU_DUTY` (1.0, the default: off; in (0,1) the laptop GPU sleeps between waited-for submissions, needs SUBMIT_STEPS >= 1).
+/// Neither changes the results.
+fn gpu_pacing() -> Options {
+    let num = |n: &str| std::env::var(n).ok().and_then(|v| v.parse::<f64>().ok());
+    let o = Options { submit_steps: num("FIELDCRAFT_GPU_SUBMIT_STEPS").map_or(0, |v| v as u64), duty: num("FIELDCRAFT_GPU_DUTY").unwrap_or(1.0), ..Options::default() };
+    println!("GPU pacing: submit_steps {}, duty {}", o.submit_steps, o.duty);
+    o
+}
+
 #[test]
 #[ignore = "local: GPU run, approved per run"]
 fn slotted_channel_stability() {
@@ -319,7 +329,7 @@ fn slotted_channel_stability() {
         );
     }
     let mut gpu = if use_gpu {
-        match GpuFlow::with_options(&cpu, Policy::from_env().unwrap(), Options::default()) {
+        match GpuFlow::with_options(&cpu, Policy::from_env().unwrap(), gpu_pacing()) {
             Ok(g) => {
                 println!("DEVICE {}", g.adapter_name());
                 Some(g)
