@@ -91,6 +91,24 @@ fn duct_coefficient() -> f64 {
     (1.0 - 192.0 / pi.powi(5) * sum) / 12.0
 }
 
+/// The first chunk (its end step) whose change in the flow rate exceeds 10 times the median change of its neighbours (up to
+/// two chunks each side), with a floor of 1e-6 so that a noiseless stretch does not flag rounding.
+fn first_jump(hist: &[(u64, f64)]) -> Option<u64> {
+    let d: Vec<f64> = hist.windows(2).map(|w| (w[1].1 - w[0].1).abs()).collect();
+    (0..d.len()).find_map(|i| {
+        let mut nb: Vec<f64> = (i.saturating_sub(2)..(i + 3).min(d.len())).filter(|&j| j != i).map(|j| d[j]).collect();
+        nb.sort_by(f64::total_cmp);
+        let med = nb.get(nb.len() / 2).copied().unwrap_or(0.0);
+        (d[i] > 1e-6 && d[i] > 10.0 * med).then(|| hist[i + 1].0)
+    })
+}
+
+/// max - min of the flow rate over the history points after `from` (the last third of the run).
+fn range_after(hist: &[(u64, f64)], from: u64) -> f64 {
+    let v: Vec<f64> = hist.iter().filter(|(s, _)| *s > from).map(|h| h.1).collect();
+    v.iter().cloned().fold(f64::NEG_INFINITY, f64::max) - v.iter().cloned().fold(f64::INFINITY, f64::min)
+}
+
 fn flow_rate(flow: &mut fieldcraft_lbm::Flow, fluid: &[bool], along: f64, reference: f64) -> (f64, f64) {
     let f = Backend::fields(flow).expect("fields");
     let sum: f64 = (0..fluid.len()).filter(|&c| fluid[c]).map(|c| f.velocity[c][0]).sum();
@@ -146,7 +164,8 @@ fn product_rows() {
                     let t = done * 2 / 3;
                     if let Some(&(_, back)) = hist.iter().rev().find(|(s, _)| *s <= t) {
                         drift_last_third = (rate - back).abs() / (1.0 + rate).abs();
-                        if drift_last_third < 5e-4 {
+                        let jump_in_third = first_jump(&hist).filter(|j| *j > t);
+                        if drift_last_third < 5e-4 && range_after(&hist, t) < 5e-4 && jump_in_third.is_none() {
                             settled = true;
                             break;
                         }
@@ -159,20 +178,28 @@ fn product_rows() {
             println!("PRODUCT-HISTORY collision {label} tau-1/2 {tau_mh:e} case {name} cells {w}: {}", series.join(" "));
             let last = hist.last().map_or(f64::NAN, |h| h.1);
             let third = hist.iter().rev().find(|(s, _)| *s <= done * 2 / 3).map_or(f64::NAN, |h| h.1);
+            let last_jump = first_jump(&hist).filter(|j| *j > done * 2 / 3);
+            let status = if settled {
+                "settled: under 0.05 %"
+            } else if done < min_steps {
+                "below the minimum steps"
+            } else if last_jump.is_some() {
+                "NOT settled (jump)"
+            } else if range_after(&hist, done * 2 / 3) >= 5e-4 {
+                "NOT settled (oscillating)"
+            } else {
+                "NOT settled"
+            };
+            let jumps = first_jump(&hist).map_or(String::new(), |j| format!(" [first JUMP at step {j}]"));
+            let range = 100.0 * range_after(&hist, done * 2 / 3);
             println!(
-                "PRODUCT collision {label} tau-1/2 {tau_mh:e} U_LAT {} SA_SEED {} case {name} cells {w} steps {done} (minimum {min_steps}, cap {cap}): flow-rate error {:+.4} % (at 2/3 of the run {:+.4} %), change over the last third {:.4} % ({}), mean-density drift {:+.3e} per 10000 steps, largest nu_t/nu {max_ratio:.3e}{}",
+                "PRODUCT collision {label} tau-1/2 {tau_mh:e} U_LAT {} SA_SEED {} case {name} cells {w} steps {done} (minimum {min_steps}, cap {cap}): flow-rate error {:+.4} % (at 2/3 of the run {:+.4} %), change over the last third {:.4} %, max-min over it {range:.4} % ({status}){jumps}, range under the 1 % bar: {}, mean-density drift {:+.3e} per 10000 steps, largest nu_t/nu {max_ratio:.3e}{}",
                 u_lat(),
                 env("SA_SEED", 3.0),
                 100.0 * last,
                 100.0 * third,
                 100.0 * drift_last_third,
-                if settled {
-                    "settled: under 0.05 %"
-                } else if done >= min_steps {
-                    "NOT settled"
-                } else {
-                    "below the minimum steps"
-                },
+                if range < 1.0 { "yes" } else { "NO" },
                 (rho - rho0) / done.max(1) as f64 * 1e4,
                 if max_ratio > 1e-3 { "  VOID: the model is not idle" } else { "" }
             );
