@@ -11,6 +11,11 @@
 //! Mechanism knobs, both off by default (the rows are then unchanged): `WALL=halfway` leaves the walls as the plain half-way
 //! bounce-back of the grid (no interpolated links); the default interpolates them (linear). `LENGTH=<n>` makes the square duct n
 //! cells long along the flow (still periodic); the default is the harness's own 4 cells. Both are printed on the PRODUCT line.
+//! `PROFILE_START=1` (the pocket case only, test-only): the channel starts from the developed parabola of mean speed `U_LAT`
+//! (the pocket and the solid at rest) instead of from rest. The pocket case also reads its history every 1,000 steps and prints
+//! `PRODUCT-POCKET-HISTORY` (step:largest speed in the pocket, then in the whole domain).
+//! `WALL_SIGMA1=1` (default 0, off) sets σ = 1 in every fluid cell with a solid axis neighbour, the blend kept in the interior
+//! (the wall-layer rule); 2 is its complement (σ = 1 everywhere else).
 //! `WALL_GRADIENT=1` (default off: rows unchanged) lets the hybrid collision's strain rate see the walls: next to a solid cell the
 //! velocity gradient is taken through the wall point (u = 0, half a cell away), exact for a parabola. Printed on the PRODUCT line.
 //! `CASE=pocket` (never part of the default run): the aligned plane channel (width `CELLS`) with a rectangular pocket cut into
@@ -326,6 +331,16 @@ fn product_rows() {
             if !halfway_walls() {
                 flow.interpolate_walls_with(&setup, &obstacles, WallOrder::Linear).expect("interpolated walls");
             }
+            if pocket.is_some() && env("PROFILE_START", 0.0) == 1.0 {
+                // the developed laminar profile in the channel's rows (wall faces at y = 0 and y = w cells), the pocket at rest
+                let g = *flow.grid();
+                let wf = w as f64;
+                flow.set_equilibrium(|c| {
+                    let j = g.coords(c)[1];
+                    let y = (j as f64 + 0.5) / wf;
+                    (1.0, if j < w { [6.0 * u_lat() * y * (1.0 - y), 0.0, 0.0] } else { [0.0; 3] })
+                });
+            }
             flow.set_wall_aware_gradient(wall_gradient());
             flow.set_wall_gradient_gap(env("WALL_GAP", 0.5));
             flow.set_wall_layer_sigma_one(env("WALL_SIGMA1", 0.0) as u8);
@@ -352,7 +367,7 @@ fn product_rows() {
                 _ => (1.5 * (w * w) as f64 / tau_mh).ceil() as u64,
             };
             let cap = env("SCAN_STEPS", 4.0 * min_steps as f64) as u64;
-            let chunk = (min_steps / 40).max(250);
+            let chunk = if pocket.is_some() { 1000 } else { (min_steps / 40).max(250) };
             let (_, rho0) = flow_rate(&mut flow, &rate_cells, along, reference);
             let mut hist: Vec<(u64, f64)> = Vec::new();
             let (mut done, mut max_ratio) = (0u64, 0.0f64);
@@ -361,12 +376,13 @@ fn product_rows() {
             let mut rho = rho0;
             let mut along_hist: Vec<(u64, f64)> = Vec::new();
             let (mut pocket_max, mut pocket_last, mut first_flag) = (0.0f64, 0.0f64, None::<u64>);
+            let mut pocket_hist: Vec<(u64, f64, f64)> = Vec::new();
             while done < cap {
                 // the first chunk is sampled ten times finer, so that a jump inside it is seen by the running minimum
-                let step = if done < chunk { (chunk / 10).max(1) } else { chunk };
+                let step = if done < chunk && pocket.is_none() { (chunk / 10).max(1) } else { chunk };
                 let chunk = step.min(cap - done);
-                if Backend::advance(&mut flow, chunk).is_err() {
-                    println!("PRODUCT collision {label} tau-1/2 {tau_mh:e} case {name} cells {w}: STOPPED by the backend at step {done}");
+                if let Err(e) = Backend::advance(&mut flow, chunk) {
+                    println!("PRODUCT collision {label} tau-1/2 {tau_mh:e} case {name} cells {w}: STOPPED by the backend at step {done}: {e}");
                     break;
                 }
                 done += chunk;
@@ -378,6 +394,7 @@ fn product_rows() {
                 if pocket.is_some() {
                     let (all, inside, finite) = speeds(&mut flow, &fluid, w);
                     pocket_max = pocket_max.max(inside);
+                    pocket_hist.push((done, inside, all));
                     pocket_last = inside;
                     if first_flag.is_none() && (!finite || all > 0.3) {
                         first_flag = Some(done);
@@ -410,6 +427,10 @@ fn product_rows() {
             let along_series: Vec<String> = along_hist.iter().step_by(every).map(|(st, a)| format!("{st}:{a:.3e}")).collect();
             println!("PRODUCT-ALONG collision {label} tau-1/2 {tau_mh:e} case {name} cells {w}: {}", along_series.join(" "));
             let along_max = along_hist.last().map_or(f64::NAN, |a| a.1);
+            if pocket.is_some() {
+                let series: Vec<String> = pocket_hist.iter().map(|(st, i, a)| format!("{st}:{i:.3e}/{a:.3e}")).collect();
+                println!("PRODUCT-POCKET-HISTORY collision {label} tau-1/2 {tau_mh:e} case {name} cells {w}: {}", series.join(" "));
+            }
             if let Some((pw, pd)) = pocket {
                 let (none, lacking) = neighbour_counts(&flow, &fluid);
                 println!(
