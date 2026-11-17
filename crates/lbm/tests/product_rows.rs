@@ -141,6 +141,10 @@ fn product_rows() {
                     }
                 }
             }
+            // the history, at most 40 points: step:flow-rate error (%)
+            let every = (hist.len() / 40).max(1);
+            let series: Vec<String> = hist.iter().step_by(every).map(|(st, r)| format!("{st}:{:+.4}", 100.0 * r)).collect();
+            println!("PRODUCT-HISTORY collision {label} tau-1/2 {tau_mh:e} case {name} cells {w}: {}", series.join(" "));
             let last = hist.last().map_or(f64::NAN, |h| h.1);
             let third = hist.iter().rev().find(|(s, _)| *s <= done * 2 / 3).map_or(f64::NAN, |h| h.1);
             println!(
