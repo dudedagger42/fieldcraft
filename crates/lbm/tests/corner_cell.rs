@@ -90,6 +90,7 @@ fn corner_cell() {
     };
     flow.set_wall_layer_mrt(env("WALL_MRT", 1.0) != 0.0 && !mrt_all);
     flow.set_wall_corner_relax(env("WALL_CORNER", 0.0) != 0.0);
+    flow.set_wall_tau_floor(env("WALL_TAU_FLOOR", 0.0));
     let grid = *flow.grid();
     let fluid: Vec<bool> = (0..grid.len()).map(|c| Backend::is_fluid(&flow, c)).collect();
     // the census: fluid cells by their number of solid axis faces

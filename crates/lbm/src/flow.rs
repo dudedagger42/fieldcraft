@@ -675,6 +675,8 @@ pub struct Flow {
     /// The corner study (see `set_wall_corner_relax`): on or off, an explicit cell set that replaces the pure-corner test, and the
     /// cells excluded from it.
     wall_corner_relax: bool,
+    /// The wall-layer MRT's floor on τ − ½ (0: none), see `set_wall_tau_floor`.
+    wall_tau_floor: f64,
     wall_corner_cells: Option<Vec<usize>>,
     wall_corner_exclude: Vec<usize>,
     /// Whether σ is dynamic (set per cell from the subgrid model, [`crate::hrr`]), and then its
@@ -1816,6 +1818,7 @@ impl Flow {
             wall_layer_bulk: 0.0,
             wall_layer_mrt: false,
             wall_corner_relax: false,
+            wall_tau_floor: 0.0,
             wall_corner_cells: None,
             wall_corner_exclude: Vec::new(),
             dynamic: setup.dynamic_sigma,
@@ -2467,6 +2470,18 @@ impl Flow {
     /// [`Flow::set_wall_corner_exclude`] removes cells from either.
     pub fn set_wall_corner_relax(&mut self, on: bool) {
         self.wall_corner_relax = on;
+    }
+
+    /// A study (off by default, bit-identical off), used with [`Flow::set_wall_layer_mrt`]: a floor on τ − ½ of the wall layer's MRT
+    /// stresses, so those cells relax no faster than `floor` allows (a larger viscosity there). A value that is not finite or not
+    /// positive switches it off.
+    pub fn set_wall_tau_floor(&mut self, floor: f64) {
+        self.wall_tau_floor = if floor.is_finite() && floor > 0.0 { floor } else { 0.0 };
+    }
+
+    /// The wall layer's floor on τ − ½ ([`Flow::set_wall_tau_floor`]; 0 when off).
+    pub fn wall_tau_floor(&self) -> f64 {
+        self.wall_tau_floor
     }
 
     /// The corner study's cell set, replacing its own pure-corner test (fluid cells only are used); `None` returns to the test.
@@ -3341,6 +3356,7 @@ impl Flow {
         let wall_gap = self.wall_gap;
         let wall_layer_sigma_one = self.wall_layer_sigma_one;
         let (wall_bulk, wall_mrt) = (self.wall_layer_bulk, self.wall_layer_mrt);
+        let wall_tau_floor = self.wall_tau_floor;
         // The wall layer of the two remedy studies: fluid cells with a solid axis neighbour (empty when neither is on).
         let layer: Vec<bool> = if (wall_bulk > 0.0 || wall_mrt) && regularized {
             let solid = |c: usize| !self.fluid.get(c).copied().unwrap_or(true);
@@ -3514,7 +3530,10 @@ impl Flow {
                 }
                 // The MRT study: the wall layer relaxes with MRT, at the rate the MRT branch below would use.
                 if regularized && wall_mrt && in_layer {
-                    let rate = wall_rate.or(explicit).unwrap_or(wp);
+                    let mut rate = wall_rate.or(explicit).unwrap_or(wp);
+                    if wall_tau_floor > 0.0 {
+                        rate = rate.min(1.0 / (0.5 + wall_tau_floor));
+                    }
                     if turbulent {
                         eddy(from_rate(rate));
                     }
@@ -4090,6 +4109,7 @@ impl crate::backend::Backend for Flow {
             wall_layer_bulk: _,
             wall_layer_mrt: _,
             wall_corner_relax: _,
+            wall_tau_floor: _,
             wall_corner_cells: _,
             wall_corner_exclude: _,
             dynamic,
