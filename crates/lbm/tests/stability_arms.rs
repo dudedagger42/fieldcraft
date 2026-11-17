@@ -130,6 +130,10 @@ fn the_stability_arms() {
             walls: WallTreatment::InterpolatedQuadratic,
             halfway_above_half: false,
         },
+        Arm { name: "HRR 1.0, linear", collision: Collision::Hrr, sigma: Some(1.0), walls: lin, halfway_above_half: false },
+        Arm { name: "HRR 1.0, quadratic", collision: Collision::Hrr, sigma: Some(1.0), walls: WallTreatment::InterpolatedQuadratic, halfway_above_half: false },
+        Arm { name: "HRR 0.99, linear", collision: Collision::Hrr, sigma: Some(0.99), walls: lin, halfway_above_half: false },
+        Arm { name: "HRR 0.99, quadratic", collision: Collision::Hrr, sigma: Some(0.99), walls: WallTreatment::InterpolatedQuadratic, halfway_above_half: false },
         Arm { name: "HRR 0.95, half-way walls", collision: Collision::Hrr, sigma: Some(0.95), walls: WallTreatment::Halfway, halfway_above_half: false },
         Arm { name: "regularised, quadratic", collision: Collision::Regularized, sigma: None, walls: WallTreatment::InterpolatedQuadratic, halfway_above_half: false },
         Arm {
