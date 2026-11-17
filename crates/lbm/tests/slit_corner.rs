@@ -1,0 +1,263 @@
+//! A driven test bed for the dead-end corner of a slit: how strongly does the corner cell amplify a disturbance, and does the
+//! disturbance decay or grow afterwards? Print-only, `#[ignore]`: the lines are read, not gated.
+//!
+//! Geometry (3D, periodic along z over 4 cells, so it is a 2D case): a plane channel `CELLS` cells wide (default 8) driven along x by a
+//! body force, with a slit `SLIT_W` cells wide (default 2) and `SLIT_D` cells deep (default 30) cut into its upper wall, closed at the
+//! far end. The slit's closed end has two corner cells, each with two solid axis neighbours (a side wall and the end). The channel flow
+//! passes the slit's mouth. `FILL="x,y;x,y;..."` makes the listed cells (cell coordinates) solid, for the variants that fill cells
+//! next to the corner; the corner cells are `(4, W + D - 1)` and `(5, W + D - 1)` for a 2-wide slit (printed).
+//!
+//! The drive: after `SETTLE_STEPS` (default 20,000) the flow is read as the baseline, then for `PULSE_STEPS` (default 300) the body force
+//! carries an extra `PULSE_AMP / PULSE_STEPS` along x (default amplitude 1e-3 lattice speed: the free-flow velocity change the pulse
+//! would cause), then the run continues `AFTER_STEPS` (default 20,000) more. The pulse and the read-out are the reusable part: a corner
+//! remedy is scored by the lines below with the same pulse.
+//!
+//! Read-out, every `SAMPLE` (default 10) steps: the largest |rho - rho_baseline| over the corner cells (called the corner deviation),
+//! and whether that cell alternates cell to cell: along some axis both its fluid neighbours' deviations have the opposite sign and
+//! at least half its size (2 dx alternation). The lines:
+//! - `SLIT-CORNER ... amplification A`: the largest corner deviation over the whole run divided by `PULSE_AMP`, and the step it occurs at;
+//! - `rate`: the corner deviation's envelope (the maximum over each 500-step block) after the pulse ends, as the natural log of the last
+//!   block over the first block, per 1,000 steps (positive: growing, negative: decaying), with the envelope blocks printed;
+//! - `SLIT-HISTORY`: the corner deviation every 100 steps (`*` marks an alternating read);
+//! - the run's stop (the solver's own, a speed over 0.3 or a non-finite number), if any.
+//!
+//! Environment: `TAU_MINUS_HALF` (default 1.8e-4), `PEAK` (peak lattice speed of the channel's parabola, default 0.11; the mean is 2/3 of it
+//! (parabola), `SIGMA` (default 0.95), `WALL_SIGMA1` (0 or 1, default 0), `SA_SEED` (default 0: the model's trivial solution).
+//!
+//! `cargo test --release -p fieldcraft-lbm --test slit_corner -- --ignored --nocapture slit_corner`
+
+mod common;
+
+use common::*;
+use fieldcraft_lbm::backend::Backend;
+use fieldcraft_lbm::{Flow, Limits, Obstacle, Setup};
+use fieldcraft_model::{Collision, FaceCondition, HrrSigma, Procedure, Turbulence};
+
+const PERIODIC: FaceCondition = FaceCondition::Periodic {};
+
+fn env(name: &str, default: f64) -> f64 {
+    std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+}
+
+/// `FILL="x,y;x,y"`: cells (coordinates) made solid.
+fn fill_cells() -> Vec<(usize, usize)> {
+    std::env::var("FILL")
+        .unwrap_or_default()
+        .split(';')
+        .filter_map(|p| {
+            let (a, b) = p.split_once(',')?;
+            Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
+        })
+        .collect()
+}
+
+struct Case {
+    setup: Setup,
+    obstacles: Vec<Obstacle>,
+    /// The two corner cells' coordinates.
+    corners: [[usize; 3]; 2],
+    /// The acceleration (lattice units) the flow is driven with.
+    base_acceleration: f64,
+}
+
+/// The channel with the slit, in lattice units with dx = 1/w.
+fn build(w: usize, slit_w: usize, slit_d: usize, tau_minus_half: f64, peak: f64, sigma: f64, fills: &[(usize, usize)]) -> Result<Case, String> {
+    let nu_lat = tau_minus_half / 3.0;
+    let dx = 1.0 / w as f64;
+    let dt = nu_lat * dx * dx;
+    let wf = w as f64;
+    let ny = w + 4 + slit_d;
+    let (lx, ly, lz) = (16.0 * dx, ny as f64 * dx, 4.0 * dx);
+    let ho = wf * dx;
+    let (x0, x1) = (4.0 * dx, (4 + slit_w) as f64 * dx);
+    let mut obstacles = vec![
+        obstacle("WallLeft", cuboid([-3.0 * lx, ho, -dx], [x0, ly, lz + dx]), &CUBOID_FACES),
+        obstacle("WallRight", cuboid([x1, ho, -dx], [3.0 * lx, ly, lz + dx]), &CUBOID_FACES),
+        obstacle("WallCap", cuboid([x0, ho + slit_d as f64 * dx, -dx], [x1, ly, lz + dx]), &CUBOID_FACES),
+    ];
+    for (k, &(cx, cy)) in fills.iter().enumerate() {
+        let (a, b) = (cx as f64 * dx, cy as f64 * dx);
+        let name: &'static str =
+            ["Fill0", "Fill1", "Fill2", "Fill3", "Fill4", "Fill5", "Fill6", "Fill7"].get(k).copied().ok_or("at most 8 fill cells")?;
+        obstacles.push(obstacle(name, cuboid([a, b, -dx], [a + dx, b + dx, lz + dx]), &CUBOID_FACES));
+    }
+    let mut d = domain([0.0; 3], [lx, ly, lz], dx);
+    for f in [&mut d.faces.x_min, &mut d.faces.x_max, &mut d.faces.y_min, &mut d.faces.y_max, &mut d.faces.z_min, &mut d.faces.z_max] {
+        *f = PERIODIC;
+    }
+    d.obstacles = obstacles.iter().map(|o| o.body.clone()).collect();
+    // the body force of a plane channel for the mean speed (2/3 of the peak): 12 nu U / H^2
+    let mean = peak * 2.0 / 3.0;
+    let g_lat = 12.0 * nu_lat * mean / (wf * wf);
+    d.acceleration = [g_lat * dx / (dt * dt), 0.0, 0.0];
+    let mut p = collide(1e6 * dt, dt, None, Collision::Hrr);
+    if let Procedure::Fluid { sigma: s, turbulence, .. } = &mut p {
+        *s = Some(HrrSigma::Value(sigma));
+        if tau_minus_half < 5e-3 - 1e-12 {
+            *turbulence = Some(Turbulence::SpalartAllmaras { prandtl: 0.9, wall_model: None, inflow_ratio: env("SA_SEED", 0.0), ddes: None });
+        }
+    }
+    let m = model(1.0, 1.0, d, p);
+    let setup = Setup::new(&m, None, &obstacles, &Limits::default()).map_err(|e| e.to_string())?;
+    let yb = w + slit_d - 1;
+    Ok(Case { setup, obstacles, corners: [[4, yb, 0], [5, yb, 0]], base_acceleration: g_lat })
+}
+
+/// One read of the corner: the largest |rho - baseline| over the corner cells, its signed value, and the alternation flag.
+fn read_corner(flow: &mut Flow, fluid: &[bool], corners: &[[usize; 3]; 2], baseline: &[f64]) -> Option<(f64, bool)> {
+    let f = Backend::fields(flow).ok()?;
+    let g = *flow.grid();
+    let dev = |c: usize| f.density.get(c).copied().unwrap_or(f64::NAN) - baseline.get(c).copied().unwrap_or(f64::NAN);
+    let (mut best, mut best_dev) = (None::<[usize; 3]>, 0.0f64);
+    for &p in corners {
+        let c = g.index(p);
+        if !fluid.get(c).copied().unwrap_or(false) {
+            continue;
+        }
+        let d = dev(c);
+        if !d.is_finite() {
+            return Some((f64::NAN, false));
+        }
+        if best.is_none() || d.abs() > best_dev.abs() {
+            best = Some(p);
+            best_dev = d;
+        }
+    }
+    let p = best?;
+    let mut alternates = false;
+    for a in 0..3 {
+        let n = g.cells[a];
+        let mut vals = [f64::NAN; 2];
+        for (k, up) in [false, true].into_iter().enumerate() {
+            let mut q = p;
+            q[a] = if up { (p[a] + 1) % n } else { (p[a] + n - 1) % n };
+            let ci = g.index(q);
+            if fluid.get(ci).copied().unwrap_or(false) {
+                vals[k] = dev(ci);
+            }
+        }
+        alternates |= vals.iter().all(|v| v * best_dev < 0.0 && v.abs() >= 0.5 * best_dev.abs());
+    }
+    Some((best_dev, alternates))
+}
+
+#[test]
+#[ignore = "print-only study: see the module docs (cargo test --release -p fieldcraft-lbm --test slit_corner -- --ignored --nocapture)"]
+fn slit_corner() {
+    let (w, slit_w, slit_d) = (env("CELLS", 8.0) as usize, env("SLIT_W", 2.0) as usize, env("SLIT_D", 30.0) as usize);
+    let (tau, peak, sigma) = (env("TAU_MINUS_HALF", 1.8e-4), env("PEAK", 0.11), env("SIGMA", 0.95));
+    let (settle, pulse_steps, after) = (env("SETTLE_STEPS", 20_000.0) as u64, env("PULSE_STEPS", 300.0) as u64, env("AFTER_STEPS", 20_000.0) as u64);
+    let (amp, sample) = (env("PULSE_AMP", 1e-3), (env("SAMPLE", 10.0) as u64).max(1));
+    let wall_sigma1 = env("WALL_SIGMA1", 0.0) as u8;
+    let fills = fill_cells();
+    let label = format!("tau-1/2 {tau:e} peak {peak} sigma {sigma} WALL_SIGMA1 {wall_sigma1} fill {fills:?}");
+    let case = match build(w, slit_w, slit_d, tau, peak, sigma, &fills) {
+        Ok(c) => c,
+        Err(e) => {
+            println!("SLIT-CORNER {label}: setup refused: {e}");
+            return;
+        }
+    };
+    let mut flow = match Flow::new(&case.setup, &case.obstacles) {
+        Ok(f) => f,
+        Err(e) => {
+            println!("SLIT-CORNER {label}: refused: {e}");
+            return;
+        }
+    };
+    flow.set_wall_layer_sigma_one(wall_sigma1);
+    let n = flow.grid().len();
+    let fluid: Vec<bool> = (0..n).map(|c| Backend::is_fluid(&flow, c)).collect();
+    println!(
+        "SLIT-GEOMETRY {label}: grid {:?}, corner cells {:?}, corner fluid {:?}",
+        flow.grid().cells,
+        case.corners,
+        case.corners.map(|p| fluid[flow.grid().index(p)])
+    );
+    let a0 = flow.acceleration();
+    let mut stop: Option<String> = None;
+    // settle
+    let mut done = 0u64;
+    while done < settle && stop.is_none() {
+        let c = 1000.min(settle - done);
+        if let Err(e) = Backend::advance(&mut flow, c) {
+            stop = Some(format!("solver stop after step {done}: {e}"));
+        }
+        done += c;
+    }
+    let baseline: Vec<f64> = match Backend::fields(&mut flow) {
+        Ok(f) if stop.is_none() => f.density,
+        _ => vec![1.0; n],
+    };
+    // pulse and after: one clock of `sample` steps
+    let pulse_a = [a0[0] + amp / pulse_steps.max(1) as f64, a0[1], a0[2]];
+    let total = pulse_steps + after;
+    let (mut t, mut peak_dev, mut peak_at) = (0u64, 0.0f64, 0u64);
+    let mut hist: Vec<(u64, f64, bool)> = Vec::new();
+    let mut alt_reads = 0usize;
+    while t < total && stop.is_none() {
+        let c = sample.min(total - t);
+        let a = if t < pulse_steps { pulse_a } else { a0 };
+        if let Err(e) = Backend::set_acceleration(&mut flow, a) {
+            stop = Some(format!("acceleration refused: {e}"));
+            break;
+        }
+        if let Err(e) = Backend::advance(&mut flow, c) {
+            stop = Some(format!("solver stop at time {t} after the settle: {e}"));
+            break;
+        }
+        t += c;
+        match read_corner(&mut flow, &fluid, &case.corners, &baseline) {
+            Some((d, alt)) => {
+                if !d.is_finite() {
+                    stop = Some(format!("non-finite corner density at time {t}"));
+                    break;
+                }
+                alt_reads += usize::from(alt);
+                if d.abs() > peak_dev {
+                    peak_dev = d.abs();
+                    peak_at = t;
+                }
+                hist.push((t, d, alt));
+            }
+            None => {
+                stop = Some(format!("could not read the fields at time {t}"));
+                break;
+            }
+        }
+    }
+    let series: Vec<String> =
+        hist.iter().filter(|(s, ..)| s % 100 == 0).map(|(s, d, alt)| format!("{s}:{d:+.3e}{}", if *alt { "*" } else { "" })).collect();
+    println!("SLIT-HISTORY {label} (time since the pulse start: corner deviation):\n{}", series.join(" "));
+    // envelope blocks of 500 steps after the pulse
+    let blocks: Vec<f64> = hist
+        .iter()
+        .filter(|(s, ..)| *s > pulse_steps)
+        .fold(Vec::<(u64, f64)>::new(), |mut acc, (s, d, _)| {
+            let b = (s - pulse_steps - 1) / 500;
+            if acc.last().map(|x| x.0) == Some(b) {
+                if let Some(l) = acc.last_mut() {
+                    l.1 = l.1.max(d.abs());
+                }
+            } else {
+                acc.push((b, d.abs()));
+            }
+            acc
+        })
+        .into_iter()
+        .map(|(_, v)| v)
+        .collect();
+    let rate = match (blocks.first(), blocks.last()) {
+        (Some(&f), Some(&l)) if blocks.len() > 1 && f > 0.0 && l > 0.0 => ((l / f).ln() / ((blocks.len() - 1) as f64 * 0.5)).to_string(),
+        _ => "n/a".to_string(),
+    };
+    println!(
+        "SLIT-CORNER {label}: amplification {:.3} (peak corner deviation {:.3e} at time {peak_at}, pulse {amp:e}); rate per 1000 steps {rate} (positive grows); alternating reads {alt_reads} of {}; envelope blocks of 500 steps {:?}; {}",
+        peak_dev / amp,
+        peak_dev,
+        hist.len(),
+        blocks.iter().map(|b| format!("{b:.2e}")).collect::<Vec<_>>(),
+        stop.unwrap_or_else(|| "no stop".to_string())
+    );
+    let _ = case.base_acceleration;
+}
