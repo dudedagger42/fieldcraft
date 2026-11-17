@@ -1694,7 +1694,7 @@ fn collide_cell(cell: u32, lid: u32) {
     var g = Gradient(vec3<f32>(0.0), vec3<f32>(0.0), vec3<f32>(0.0), vec3<f32>(0.0));
     if collision_gradient() { g = fd_gradient(cell); }
     if REGULARIZED {
-        if WALL_MRT && HRR && wall_layer(xyz) {
+        if WALL_MRT && HRR && wall_layer(coords(cell)) {
             collide_mrt(cell, lid, xyz, &fq, drho, rho, u, force, forced, g);
             return;
         }

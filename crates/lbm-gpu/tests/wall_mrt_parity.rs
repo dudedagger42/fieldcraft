@@ -35,9 +35,13 @@ struct Case {
 }
 
 fn fluid_procedure(dt: f64, tau_minus_half: f64, sigma: f64) -> Procedure {
-    let mut p = collide(1e6 * dt, dt, None, Collision::Hrr);
+    // MRT_ALL=1: the control with the MRT collision everywhere (the knob then does nothing)
+    let all = env("MRT_ALL", 0.0) != 0.0;
+    let mut p = collide(1e6 * dt, dt, None, if all { Collision::Mrt } else { Collision::Hrr });
     if let Procedure::Fluid { sigma: s, turbulence, .. } = &mut p {
-        *s = Some(HrrSigma::Value(sigma));
+        if !all {
+            *s = Some(HrrSigma::Value(sigma));
+        }
         if tau_minus_half < 5e-3 - 1e-12 {
             *turbulence = Some(Turbulence::SpalartAllmaras { prandtl: 0.9, wall_model: None, inflow_ratio: 0.0, ddes: None });
         }
@@ -50,18 +54,29 @@ fn finish(m: fieldcraft_model::Model, obstacles: Vec<Obstacle>, steps: u64, forc
     Ok(Case { setup, obstacles, steps, force })
 }
 
-/// The square duct, `w` cells across, 4 cells long (periodic), half-way box walls on y and z.
+/// The square duct, `w` cells across, 4 cells long (periodic): the fluid cells 1..=w of a box `w + 2` cells across, periodic all round, with four
+/// solid slabs for the walls (half-way walls on solid cells, so the wall layer exists).
 fn duct(w: usize, tau_minus_half: f64, sigma: f64) -> Result<Case, String> {
     let nu_lat = tau_minus_half / 3.0;
     let dx = 1.0 / w as f64;
     let dt = nu_lat * dx * dx;
-    let mut d = domain([0.0; 3], [4.0 * dx, w as f64 * dx, w as f64 * dx], dx);
-    d.faces.x_min = PERIODIC;
-    d.faces.x_max = PERIODIC;
+    let n = (w + 2) as f64 * dx;
+    let big = 3.0 * n;
+    let obstacles = vec![
+        obstacle("WallYLow", cuboid([-big, -dx, -dx], [big, dx, n + dx]), &CUBOID_FACES),
+        obstacle("WallYHigh", cuboid([-big, (w + 1) as f64 * dx, -dx], [big, n + dx, n + dx]), &CUBOID_FACES),
+        obstacle("WallZLow", cuboid([-big, -dx, -dx], [big, n + dx, dx]), &CUBOID_FACES),
+        obstacle("WallZHigh", cuboid([-big, -dx, (w + 1) as f64 * dx], [big, n + dx, n + dx]), &CUBOID_FACES),
+    ];
+    let mut d = domain([0.0; 3], [4.0 * dx, n, n], dx);
+    for f in [&mut d.faces.x_min, &mut d.faces.x_max, &mut d.faces.y_min, &mut d.faces.y_max, &mut d.faces.z_min, &mut d.faces.z_max] {
+        *f = PERIODIC;
+    }
+    d.obstacles = obstacles.iter().map(|o| o.body.clone()).collect();
     let g_lat = 12.0 * nu_lat * 0.02 / (w * w) as f64;
     d.acceleration = [g_lat * dx / (dt * dt), 0.0, 0.0];
     let m = model(1.0, 1.0, d, fluid_procedure(dt, tau_minus_half, sigma));
-    finish(m, Vec::new(), env("PARITY_STEPS", 2000.0) as u64, Box::new(move |_| [g_lat, 0.0, 0.0]))
+    finish(m, obstacles, env("PARITY_STEPS", 2000.0) as u64, Box::new(move |_| [g_lat, 0.0, 0.0]))
 }
 
 /// The plane channel (periodic in x and z) with a pocket 2 cells wide and 4 deep cut into the upper wall.
@@ -164,14 +179,18 @@ fn parity(name: &str, case: Result<Case, String>) -> Result<(), String> {
         Backend::advance(&mut gpu, c).map_err(|e| e.to_string())?;
         t += c;
         let (fa, fb) = (Backend::fields(&mut cpu).map_err(|e| e.to_string())?, Backend::fields(&mut gpu).map_err(|e| e.to_string())?);
-        let (mut du, mut dr) = (0.0f64, 0.0f64);
+        let (mut du, mut dr, mut at) = (0.0f64, 0.0f64, 0usize);
         for i in 0..fa.velocity.len() {
             if !Backend::is_fluid(&cpu, i) {
                 continue;
             }
-            du = du.max((0..3).map(|k| (fa.velocity[i][k] - fb.velocity[i][k]).powi(2)).sum::<f64>().sqrt());
+            let e = (0..3).map(|k| (fa.velocity[i][k] - fb.velocity[i][k]).powi(2)).sum::<f64>().sqrt();
+            if e > du {
+                (du, at) = (e, i);
+            }
             dr = dr.max((fa.density[i] - fb.density[i]).abs());
         }
+        println!("WALL_MRT-PARITY {name} step {t}: largest |du| at cell {:?}", cpu.grid().coords(at));
         worst_u = worst_u.max(du);
         worst_r = worst_r.max(dr);
         println!(
