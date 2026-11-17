@@ -724,6 +724,12 @@ impl Step {
             window.restore(&saved);
             steps = at;
             println!("resumed {} at step {steps} ({} samples)", path.display(), kept.len());
+            // `FIELDCRAFT_STEP_FRESH_LAYER`: the shear layer's sums (stresses, variances) start at the resumed step, so they
+            // cover the continuation alone (the floor's sums and the blocks go on from the file).
+            if std::env::var_os("FIELDCRAFT_STEP_FRESH_LAYER").is_some() {
+                window.layer = ShearLayer::new(&flow, self);
+                println!("the shear layer's sums restart at step {steps}: stresses and variances cover the steps after it");
+            }
             let first = startup + self.sample;
             for (n, sample) in kept.iter().enumerate() {
                 let now = take(sample, first + n as u64 * self.sample, None, &mut shear, &mut blocks, &mut missing, &mut recent);
@@ -1216,12 +1222,20 @@ impl std::fmt::Display for Readings {
 
 /// The stations behind the step (x, in H) where the resolved and the modelled shear stress are
 /// compared in the shear layer.
-const STRESS_STATIONS: [f64; 3] = [1.0, 3.0, 5.0];
+/// The first three are the original stations (indices 0 to 2 are read by position elsewhere); 0.5 and 2 H were added with the
+/// velocity variances.
+const STRESS_STATIONS: [f64; 5] = [1.0, 3.0, 5.0, 0.5, 2.0];
+
+/// What a station's row sums hold: `[Σ u, Σ w, Σ u w, Σ ν_t, samples, Σ u², Σ v, Σ v², Σ w², samples with the velocity
+/// sums, Σ u and Σ w over those samples alone]` (u streamwise, v spanwise, w vertical; each term the span mean of a sample). The last seven are absent from a file
+/// written before they existed: its rows load with a zero velocity-sample count and no variance is reported from them.
+const ROW_SUMS: usize = 12;
 
 /// The shear layer's stress at [`STRESS_STATIONS`] over the whole averaging window: for each
 /// station and cell row, the running sums of the span-mean u, w, u w and the eddy viscosity ν_t,
 /// one sample at a time. The resolved stress is −(⟨u w⟩ − ⟨u⟩⟨w⟩), the modelled one ⟨ν_t⟩ d⟨u⟩/dz
 /// (the molecular part is negligible at these Reynolds numbers and is left out of both).
+#[derive(Clone)]
 struct ShearLayer {
     /// The column of each station.
     columns: [usize; STRESS_STATIONS.len()],
@@ -1231,8 +1245,8 @@ struct ShearLayer {
     lattice_velocity: f64,
     /// The fluid's molecular viscosity (lattice units), the argument of the model's ν_t.
     nu: f64,
-    /// `[Σ u, Σ w, Σ u w, Σ ν_t, samples]` of station s, row k, at `s * nz + k`.
-    sums: Vec<[f64; 5]>,
+    /// [`ROW_SUMS`] of station s, row k, at `s * nz + k`.
+    sums: Vec<[f64; ROW_SUMS]>,
 }
 
 /// The stress of one station: at the height of the largest total stress, and over the layer.
@@ -1247,6 +1261,10 @@ struct Stress {
     /// Resolved over total at that height, and ∫|τ_res| over ∫(|τ_res| + |τ_mod|) over the rows.
     peak_fraction: f64,
     layer_fraction: f64,
+    /// The variances (u'u', v'v', w'w') at that height and the spanwise over streamwise ratio v'v'/u'u' summed over the
+    /// layer's rows; none for sums without them.
+    variance: Option<[f64; 3]>,
+    layer_ratio: Option<f64>,
 }
 
 impl ShearLayer {
@@ -1261,7 +1279,7 @@ impl ShearLayer {
             spacing: h,
             lattice_velocity: step.lattice_velocity,
             nu: (1.0 / omega - 0.5) / 3.0,
-            sums: vec![[0.0; 5]; STRESS_STATIONS.len() * g.cells[2]],
+            sums: vec![[0.0; ROW_SUMS]; STRESS_STATIONS.len() * g.cells[2]],
         }
     }
 
@@ -1272,10 +1290,10 @@ impl ShearLayer {
         let sa = flow.spalart_allmaras();
         for (s, &i) in self.columns.iter().enumerate() {
             for k in 0..self.nz {
-                let cells: Vec<(f64, f64, f64)> = (0..ny)
+                let cells: Vec<(f64, f64, f64, f64)> = (0..ny)
                     .filter_map(|j| {
                         let c = g.index([i, j, k]);
-                        flow.moments(c).map(|m| (m.1[0], m.1[2], sa.map_or(0.0, |f| f.nu_t(c, self.nu))))
+                        flow.moments(c).map(|m| (m.1[0], m.1[2], sa.map_or(0.0, |f| f.nu_t(c, self.nu)), m.1[1]))
                     })
                     .collect();
                 if let Some(a) = self.sums.get_mut(s * self.nz + k).filter(|_| !cells.is_empty()) {
@@ -1285,6 +1303,13 @@ impl ShearLayer {
                     a[2] += cells.iter().map(|c| c.0 * c.1).sum::<f64>() / n;
                     a[3] += cells.iter().map(|c| c.2).sum::<f64>() / n;
                     a[4] += 1.0;
+                    a[5] += cells.iter().map(|c| c.0 * c.0).sum::<f64>() / n;
+                    a[6] += cells.iter().map(|c| c.3).sum::<f64>() / n;
+                    a[7] += cells.iter().map(|c| c.3 * c.3).sum::<f64>() / n;
+                    a[8] += cells.iter().map(|c| c.1 * c.1).sum::<f64>() / n;
+                    a[9] += 1.0;
+                    a[10] += cells.iter().map(|c| c.0).sum::<f64>() / n;
+                    a[11] += cells.iter().map(|c| c.1).sum::<f64>() / n;
                 }
             }
         }
@@ -1294,12 +1319,27 @@ impl ShearLayer {
         self.sums.iter().flatten().copied().collect()
     }
 
+    /// A file with the current layout, or with the first layout (five sums a row, the three original stations): its rows
+    /// load into the first stations with no velocity samples. Anything else is left out (the sums start at zero).
     fn restore(&mut self, state: &[f64]) {
-        if state.len() == 5 * self.sums.len() {
-            for (s, v) in self.sums.iter_mut().flatten().zip(state) {
-                *s = *v;
+        if state.len() == ROW_SUMS * self.sums.len() {
+            for (row, v) in self.sums.iter_mut().zip(state.chunks(ROW_SUMS)) {
+                row.copy_from_slice(v);
+            }
+        } else if state.len() == 5 * 3 * self.nz {
+            for (row, v) in self.sums.iter_mut().zip(state.chunks(5)) {
+                row[..5].copy_from_slice(v);
             }
         }
+    }
+
+    /// Station `s`, row `k`'s velocity variances (u'u', v'v', w'w'), in units of the inlet speed squared: the sum over the
+    /// span and the window, so the spanwise-mean fluctuation is in them. None without velocity samples.
+    fn variance(&self, s: usize, k: usize) -> Option<[f64; 3]> {
+        let r = self.sums.get(s * self.nz + k).filter(|r| r[9] > 0.0)?;
+        let n = r[9];
+        let scale = self.lattice_velocity * self.lattice_velocity;
+        Some([(r[5] / n - (r[10] / n).powi(2)) / scale, (r[7] / n - (r[6] / n).powi(2)) / scale, (r[8] / n - (r[11] / n).powi(2)) / scale])
     }
 
     /// Station `s`'s rows: (height in H, resolved, modelled stress over the inlet speed squared) of every row with fluid in
@@ -1316,6 +1356,22 @@ impl ShearLayer {
                 Some(((k as f64 - 0.5) * self.spacing, resolved / scale, modelled / scale))
             })
             .collect()
+    }
+
+    /// The variances of station `s` at the row whose centre is at height `z` (H).
+    fn variance_at(&self, s: usize, z: f64) -> Option<[f64; 3]> {
+        self.variance(s, (z / self.spacing + 0.5).round() as usize)
+    }
+
+    /// v'v' over u'u' summed over the station's rows with velocity samples.
+    fn layer_ratio(&self, s: usize) -> Option<f64> {
+        let (mut v, mut u) = (0.0, 0.0);
+        for k in 0..self.nz {
+            let var = self.variance(s, k)?;
+            v += var[1];
+            u += var[0];
+        }
+        (u > 0.0).then_some(v / u)
     }
 
     /// Each station's stress, or why there is none (no samples, or no fluid row with both
@@ -1337,6 +1393,8 @@ impl ShearLayer {
                     modelled: peak.2,
                     peak_fraction: peak.1 / (peak.1 + peak.2),
                     layer_fraction: if tot > 0.0 { res / tot } else { f64::NAN },
+                    variance: self.variance_at(s, peak.0),
+                    layer_ratio: self.layer_ratio(s),
                 })
             })
             .collect()
@@ -1349,7 +1407,16 @@ impl std::fmt::Display for Stress {
             f,
             "x = {} H: at the stress peak z = {:.2} H, resolved {:.3e} and modelled {:.3e} U²: resolved fraction {:.2} (whole layer {:.2})",
             self.x, self.z, self.resolved, self.modelled, self.peak_fraction, self.layer_fraction
-        )
+        )?;
+        match (self.variance, self.layer_ratio) {
+            (Some([uu, vv, ww]), ratio) => write!(
+                f,
+                "; velocity variances there u'u' {uu:.3e}, v'v' {vv:.3e}, w'w' {ww:.3e} U² (v'v'/u'u' {:.3}; summed over the layer {})",
+                vv / uu,
+                ratio.map_or("n/a".to_string(), |r| format!("{r:.3}"))
+            ),
+            _ => write!(f, "; no velocity variances in these sums"),
+        }
     }
 }
 
@@ -2457,11 +2524,18 @@ fn the_shear_layers_stress_splits_into_resolved_and_modelled() {
     // One station's rows: u rises linearly (du/dz = 2 per cell row), w = 0 on average, u w
     // correlated to give a resolved stress of 0.004 at row 5 and 0.001 elsewhere, ν_t = 0.003.
     let (nz, spacing, lattice_velocity) = (10, 0.1, 1.0);
-    let station = |tau_res: &dyn Fn(usize) -> f64| -> Vec<[f64; 5]> {
-        (0..nz).map(|k| [4.0 * 2.0 * k as f64, 0.0, 4.0 * -tau_res(k), 4.0 * 0.003, 4.0]).collect()
+    let station = |tau_res: &dyn Fn(usize) -> f64| -> Vec<[f64; ROW_SUMS]> {
+        (0..nz).map(|k| [4.0 * 2.0 * k as f64, 0.0, 4.0 * -tau_res(k), 4.0 * 0.003, 4.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).collect()
     };
     let rows = station(&|k| if k == 5 { 0.004 } else { 0.001 });
-    let layer = ShearLayer { columns: [0; 3], nz, spacing, lattice_velocity, nu: 0.01, sums: rows.iter().cycle().take(3 * nz).copied().collect() };
+    let layer = ShearLayer {
+        columns: [0; STRESS_STATIONS.len()],
+        nz,
+        spacing,
+        lattice_velocity,
+        nu: 0.01,
+        sums: rows.iter().cycle().take(STRESS_STATIONS.len() * nz).copied().collect(),
+    };
     let s = layer.stresses().remove(0).unwrap();
     // Modelled: ⟨ν_t⟩ d⟨u⟩/dz = 0.003 × 2 = 0.006 everywhere; the total peaks at row 5 (0.004 + 0.006).
     assert!((s.z - 4.5 * spacing).abs() < 1e-12, "{}", s.z);
@@ -2470,8 +2544,54 @@ fn the_shear_layers_stress_splits_into_resolved_and_modelled() {
     // Over rows 1 to 8: resolved 7 × 0.001 + 0.004 = 0.011 against 8 × 0.006 modelled.
     assert!((s.layer_fraction - 0.011 / (0.011 + 0.048)).abs() < 1e-12, "{}", s.layer_fraction);
     // No samples: no stress.
-    let none = ShearLayer { sums: vec![[0.0; 5]; 3 * nz], ..layer };
+    let none = ShearLayer { sums: vec![[0.0; ROW_SUMS]; STRESS_STATIONS.len() * nz], ..layer };
     assert!(none.stresses().iter().all(Result::is_err));
+}
+
+/// The velocity variances come from the sums (⟨u²⟩ − ⟨u⟩² per row, the span-mean samples), a file of the first layout (five
+/// sums a row, three stations) loads into the first stations with no variance, and a file of this layout loads as it is.
+#[test]
+fn the_shear_layers_velocity_variances_come_from_the_sums_and_an_old_file_loads_without_them() {
+    let (nz, spacing, lattice_velocity) = (4, 0.1, 2.0);
+    let mut layer = ShearLayer {
+        columns: [0; STRESS_STATIONS.len()],
+        nz,
+        spacing,
+        lattice_velocity,
+        nu: 0.01,
+        sums: vec![[0.0; ROW_SUMS]; STRESS_STATIONS.len() * nz],
+    };
+    // Station 1, row 2: two samples of u = 1 and 3, v = -1 and 1, w = 0 and 2 (lattice units).
+    let row = &mut layer.sums[nz + 2];
+    for (u, v, w) in [(1.0, -1.0, 0.0), (3.0, 1.0, 2.0)] {
+        row[0] += u;
+        row[1] += w;
+        row[4] += 1.0;
+        row[5] += u * u;
+        row[6] += v;
+        row[7] += v * v;
+        row[8] += w * w;
+        row[9] += 1.0;
+        row[10] += u;
+        row[11] += w;
+    }
+    // Variances: u 1 (⟨u²⟩ 5 − 2²), v 1, w 1; over U² = 4.
+    let var = layer.variance(1, 2).unwrap();
+    assert!(var.iter().all(|v| (v - 0.25).abs() < 1e-12), "{var:?}");
+    assert!(layer.variance(1, 1).is_none() && layer.variance(0, 2).is_none());
+    let state = layer.state();
+    let mut again = ShearLayer { sums: vec![[0.0; ROW_SUMS]; STRESS_STATIONS.len() * nz], ..layer.clone() };
+    again.restore(&state);
+    assert_eq!(again.sums, layer.sums);
+    // The first layout: station 2's row 1 of five sums.
+    let mut old = vec![0.0; 5 * 3 * nz];
+    old[(2 * nz + 1) * 5..(2 * nz + 1) * 5 + 5].copy_from_slice(&[6.0, 0.0, 0.0, 0.1, 3.0]);
+    let mut from_old = ShearLayer { sums: vec![[0.0; ROW_SUMS]; STRESS_STATIONS.len() * nz], ..layer.clone() };
+    from_old.restore(&old);
+    assert_eq!(from_old.sums[2 * nz + 1][..5], [6.0, 0.0, 0.0, 0.1, 3.0]);
+    assert_eq!(from_old.sums[2 * nz + 1][5..], [0.0; ROW_SUMS - 5]);
+    assert!(from_old.variance(2, 1).is_none());
+    assert!(from_old.sums[3 * nz..].iter().all(|r| r.iter().all(|v| *v == 0.0)), "the added stations start empty");
 }
 
 #[test]
