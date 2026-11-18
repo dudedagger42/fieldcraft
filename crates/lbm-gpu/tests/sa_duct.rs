@@ -102,6 +102,8 @@ impl Duct {
         }
         let m = model(1.0, 1.0 / self.re_tau, d, p);
         let (setup, mut flow) = prepare(&m, &[]);
+        // study: WALL_MRT=1 collides the wall layer with the MRT moments
+        flow.set_wall_layer_mrt(std::env::var("WALL_MRT").is_ok_and(|v| v == "1"));
         let grid = *flow.grid();
         let scale = setup.velocity_scale();
         // The product of two 1/7 laws has a mean of (7/8)² of its peak.

@@ -185,6 +185,8 @@ impl Channel {
     /// Run to settling or the step cap.
     fn run(&self) -> ChannelResult {
         let (setup, mut flow) = prepare(&self.model(), &self.obstacles());
+        // study: WALL_MRT=1 collides the wall layer with the MRT moments (set_wall_layer_mrt)
+        flow.set_wall_layer_mrt(std::env::var("WALL_MRT").is_ok_and(|v| v == "1"));
         let grid = *flow.grid();
         // The rows between the walls (the slabs' rows left out).
         let first = self.slab_rows();
@@ -1011,7 +1013,11 @@ fn oracle_turbulent_channel_wall_law_on_the_half_way_wall() {
         ("re1000_n80", 1000.0, 80, LEE_MOSER_1000_BULK, LEE_MOSER_1000_CF, Some(-0.01702379)),
     ];
     let mut failures = Vec::new();
+    let only = std::env::var("ORACLE_ROWS").unwrap_or_default();
     for (name, re_tau, cells, bulk, cf_ref, frozen) in rows {
+        if !only.is_empty() && !only.split(',').any(|o| o == name) {
+            continue;
+        }
         let r = Channel {
             re_tau,
             cells,
@@ -1043,6 +1049,7 @@ fn oracle_turbulent_channel_wall_law_on_the_half_way_wall() {
             failures.push(format!("{name}: not settled in {} steps", r.steps));
         }
         if let Some(frozen) = frozen
+            && std::env::var("WALL_MRT").is_err()
             && (error - frozen).abs() > 5e-4
         {
             failures.push(format!("{name}: C_f error {:+.4} % left its regression band {:+.4} ± 0.05 %", 100.0 * error, 100.0 * frozen));
