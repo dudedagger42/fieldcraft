@@ -145,6 +145,14 @@ fn slotted_channel_stability() {
         }
     };
     let mut cpu = fieldcraft_lbm::Flow::new(&setup, &obstacles).unwrap();
+    // The wall layer studies (CPU only; the flow's own defaults when unset): WALL_SIGMA1 (the σ = 1 rule's mode; 0 off, which the default is not),
+    // WALL_BULK (a further share of the layer's density mode removed), WALL_MRT (MRT in the wall-layer cells; 1 on).
+    if let Some(mode) = std::env::var("WALL_SIGMA1").ok().and_then(|v| v.parse::<f64>().ok()) {
+        cpu.set_wall_layer_sigma_one(mode as u8);
+    }
+    cpu.set_wall_layer_bulk(env("WALL_BULK", 0.0));
+    cpu.set_wall_layer_mrt(env("WALL_MRT", 0.0) > 0.5);
+    println!("CASE WALL_SIGMA1 {} WALL_BULK {} WALL_MRT {}", cpu.wall_layer_sigma_one(), env("WALL_BULK", 0.0), env("WALL_MRT", 0.0) > 0.5);
     let n = cpu.grid().len();
     let [nx, ny, nz] = cpu.grid().cells;
     let scale = setup.velocity_scale();

@@ -99,7 +99,7 @@ pub mod wall;
 pub mod wall_layer;
 
 pub use backend::{Backend, Choice, Fields, device_available, register_backend};
-pub use flow::{Flow, Group, Link, OpenCell, Rule, Target, ThermalState, ZoneSample};
+pub use flow::{Flow, Group, Link, OpenCell, Rule, Target, ThermalState, WALL_LAYER_RULE_BULK, ZoneSample};
 pub use memory::{DeviceBuffer, Memory};
 pub use ports::{Port, PortProperties, Stream};
 pub use setup::{ContactSetup, PhaseSetup, SolidSetup, SurfaceSetup, ThermalSetup};

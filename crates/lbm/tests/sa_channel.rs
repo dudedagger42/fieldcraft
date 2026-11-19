@@ -410,7 +410,7 @@ fn the_wall_layer_sigma_leaves_a_wall_law_channel_bit_identical() {
     let velocities = |mode: u8| {
         let (_, mut flow) = prepare(&channel.model(), &channel.obstacles());
         assert_eq!(flow.wall_layer_sigma_one(), 1, "the rule is on by default");
-        assert_eq!(flow.wall_sigma_layer_on_device(), Some(false), "a wall-law wall has no layer for the rule");
+        assert!(!flow.wall_sigma_layer_mask().iter().any(|&m| m), "a wall-law wall has no layer for the rule");
         flow.set_wall_layer_sigma_one(mode);
         for _ in 0..300 {
             flow.step().unwrap();

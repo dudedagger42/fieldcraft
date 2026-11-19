@@ -28,7 +28,7 @@ fn lbm_wgsl_validates_for_the_collision_variants() {
         ("defaults", vec![]),
         ("hybrid", hybrid.to_vec()),
         ("hybrid with WALL_SIGMA1 = 0", [&hybrid[..], &[("WALL_SIGMA1", 0.0)]].concat()),
-        ("hybrid with WALL_SIGMA1 = 1", [&hybrid[..], &[("WALL_SIGMA1", 1.0)]].concat()),
+        ("hybrid with WALL_SIGMA1 = 1", [&hybrid[..], &[("WALL_SIGMA1", 1.0), ("WALL_SIGMA1_BASE", 96.0)]].concat()),
         ("hybrid, dynamic σ, WALL_SIGMA1 = 1", [&hybrid[..], &[("DYNAMIC", 1.0), ("VREMAN", 1.0), ("WALL_SIGMA1", 1.0)]].concat()),
         ("hybrid, SA, WALL_SIGMA1 = 1", [&hybrid[..], &[("SA", 1.0), ("WALL_SIGMA1", 1.0)]].concat()),
         ("hybrid, on-node, WALL_SIGMA1 = 1", [&hybrid[..], &[("ON_NODE", 1.0), ("WALL_SIGMA1", 1.0)]].concat()),

@@ -322,6 +322,10 @@ pub(crate) fn neighbour(grid: &Grid, periodic: [bool; 3], fluid: &[bool], p: [us
 /// Remove the share `eps` of the non-equilibrium density (trace) mode of the populations `post`: the Hermite component
 /// `H = |c|² − 1` (c_s² = 1/3, so the trace of the equilibrium second moment is ρ(1 + u²)). With `a = Σ post H − ρ u²` and
 /// `Σ w H² = 2/3`, the component is `1.5 a w H`; the density and the momentum are untouched (H is orthogonal to both).
+/// The share of the non-equilibrium density mode the σ = 1 rule removes in its layer (the same constant is `WALL_RULE_BULK` in lbm.wgsl).
+/// Without it a layer of pure regularisation carries a cell-to-cell mode along a slot of 8 cells or fewer (tests/slot_mode.rs).
+pub const WALL_LAYER_RULE_BULK: f64 = 0.5;
+
 fn damp_density_mode(post: &mut [f64; Q], rho: f64, uu: f64, eps: f64) {
     let h = |q: usize| {
         let c = C[q];
@@ -668,6 +672,8 @@ pub struct Flow {
     /// A study: 1 gives σ = 1 in every fluid cell with a solid axis neighbour (the wall layer, the N = 2 rule), 2 gives σ = 1
     /// in every cell outside it (the blend only in the wall layer), 0 neither (the default).
     wall_layer_sigma_one: u8,
+    /// Which box faces are walls (axis, at the upper end): the wall layer studies treat these as walls.
+    wall_faces: [[bool; 2]; 3],
     /// A study (off: 0): the share of the non-equilibrium density (trace) mode removed each step in the wall layer, after the collision.
     wall_layer_bulk: f64,
     /// A study (off): the wall layer collides with the two-relaxation-time MRT scheme instead of the regularised one.
@@ -889,6 +895,14 @@ impl Flow {
             _ => None,
         };
         let is_slip = |face: BoxFace| matches!(domain.faces.get(face), FaceCondition::Slip {});
+        let mut wall_faces = [[false; 2]; 3];
+        for face in BoxFace::ALL {
+            if matches!(domain.faces.get(face), FaceCondition::Wall {} | FaceCondition::MovingWall { .. })
+                && let Some(slot) = wall_faces.get_mut(face.axis()).and_then(|a| a.get_mut(usize::from(face.is_max())))
+            {
+                *slot = true;
+            }
+        }
         // Where an inlet meets two walls, the on-node wall-function bounce is unstable (a density mode grows
         // at the cell until the run dies). A cell in a velocity inlet's layer that touches two walls (its
         // in-plane neighbours: a solid cell, or a box face that is a wall; a staircase step on a rim is
@@ -1816,6 +1830,7 @@ impl Flow {
             wall_gradient: false,
             wall_gap: 0.5,
             wall_layer_sigma_one: 1,
+            wall_faces,
             wall_layer_bulk: 0.0,
             wall_layer_mrt: false,
             wall_corner_relax: false,
@@ -2322,20 +2337,9 @@ impl Flow {
         self.wall_layer_cells(true)
     }
 
-    /// Whether the GPU can take the σ = 1 rule as it stands: `Some(true)` when the device's layer (every fluid cell with a solid axis
-    /// neighbour) is the rule's layer, `Some(false)` when the rule's layer is empty (nothing to apply), `None` when they differ (box-face
-    /// walls, which the device does not take as walls yet, or a wall law's boundary nodes, whose rows the device would also catch).
-    pub fn wall_sigma_layer_on_device(&self) -> Option<bool> {
-        let rule = self.wall_sigma_layer();
-        if !rule.iter().any(|&m| m) {
-            return Some(false);
-        }
-        let solid = |c: usize| !self.fluid.get(c).copied().unwrap_or(true);
-        let device = |c: usize| {
-            let p = self.grid.coords(c);
-            self.fluid.get(c).copied().unwrap_or(false) && (0..3).any(|axis| [false, true].iter().any(|&up| across(&self.grid, self.periodic, p, axis, up).is_some_and(solid)))
-        };
-        (0..self.grid.len()).all(|c| rule.get(c).copied().unwrap_or(false) == device(c)).then_some(true)
+    /// The cells of the σ = 1 rule's layer ([`Flow::wall_layer_mask`]); the device reads this mask.
+    pub fn wall_sigma_layer_mask(&self) -> Vec<bool> {
+        self.wall_sigma_layer()
     }
 
     fn wall_layer_cells(&self, faces: bool) -> Vec<bool> {
@@ -2354,7 +2358,9 @@ impl Flow {
                     && (0..3).any(|axis| {
                         [false, true].iter().any(|&up| match across(&self.grid, self.periodic, p, axis, up) {
                             Some(n) => solid(n),
-                            None => faces_wall && !opens.contains(&(c, axis)),
+                            None => {
+                                faces_wall && self.wall_faces.get(axis).and_then(|a| a.get(usize::from(up))).copied().unwrap_or(false) && !opens.contains(&(c, axis))
+                            }
                         })
                     })
             })
@@ -2507,7 +2513,7 @@ impl Flow {
         self.wall_layer_sigma_one
     }
 
-    /// 1 (the default) sets the hybrid collision's σ to 1 in every cell with a solid neighbour along an axis (the wall layer: the blend's
+    /// 1 (the default) sets the hybrid collision's σ to 1 in the wall layer and damps the layer's density mode ([`WALL_LAYER_RULE_BULK`]) (the blend's
     /// finite-difference strain is first-order there and its error is amplified by τ̄/(τ̄ − ½)), 0 switches that off (the blend everywhere),
     /// 2 (a study) sets σ = 1 in every other cell, 3 (a study) in the two layers beside a solid cell.
     pub fn set_wall_layer_sigma_one(&mut self, mode: u8) {
@@ -3625,6 +3631,7 @@ impl Flow {
                     // the model's eddy viscosity (Vreman's, or Hou's implicit Smagorinsky one),
                     // 1 at a wall cell under the wall model.
                     let mut nu_model = None;
+                    let mut rule_damp = false;
                     let blend = local.as_ref().filter(|_| hybrid).map(|(g, nb)| {
                         let cell_sigma = if dynamic {
                             let s = match wall_rate {
@@ -3666,7 +3673,13 @@ impl Flow {
                             cell_sigma
                         } else if wall_layer_sigma_one == 1 {
                             // The resolved walls' layer (`wall_layer_mask`): never a row whose stress comes from a wall law.
-                            if sigma_layer.get(b * block + i).copied().unwrap_or(false) { 1.0 } else { cell_sigma }
+                            if sigma_layer.get(b * block + i).copied().unwrap_or(false) {
+                                // the rule changes the collision only where the blend was not already σ = 1
+                                rule_damp = cell_sigma != 1.0;
+                                1.0
+                            } else {
+                                cell_sigma
+                            }
                         } else {
                             let p = grid.coords(b * block + i);
                             let solid = |c: usize| !fluid.get(c).copied().unwrap_or(true);
@@ -3703,6 +3716,10 @@ impl Flow {
                     }
                     if wall_bulk > 0.0 && in_layer {
                         damp_density_mode(&mut post, rho, uu, wall_bulk);
+                    }
+                    // The σ = 1 rule's layer also damps its density mode (the hybrid collision only).
+                    if rule_damp {
+                        damp_density_mode(&mut post, rho, uu, WALL_LAYER_RULE_BULK);
                     }
                     for (q, v) in post.iter().enumerate() {
                         put(q, *v);
@@ -4178,6 +4195,7 @@ impl crate::backend::Backend for Flow {
             wall_gradient: _,
             wall_gap: _,
             wall_layer_sigma_one: _,
+            wall_faces: _,
             wall_layer_bulk: _,
             wall_layer_mrt: _,
             wall_corner_relax: _,

@@ -129,6 +129,10 @@ override VREMAN: bool = false;
 override DYNAMIC: bool = false;
 // The study knob WALL_SIGMA1 = 1 (Flow::set_wall_layer_sigma_one, with HRR): σ = 1 in every fluid cell with a solid axis neighbour.
 override WALL_SIGMA1: bool = false;
+// With it, the first word of the layer flags: one per cell, 1 in the rule's layer (the host builds them from the CPU flow's `wall_sigma_layer_mask`).
+override WALL_SIGMA1_BASE: u32 = 0u;
+// The share of the density mode the rule's layer damps (the same constant as flow.rs WALL_LAYER_RULE_BULK).
+const WALL_RULE_BULK: f32 = 0.5;
 // Fans and porous zones (fieldcraft_lbm::flow's zone actions, data in `fluid`: zones.rs); likewise.
 override ZONES: bool = false;
 // The Spalart–Allmaras model (fieldcraft_lbm::sa): ν̃'s passes and its ν_t in the collision; likewise.
@@ -1161,23 +1165,6 @@ fn fd_neighbour(p: vec3<i32>, d: vec3<i32>) -> u32 {
     return cell;
 }
 
-// Whether the cell one unit step `d` along an axis from the cell at `p` is a solid cell (a step out of a non-periodic
-// box is not).
-fn fd_is_solid(p: vec3<i32>, d: vec3<i32>) -> bool {
-    let size = vec3<i32>(i32(params.nx), i32(params.ny), i32(params.nz));
-    let periodic = params.periodic.xyz != vec3<u32>(0u);
-    let w = p + d;
-    if any(((w < vec3<i32>(0)) | (w >= size)) & !periodic) { return false; }
-    return !is_fluid(wrapped(w));
-}
-
-// A fluid cell with a solid cell beside it along an axis (the wall layer of the WALL_SIGMA1 study).
-fn wall_layer(p: vec3<i32>) -> bool {
-    return fd_is_solid(p, vec3<i32>(-1, 0, 0)) || fd_is_solid(p, vec3<i32>(1, 0, 0))
-        || fd_is_solid(p, vec3<i32>(0, -1, 0)) || fd_is_solid(p, vec3<i32>(0, 1, 0))
-        || fd_is_solid(p, vec3<i32>(0, 0, -1)) || fd_is_solid(p, vec3<i32>(0, 0, 1));
-}
-
 // The derivative of u along one axis (d) and its second difference (dd) from the neighbours below
 // (m) and above (p).
 struct FdAxis {
@@ -2086,7 +2073,12 @@ fn collide_regularized(cell: u32, lid: u32, xyz: vec3<i32>, fq: ptr<function, ar
             record_eddy(cell, lid, omega, u);
         }
     }
-    if WALL_SIGMA1 && HRR && wall_layer(coords(cell)) { sigma = 1.0; }
+    // The rule changes the collision only where the blend was not already σ = 1 (flow.rs `rule_damp`).
+    var rule_damp = false;
+    if WALL_SIGMA1 && HRR && fluid[WALL_SIGMA1_BASE + cell] != 0u {
+        rule_damp = sigma != 1.0;
+        sigma = 1.0;
+    }
     if HRR && sigma != 1.0 {
         let s = strain(g);
         let fd = -2.0 * (1.0 / 3.0) * rho / omega;
@@ -2137,6 +2129,19 @@ fn collide_regularized(cell: u32, lid: u32, xyz: vec3<i32>, fq: ptr<function, ar
         }
         out[q] = even + odd;
         out[q + 1u] = even - odd;
+    }
+    // The σ = 1 rule's layer also damps its non-equilibrium density mode (flow.rs WALL_LAYER_RULE_BULK, the same share): with
+    // h_q = c² − 1, a = Σ out_q h_q − ρ u² (the deviations from the weights have Σ w h = 0), out_q −= share · 1.5 a w_q h_q.
+    if rule_damp {
+        var a = -rho * uu;
+        for (var q = 0u; q < Q; q = q + 1u) {
+            let cq = vec3<f32>(c_of(q));
+            a = a + out[q] * (dot(cq, cq) - 1.0);
+        }
+        for (var q = 0u; q < Q; q = q + 1u) {
+            let cq = vec3<f32>(c_of(q));
+            out[q] = out[q] - WALL_RULE_BULK * 1.5 * a * w_of(q) * (dot(cq, cq) - 1.0);
+        }
     }
     // The rebuild from (δρ, j, P) keeps mass and momentum only to its f32 rounding, and in a
     // nearly steady flow beside walls that rounding has the same sign every step: the mean
