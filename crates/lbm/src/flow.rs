@@ -1815,7 +1815,7 @@ impl Flow {
             sigma: setup.sigma,
             wall_gradient: false,
             wall_gap: 0.5,
-            wall_layer_sigma_one: 0,
+            wall_layer_sigma_one: 1,
             wall_layer_bulk: 0.0,
             wall_layer_mrt: false,
             wall_corner_relax: false,
@@ -2313,6 +2313,32 @@ impl Flow {
     /// boundary node of the on-node wall-function bounce is not in it (those nodes are fluid cells that do not collide, and the wall
     /// law sets the stress of the row beside them), so the layer studies leave a wall-law wall as it is.
     pub fn wall_layer_mask(&self) -> Vec<bool> {
+        self.wall_layer_cells(true)
+    }
+
+    /// The wall layer of the σ = 1 rule: [`Flow::wall_layer_mask`], so a wall of obstacle cells and a wall that is a box face are
+    /// treated alike.
+    fn wall_sigma_layer(&self) -> Vec<bool> {
+        self.wall_layer_cells(true)
+    }
+
+    /// Whether the GPU can take the σ = 1 rule as it stands: `Some(true)` when the device's layer (every fluid cell with a solid axis
+    /// neighbour) is the rule's layer, `Some(false)` when the rule's layer is empty (nothing to apply), `None` when they differ (box-face
+    /// walls, which the device does not take as walls yet, or a wall law's boundary nodes, whose rows the device would also catch).
+    pub fn wall_sigma_layer_on_device(&self) -> Option<bool> {
+        let rule = self.wall_sigma_layer();
+        if !rule.iter().any(|&m| m) {
+            return Some(false);
+        }
+        let solid = |c: usize| !self.fluid.get(c).copied().unwrap_or(true);
+        let device = |c: usize| {
+            let p = self.grid.coords(c);
+            self.fluid.get(c).copied().unwrap_or(false) && (0..3).any(|axis| [false, true].iter().any(|&up| across(&self.grid, self.periodic, p, axis, up).is_some_and(solid)))
+        };
+        (0..self.grid.len()).all(|c| rule.get(c).copied().unwrap_or(false) == device(c)).then_some(true)
+    }
+
+    fn wall_layer_cells(&self, faces: bool) -> Vec<bool> {
         let live = self.collides();
         let solid = |c: usize| !self.fluid.get(c).copied().unwrap_or(true);
         // A domain face is a resolved wall too (halfway bounce-back) unless a wall law gives it its stress or the cell is an inlet/outlet there.
@@ -2320,7 +2346,7 @@ impl Flow {
         for o in &self.open {
             opens.insert((o.cell as usize, o.axis));
         }
-        let faces_wall = !self.wall_bounce;
+        let faces_wall = faces && !self.wall_bounce;
         (0..self.grid.len())
             .map(|c| {
                 let p = self.grid.coords(c);
@@ -2476,12 +2502,14 @@ impl Flow {
         self.wall_gradient
     }
 
-    /// The mode [`Flow::set_wall_layer_sigma_one`] set (0 off).
+    /// The mode [`Flow::set_wall_layer_sigma_one`] set (1 by default, 0 off).
     pub fn wall_layer_sigma_one(&self) -> u8 {
         self.wall_layer_sigma_one
     }
 
-    /// A study: 1 sets σ = 1 in every cell with a solid neighbour along an axis, 2 sets σ = 1 in every other cell, 0 neither.
+    /// 1 (the default) sets the hybrid collision's σ to 1 in every cell with a solid neighbour along an axis (the wall layer: the blend's
+    /// finite-difference strain is first-order there and its error is amplified by τ̄/(τ̄ − ½)), 0 switches that off (the blend everywhere),
+    /// 2 (a study) sets σ = 1 in every other cell, 3 (a study) in the two layers beside a solid cell.
     pub fn set_wall_layer_sigma_one(&mut self, mode: u8) {
         self.wall_layer_sigma_one = mode;
     }
@@ -3408,6 +3436,8 @@ impl Flow {
         } else {
             Vec::new()
         };
+        // The σ = 1 rule's layer (empty when off).
+        let sigma_layer: Vec<bool> = if wall_layer_sigma_one == 1 && regularized { self.wall_sigma_layer() } else { Vec::new() };
         // The corner study's cells (empty when off).
         let corner: Vec<bool> = if regularized { self.wall_corner_mask() } else { Vec::new() };
         // Dynamic σ's cap on the von Kármán length: the box's shortest extent in cells.
@@ -3634,6 +3664,9 @@ impl Flow {
                         // A study: σ = 1 in the wall layer (a fluid cell with a solid axis neighbour).
                         let cell_sigma = if wall_layer_sigma_one == 0 {
                             cell_sigma
+                        } else if wall_layer_sigma_one == 1 {
+                            // The resolved walls' layer (`wall_layer_mask`): never a row whose stress comes from a wall law.
+                            if sigma_layer.get(b * block + i).copied().unwrap_or(false) { 1.0 } else { cell_sigma }
                         } else {
                             let p = grid.coords(b * block + i);
                             let solid = |c: usize| !fluid.get(c).copied().unwrap_or(true);

@@ -25,7 +25,7 @@
 //! above z = 5, a lid and a closed end. `FILL="x,y,z;..."` then fills single cells (z optional). Probes: `site` (5, 34, 2) and `corner`.
 //!
 //! Environment: `TAU_MINUS_HALF` (default 1.8e-4), `PEAK` (peak lattice speed of the channel's parabola, default 0.11; the mean is 2/3 of it
-//! (parabola), `SIGMA` (default 0.95), `WALL_SIGMA1` (0 or 1, default 0), `SA_SEED` (default 0: the model's trivial solution).
+//! (parabola), `SIGMA` (default 0.95), `WALL_SIGMA1` (0 or 1, default 1), `SA_SEED` (default 0: the model's trivial solution).
 //!
 //! `cargo test --release -p fieldcraft-lbm --test slit_corner -- --ignored --nocapture slit_corner`
 
@@ -230,7 +230,7 @@ fn slit_corner() {
     let (tau, peak, sigma) = (env("TAU_MINUS_HALF", 1.8e-4), env("PEAK", 0.11), env("SIGMA", 0.95));
     let (settle, pulse_steps, after) = (env("SETTLE_STEPS", 20_000.0) as u64, env("PULSE_STEPS", 300.0) as u64, env("AFTER_STEPS", 20_000.0) as u64);
     let (amp, sample) = (env("PULSE_AMP", 1e-3), (env("SAMPLE", 10.0) as u64).max(1));
-    let wall_sigma1 = env("WALL_SIGMA1", 0.0) as u8;
+    let wall_sigma1 = env("WALL_SIGMA1", 1.0) as u8;
     let fills = fill_cells();
     let three_d = env("GEOM3", 0.0) != 0.0;
     let label =

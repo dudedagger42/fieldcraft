@@ -187,6 +187,11 @@ impl Channel {
         let (setup, mut flow) = prepare(&self.model(), &self.obstacles());
         // study: WALL_MRT=1 collides the wall layer with the MRT moments (set_wall_layer_mrt)
         flow.set_wall_layer_mrt(std::env::var("WALL_MRT").is_ok_and(|v| v == "1"));
+        // studies: WALL_SIGMA1=<mode> (the wall layer's σ; the flow's default when unset), WALL_GRADIENT=1 (the strain sees the walls)
+        if let Some(mode) = std::env::var("WALL_SIGMA1").ok().and_then(|v| v.parse::<u8>().ok()) {
+            flow.set_wall_layer_sigma_one(mode);
+        }
+        flow.set_wall_aware_gradient(std::env::var("WALL_GRADIENT").is_ok_and(|v| v == "1"));
         let grid = *flow.grid();
         // The rows between the walls (the slabs' rows left out).
         let first = self.slab_rows();
@@ -382,6 +387,37 @@ fn the_layer_mrt_leaves_a_wall_law_channel_bit_identical() {
         (0..flow.grid().len()).map(|c| flow.moments(c).map_or([f64::NAN; 4], |(r, u)| [r, u[0], u[1], u[2]]).map(f64::to_bits)).collect::<Vec<_>>()
     };
     assert!(velocities(false) == velocities(true));
+}
+
+/// The wall-layer σ = 1 rule (on by default) leaves a wall-law channel as it is: the layer of a wall-law wall is its non-colliding boundary
+/// nodes, so with the rule on and off the run is bit-identical.
+#[test]
+fn the_wall_layer_sigma_leaves_a_wall_law_channel_bit_identical() {
+    let channel = Channel {
+        re_tau: LEE_MOSER_180_RE_TAU,
+        cells: 10,
+        bulk_guess: LEE_MOSER_180_BULK,
+        lattice_bulk: 0.1,
+        collision: Collision::Hrr,
+        sigma: Some(0.95),
+        turbulence: Some(sa(WallModel::SpalartAllmarasBounceSurface)),
+        on_node: false,
+        slabs: true,
+        max_steps: 1,
+        sample: 100,
+        settling: GATED,
+    };
+    let velocities = |mode: u8| {
+        let (_, mut flow) = prepare(&channel.model(), &channel.obstacles());
+        assert_eq!(flow.wall_layer_sigma_one(), 1, "the rule is on by default");
+        assert_eq!(flow.wall_sigma_layer_on_device(), Some(false), "a wall-law wall has no layer for the rule");
+        flow.set_wall_layer_sigma_one(mode);
+        for _ in 0..300 {
+            flow.step().unwrap();
+        }
+        (0..flow.grid().len()).map(|c| flow.moments(c).map_or([f64::NAN; 4], |(r, u)| [r, u[0], u[1], u[2]]).map(f64::to_bits)).collect::<Vec<_>>()
+    };
+    assert!(velocities(0) == velocities(1));
 }
 
 /// The layer MRT study's wall layer on a channel whose walls are the domain's faces (no solid cells): the fluid rows beside the two

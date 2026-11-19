@@ -14,7 +14,7 @@
 //! `PROFILE_START=1` (the pocket case only, test-only): the channel starts from the developed parabola of mean speed `U_LAT`
 //! (the pocket and the solid at rest) instead of from rest. The pocket case also reads its history every 1,000 steps and prints
 //! `PRODUCT-POCKET-HISTORY` (step:largest speed in the pocket, then in the whole domain).
-//! `WALL_SIGMA1=1` (default 0, off) sets σ = 1 in every fluid cell with a solid axis neighbour, the blend kept in the interior
+//! `WALL_SIGMA1=1` (the default; 0 switches it off) sets σ = 1 in every fluid cell with a solid axis neighbour, the blend kept in the interior
 //! (the wall-layer rule); 2 is its complement (σ = 1 everywhere else).
 //! `WALL_MRT=1` (default 0) makes the wall layer collide with MRT while the rest keeps the hybrid collision; `WALL_BULK=<0..1>` removes
 //! that share of the non-equilibrium density mode in the wall layer (both studies, off by default; printed in the row's collision label).
@@ -410,7 +410,7 @@ fn product_rows() {
             }
             flow.set_wall_aware_gradient(wall_gradient());
             flow.set_wall_gradient_gap(env("WALL_GAP", 0.5));
-            flow.set_wall_layer_sigma_one(env("WALL_SIGMA1", 0.0) as u8);
+            flow.set_wall_layer_sigma_one(env("WALL_SIGMA1", 1.0) as u8);
             flow.set_wall_layer_bulk(env("WALL_BULK", 0.0));
             flow.set_wall_layer_mrt(env("WALL_MRT", 0.0) != 0.0);
             flow.set_wall_corner_relax(env("WALL_CORNER", 0.0) != 0.0);
@@ -589,7 +589,7 @@ fn product_rows() {
             println!(
                 "PRODUCT collision {label} tau-1/2 {tau_mh:e} WALL {wall} LENGTH {length} WALL_GRADIENT {} WALL_SIGMA1 {} SEED_AMP {} U_LAT {} SA_SEED {} case {name} cells {w} steps {done} (minimum {min_steps}, cap {cap}): flow-rate error {:+.4} % (at 2/3 of the run {:+.4} %), change over the last third {:.4} %, max-min over it {range:.4} % ({status}){jumps}, range under the 1 % bar: {}, mean-density drift {:+.3e} per 10000 steps, largest nu_t/nu {max_ratio:.3e}{} ALONG_DUCT_MAX {along_max:.6e}",
                 u8::from(wall_gradient()),
-                env("WALL_SIGMA1", 0.0) as u8,
+                env("WALL_SIGMA1", 1.0) as u8,
                 seed_amp(),
                 u_lat(),
                 env("SA_SEED", 3.0),

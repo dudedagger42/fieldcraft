@@ -1413,6 +1413,12 @@ impl GpuFlow {
         // the driver rounds the rest differently: 1.5e-8 of 0.03 on the GB10).
         use fieldcraft_model::HrrSigma;
         let hybrid = flow.hybrid_sigma().filter(|s| *s != HrrSigma::Value(1.0));
+        // The σ = 1 rule (on by default): the device's layer must be the rule's, or the rule's layer empty.
+        let wall_sigma_device = if flow.wall_layer_sigma_one() == 1 && hybrid.is_some() {
+            flow.wall_sigma_layer_on_device().ok_or_else(|| Error::Invalid("not supported yet: the wall-layer sigma rule beside a wall law's boundary nodes on the GPU; set WALL_SIGMA1=0 or solve on the CPU".into()))?
+        } else {
+            false
+        };
         if flow.wall_layer_sigma_one() > 1 || flow.wall_aware_gradient() {
             return Err(Error::Invalid("not supported yet: the wall-layer sigma study modes 2 and 3 and the wall-aware gradient on the GPU; solve on the CPU".into()));
         }
@@ -1636,7 +1642,7 @@ impl GpuFlow {
             hrr: hybrid.is_some(),
             vreman: flow.vreman() > 0.0,
             dynamic: hybrid == Some(HrrSigma::Dynamic),
-            wall_sigma1: hybrid.is_some() && flow.wall_layer_sigma_one() == 1,
+            wall_sigma1: hybrid.is_some() && flow.wall_layer_sigma_one() == 1 && wall_sigma_device,
             zones: zones.zones > 0,
             sa: sa_faces.is_some(),
             sa_law,
