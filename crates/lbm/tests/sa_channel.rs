@@ -388,13 +388,14 @@ fn the_layer_mrt_leaves_a_wall_law_channel_bit_identical() {
 /// wall faces, and nothing else (the other axes are periodic).
 #[test]
 fn the_wall_layer_of_a_domain_face_channel_is_the_row_at_each_wall_face() {
+    let re_tau = 10.0;
     let channel = Channel {
-        re_tau: LEE_MOSER_180_RE_TAU,
-        cells: 10,
-        bulk_guess: LEE_MOSER_180_BULK,
-        lattice_bulk: 0.1,
-        collision: Collision::Hrr,
-        sigma: Some(0.95),
+        re_tau,
+        cells: 16,
+        bulk_guess: re_tau / 3.0,
+        lattice_bulk: 0.05,
+        collision: Collision::Trt,
+        sigma: None,
         turbulence: None,
         on_node: false,
         slabs: false,
