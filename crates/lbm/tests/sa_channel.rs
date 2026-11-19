@@ -184,9 +184,14 @@ impl Channel {
 
     /// Run to settling or the step cap.
     fn run(&self) -> ChannelResult {
-        let (setup, mut flow) = prepare(&self.model(), &self.obstacles());
         // study: WALL_MRT=1 collides the wall layer with the MRT moments (set_wall_layer_mrt)
-        flow.set_wall_layer_mrt(std::env::var("WALL_MRT").is_ok_and(|v| v == "1"));
+        self.run_with(std::env::var("WALL_MRT").is_ok_and(|v| v == "1"))
+    }
+
+    /// Run to settling or the step cap, the wall layer colliding with MRT or not.
+    fn run_with(&self, wall_mrt: bool) -> ChannelResult {
+        let (setup, mut flow) = prepare(&self.model(), &self.obstacles());
+        flow.set_wall_layer_mrt(wall_mrt);
         let grid = *flow.grid();
         // The rows between the walls (the slabs' rows left out).
         let first = self.slab_rows();
@@ -412,6 +417,40 @@ fn the_wall_layer_of_a_domain_face_channel_is_the_row_at_each_wall_face() {
         let y = grid.coords(c)[1];
         let wall_row = y == 0 || y + 1 == ny;
         assert_eq!(mask.get(c).copied(), Some(wall_row && flow.is_fluid(c)), "cell {c} at row {y}");
+    }
+}
+
+/// Study: where the wall sits in a laminar channel with domain-face walls, from the flow rate: U_b/u_τ over its exact value Re_τ/3 is
+/// (1 + 2 s/H)² for a wall displaced by `s` cells (H the channel's cells). `s` printed for the hybrid collision with the wall layer
+/// colliding with MRT or not, at a few τ − ½.
+#[test]
+#[ignore = "study"]
+fn study_wall_position_against_tau() {
+    let re_tau = 10.0;
+    for cells in [8usize, 16] {
+        for lb in [0.01f64, 0.02, 0.04] {
+            for mrt in [false, true] {
+                let ch = Channel {
+                    re_tau,
+                    cells,
+                    bulk_guess: re_tau / 3.0,
+                    lattice_bulk: lb,
+                    collision: Collision::Hrr,
+                    turbulence: None,
+                    on_node: false,
+                    slabs: false,
+                    max_steps: 3_000_000,
+                    sample: 50,
+                    settling: GATED,
+                    sigma: Some(0.99),
+                };
+                let (setup, _) = prepare(&ch.model(), &ch.obstacles());
+                let r = ch.run_with(mrt);
+                let ratio = r.bulk / (re_tau / 3.0);
+                let s = (ratio.sqrt() - 1.0) * (2 * cells) as f64 / 2.0;
+                println!("WALLPOS cells {cells} lb {lb} tau-1/2 {:.5} mrt {mrt}: U_b+ {:.5} ratio {ratio:.5} s {s:+.4} cells settled {} steps {}", setup.tau_plus - 0.5, r.bulk, r.settled, r.steps);
+            }
+        }
     }
 }
 
