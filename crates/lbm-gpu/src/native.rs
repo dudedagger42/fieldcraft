@@ -754,7 +754,7 @@ struct Variant {
     hrr: bool,
     vreman: bool,
     dynamic: bool,
-    /// The study knob WALL_SIGMA1 = 1: σ = 1 in the wall layer.
+    /// The per-cell flag words (the σ = 1 rule's layer, the corner study's cells) are present.
     wall_sigma1: bool,
     /// Where the layer flags start in the cell flags (with `wall_sigma1`).
     wall_sigma1_base: u32,
@@ -1418,6 +1418,8 @@ impl GpuFlow {
         let hybrid = flow.hybrid_sigma().filter(|s| *s != HrrSigma::Value(1.0));
         // The σ = 1 rule (on by default): the CPU flow's layer, uploaded as one flag per cell after the cell flags; none when it is empty.
         let wall_sigma_cells = if flow.wall_layer_sigma_one() == 1 && hybrid.is_some() { flow.wall_sigma_layer_mask() } else { Vec::new() };
+        // The corner study's cells (bit 1 of the same flag word): they relax fully to equilibrium before any σ rule.
+        let wall_corner_cells = if regularized && flow.wall_corner_relax() { flow.wall_corner_mask() } else { Vec::new() };
         if flow.wall_layer_sigma_one() > 1 || flow.wall_aware_gradient() {
             return Err(Error::Invalid("not supported yet: the wall-layer sigma study modes 2 and 3 and the wall-aware gradient on the GPU; solve on the CPU".into()));
         }
@@ -1525,9 +1527,11 @@ impl GpuFlow {
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             })
         });
-        let wall_sigma_base = if wall_sigma_cells.iter().any(|&m| m) {
+        let wall_sigma_base = if wall_sigma_cells.iter().chain(&wall_corner_cells).any(|&m| m) {
             let base = u32::try_from(fluid_u32.len()).map_err(|_| Error::Limit("too many cells for the GPU solver".into()))?;
-            fluid_u32.extend((0..n).map(|c| u32::from(wall_sigma_cells.get(c).copied().unwrap_or(false))));
+            fluid_u32.extend((0..n).map(|c| {
+                u32::from(wall_sigma_cells.get(c).copied().unwrap_or(false)) | (u32::from(wall_corner_cells.get(c).copied().unwrap_or(false)) << 1)
+            }));
             let bytes = (fluid_u32.len() as u64).checked_mul(4).ok_or_else(|| Error::Limit("too much GPU zone data".into()))?;
             if bytes > cap {
                 return Err(Error::Limit(format!("GPU cell flags, layer flags and fan/porous data need {bytes} bytes; this device allows {cap} per buffer")));

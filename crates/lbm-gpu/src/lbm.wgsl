@@ -127,7 +127,8 @@ override HRR: bool = false;
 override VREMAN: bool = false;
 // The hybrid collision's dynamic σ from the subgrid model's eddy viscosity (with HRR); likewise.
 override DYNAMIC: bool = false;
-// The study knob WALL_SIGMA1 = 1 (Flow::set_wall_layer_sigma_one, with HRR): σ = 1 in every fluid cell with a solid axis neighbour.
+// Per-cell flag words follow the cell flags (from WALL_SIGMA1_BASE) when the σ = 1 rule's layer (bit 0: σ = 1 in every fluid cell with a
+// solid axis neighbour, Flow::set_wall_layer_sigma_one, with HRR) or the corner study's cells (bit 1) are on.
 override WALL_SIGMA1: bool = false;
 // With it, the first word of the layer flags: one per cell, 1 in the rule's layer (the host builds them from the CPU flow's `wall_sigma_layer_mask`).
 override WALL_SIGMA1_BASE: u32 = 0u;
@@ -1819,7 +1820,7 @@ fn collide_cell(cell: u32, lid: u32) {
         return;
     }
     if MRT {
-        collide_mrt(cell, lid, xyz, &fq, drho, rho, u, force, forced, g);
+        collide_mrt(cell, lid, xyz, &fq, drho, rho, u, force, forced, g, false);
         return;
     }
     if turbulent() {
@@ -1954,9 +1955,13 @@ fn mrt_row(k: u32, q: u32) -> f32 {
 // populations' deviations from the weights: the moments of the deviations relax towards the
 // equilibrium moments less those of the weights (ρ = 1 at rest: 1, −11 and 3 in the first three),
 // the stresses at the cell's own rate (Smagorinsky's model or the wall model) or the fluid's.
-fn collide_mrt(cell: u32, lid: u32, xyz: vec3<i32>, fq: ptr<function, array<f32, 19>>, drho: f32, rho: f32, u: vec3<f32>, force: vec3<f32>, forced: bool, g: Gradient) {
+// With `full` (the corner study, fieldcraft_lbm::mrt::collide_full) every moment but the conserved ones relaxes to its equilibrium (rate 1),
+// Guo's force in the momentum and, with (1 − ½), in the rest; the eddy record is at rate 1.
+fn collide_mrt(cell: u32, lid: u32, xyz: vec3<i32>, fq: ptr<function, array<f32, 19>>, drho: f32, rho: f32, u: vec3<f32>, force: vec3<f32>, forced: bool, g: Gradient, full: bool) {
     var omega = params.omega_plus;
-    if turbulent() {
+    if full {
+        if turbulent() { record_eddy(cell, lid, 1.0, u); }
+    } else if turbulent() {
         var wall = -1.0;
         if WALL_MODEL { wall = wall_omega(cell); }
         if wall > 0.0 {
@@ -2020,6 +2025,7 @@ fn collide_mrt(cell: u32, lid: u32, xyz: vec3<i32>, fq: ptr<function, array<f32,
             case 16u, 17u, 18u: { s = 1.98; }
             default: { s = 0.0; }
         }
+        if full && s != 0.0 { s = 1.0; }
         change[k] = (-s * (m - eq[k]) + (1.0 - 0.5 * s) * mf) / norm;
     }
     for (var q = 0u; q < Q; q = q + 1u) {
@@ -2044,6 +2050,11 @@ fn collide_mrt(cell: u32, lid: u32, xyz: vec3<i32>, fq: ptr<function, array<f32,
 // the subgrid model's ν_t (Smagorinsky's from its implicit rate, or Vreman's), which then stays
 // out of the rate; a wall cell under the wall model keeps σ = 1 and its own rate.
 fn collide_regularized(cell: u32, lid: u32, xyz: vec3<i32>, fq: ptr<function, array<f32, 19>>, drho: f32, rho: f32, u: vec3<f32>, force: vec3<f32>, forced: bool, g: Gradient) {
+    // The corner study's cells (flag bit 1, from Flow::wall_corner_mask) relax fully to equilibrium, before any σ rule (flow.rs checks them first too).
+    if WALL_SIGMA1 && (fluid[WALL_SIGMA1_BASE + cell] & 2u) != 0u {
+        collide_mrt(cell, lid, xyz, fq, drho, rho, u, force, forced, g, true);
+        return;
+    }
     var p = flux(fq, drho, rho, u, force, forced);
     var omega = params.omega_plus;
     var sigma = 1.0;
@@ -2075,7 +2086,7 @@ fn collide_regularized(cell: u32, lid: u32, xyz: vec3<i32>, fq: ptr<function, ar
     }
     // The rule changes the collision only where the blend was not already σ = 1 (flow.rs `rule_damp`).
     var rule_damp = false;
-    if WALL_SIGMA1 && HRR && fluid[WALL_SIGMA1_BASE + cell] != 0u {
+    if WALL_SIGMA1 && HRR && (fluid[WALL_SIGMA1_BASE + cell] & 1u) != 0u {
         rule_damp = sigma != 1.0;
         sigma = 1.0;
     }

@@ -43,10 +43,20 @@ fn slot() -> (Setup, Vec<fieldcraft_lbm::Obstacle>) {
     (bed.setup, bed.obstacles)
 }
 
-fn parity(name: &str, setup: &Setup, obstacles: &[fieldcraft_lbm::Obstacle]) -> Result<(), String> {
+fn parity(name: &str, setup: &Setup, obstacles: &[fieldcraft_lbm::Obstacle], corner: bool) -> Result<(), String> {
     let mut cpu = Flow::new(setup, obstacles).map_err(|e| e.to_string())?;
     let mut off = Flow::new(setup, obstacles).map_err(|e| e.to_string())?;
     off.set_wall_layer_sigma_one(0);
+    // The corner study on every third layer cell (an explicit set, on both CPU flows; the device reads the same mask), against a flow without it.
+    let mut plain = Flow::new(setup, obstacles).map_err(|e| e.to_string())?;
+    if corner {
+        let mask = cpu.wall_layer_mask();
+        let cells: Vec<usize> = (0..mask.len()).filter(|&c| mask.get(c).copied().unwrap_or(false) && c % 3 == 0).collect();
+        for f in [&mut cpu, &mut off] {
+            f.set_wall_corner_relax(true);
+            f.set_wall_corner_cells(Some(cells.clone()));
+        }
+    }
     let mut gpu = match GpuFlow::with_options(&cpu, Policy::from_env().map_err(|e| e.to_string())?, Options::default()) {
         Ok(g) => g,
         Err(e) if !gpu_required() && e.to_string().contains("no GPU device") => {
@@ -62,7 +72,7 @@ fn parity(name: &str, setup: &Setup, obstacles: &[fieldcraft_lbm::Obstacle]) -> 
     let (mut worst_u, mut worst_r) = (0.0f64, 0.0f64);
     let mut done = 0;
     while done < STEPS {
-        for b in [&mut cpu as &mut dyn Backend, &mut gpu, &mut off] {
+        for b in [&mut cpu as &mut dyn Backend, &mut gpu, &mut off, &mut plain] {
             b.advance(CHUNK).map_err(|e| e.to_string())?;
         }
         done += CHUNK;
@@ -78,9 +88,17 @@ fn parity(name: &str, setup: &Setup, obstacles: &[fieldcraft_lbm::Obstacle]) -> 
         .filter(|&c| Backend::is_fluid(&cpu, c))
         .map(|c| [0, 1, 2].map(|k| ((a.velocity[c][k] - o.velocity[c][k]) / scale).abs()).into_iter().fold(0.0, f64::max))
         .fold(0.0, f64::max);
-    println!("{name}: CPU vs device max |Δu| {worst_u:.3e}, max |Δρ| {worst_r:.3e}; rule on vs off (CPU) max |Δu| {rule:.3e}");
+    let p = Backend::fields(&mut plain).map_err(|e| e.to_string())?;
+    let corner_effect = (0..a.velocity.len())
+        .filter(|&c| Backend::is_fluid(&cpu, c))
+        .map(|c| [0, 1, 2].map(|k| ((a.velocity[c][k] - p.velocity[c][k]) / scale).abs()).into_iter().fold(0.0, f64::max))
+        .fold(0.0, f64::max);
+    println!("{name}: CPU vs device max |Δu| {worst_u:.3e}, max |Δρ| {worst_r:.3e}; rule on vs off (CPU) max |Δu| {rule:.3e}; corner cells on vs off {corner_effect:.3e}");
     if worst_u >= 2e-5 || worst_r >= 1e-6 {
         return Err(format!("{name}: |Δu| {worst_u:.3e} (bar 2e-5), |Δρ| {worst_r:.3e} (bar 1e-6)"));
+    }
+    if corner && corner_effect <= 1e-9 {
+        return Err(format!("{name}: the corner cells did not act (with vs without max |Δu| {corner_effect:.3e})"));
     }
     if rule <= 1e-9 {
         return Err(format!("{name}: the rule did not act (on vs off max |Δu| {rule:.3e})"));
@@ -92,8 +110,8 @@ fn parity(name: &str, setup: &Setup, obstacles: &[fieldcraft_lbm::Obstacle]) -> 
 #[ignore = "local: run on the machine whose GPU is to be checked"]
 fn the_cpu_and_the_device_agree_on_the_wall_layer_rule() {
     let mut failures = Vec::new();
-    for (name, (setup, obstacles)) in [("slot bed, 8 cells", slot()), ("square duct, 8 cells", duct())] {
-        if let Err(e) = parity(name, &setup, &obstacles) {
+    for (name, (setup, obstacles), corner) in [("slot bed, 8 cells", slot(), false), ("square duct, 8 cells", duct(), false), ("slot bed with corner cells", slot(), true)] {
+        if let Err(e) = parity(name, &setup, &obstacles, corner) {
             failures.push(e);
         }
     }
