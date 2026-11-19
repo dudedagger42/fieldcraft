@@ -137,6 +137,12 @@ fn the_cpu_and_the_device_agree_at_tau_minus_half_2_4e_minus_4() {
     );
 }
 
+/// The force on the obstacles along x (last step's momentum).
+fn obstacle_force(b: &mut dyn Backend) -> Result<f64, String> {
+    let forces = b.forces().map_err(|e| e.to_string())?;
+    Ok(b.groups().iter().zip(&forces).filter(|(g, _)| g.body.is_some()).map(|(_, v)| v[0]).sum::<f64>())
+}
+
 /// What round-off does not amplify, in lattice units: the flow rate through `plane` (the fluid cells of one
 /// layer across the channel at x ≈ 0.68: the slot of the plate, the ball's shoulder), the force on the obstacles
 /// (last step's momentum, along x), the kinetic energy and the mean density of the fluid cells.
@@ -192,6 +198,8 @@ fn parity(slotted: bool) -> Result<(), String> {
     let (tol_u, tol_r, tol_i) = (env("PARITY_DU", 2e-5), env("PARITY_DRHO", 1e-6), env("PARITY_INTEGRAL", 1e-4));
     let (mut worst_u, mut worst_r) = (0.0f64, 0.0f64);
     let mut failures = Vec::new();
+    // The obstacle force after each chunk (cpu, device). `PARITY_FORCE_SCALE` scales the device's, to show the gate catches a real gap.
+    let (mut forces, force_scale) = (Vec::new(), env("PARITY_FORCE_SCALE", 1.0));
     let mut done = 0;
     while done < STEPS {
         Backend::advance(&mut cpu, CHUNK).map_err(|e| e.to_string())?;
@@ -205,6 +213,7 @@ fn parity(slotted: bool) -> Result<(), String> {
             failures.push(format!("step {done}: a field is not finite"));
             break;
         }
+        forces.push((obstacle_force(&mut cpu)?, obstacle_force(&mut gpu)? * force_scale));
         let umax = a.velocity.iter().map(|u| u.iter().map(|v| v * v).sum::<f64>().sqrt()).fold(0.0, f64::max) / scale;
         let (mut du, mut drho, mut sq, mut n) = (0.0f64, 0.0f64, 0.0f64, 0usize);
         for c in 0..a.velocity.len() {
@@ -239,7 +248,17 @@ fn parity(slotted: bool) -> Result<(), String> {
         );
     }
     let (ci, gi) = (integrals(&mut cpu, &plane, scale)?, integrals(&mut gpu, &plane, scale)?);
-    for k in 0..4 {
+    // The force on the obstacle is a start-up transient that changes sign (the ball's runs through ±0.9 at 500 steps), so a single sample can sit near a
+    // zero crossing, where a relative bar on that sample measures nothing: each gated sample is checked against the run's largest |force| instead.
+    let force_scale_run = forces.iter().map(|(c, g)| c.abs().max(g.abs())).fold(0.0, f64::max).max(1e-12);
+    // Every sample through `GATED_THROUGH` and the last one (the chunks between are the unstable slot's, reported only).
+    let gated_force = |i: usize| (i as u64 + 1) * CHUNK <= GATED_THROUGH || i + 1 == forces.len();
+    let force_gap = forces.iter().enumerate().filter(|(i, _)| gated_force(*i)).map(|(_, (c, g))| (c - g).abs()).fold(0.0, f64::max) / force_scale_run;
+    println!("step {STEPS}: obstacle force cpu {:.6e} device {:.6e}; worst gated |Δ| {force_gap:.2e} of the run's largest |force| {force_scale_run:.3e} (bar {tol_i:.0e})", forces.last().map_or(0.0, |f| f.0), forces.last().map_or(0.0, |f| f.1));
+    if !(force_gap < tol_i) {
+        failures.push(format!("obstacle force: |Δ| {force_gap:.2e} of the run's largest |force| (bar {tol_i:.0e})"));
+    }
+    for k in [0, 2, 3] {
         let rel = (ci[k] - gi[k]).abs() / ci[k].abs().max(1e-12);
         println!("step {STEPS}: {} cpu {:.6e} device {:.6e}, relative difference {rel:.2e} (bar {tol_i:.0e})", INTEGRAL_NAMES[k], ci[k], gi[k]);
         if !(rel < tol_i) {
