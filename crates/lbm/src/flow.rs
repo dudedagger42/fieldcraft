@@ -2309,6 +2309,32 @@ impl Flow {
         if self.bulk.is_empty() { &self.fluid } else { &self.bulk }
     }
 
+    /// The wall layer of the resolved walls: the cells that collide and have a solid cell across an axis neighbour. A row beside a
+    /// boundary node of the on-node wall-function bounce is not in it (those nodes are fluid cells that do not collide, and the wall
+    /// law sets the stress of the row beside them), so the layer studies leave a wall-law wall as it is.
+    pub fn wall_layer_mask(&self) -> Vec<bool> {
+        let live = self.collides();
+        let solid = |c: usize| !self.fluid.get(c).copied().unwrap_or(true);
+        // A domain face is a resolved wall too (halfway bounce-back) unless a wall law gives it its stress or the cell is an inlet/outlet there.
+        let mut opens = std::collections::HashSet::new();
+        for o in &self.open {
+            opens.insert((o.cell as usize, o.axis));
+        }
+        let faces_wall = !self.wall_bounce;
+        (0..self.grid.len())
+            .map(|c| {
+                let p = self.grid.coords(c);
+                live.get(c).copied().unwrap_or(false)
+                    && (0..3).any(|axis| {
+                        [false, true].iter().any(|&up| match across(&self.grid, self.periodic, p, axis, up) {
+                            Some(n) => solid(n),
+                            None => faces_wall && !opens.contains(&(c, axis)),
+                        })
+                    })
+            })
+            .collect()
+    }
+
     /// What the corner rule did to the velocity inlets (all zero without an on-node wall law).
     pub fn inlet_corner_report(&self) -> InletCornerReport {
         self.inlet_corners
@@ -3368,13 +3394,7 @@ impl Flow {
         let wall_tau_floor = self.wall_tau_floor();
         // The wall layer of the two remedy studies: fluid cells with a solid axis neighbour (empty when neither is on).
         let layer: Vec<bool> = if (wall_bulk > 0.0 || wall_mrt) && regularized {
-            let solid = |c: usize| !self.fluid.get(c).copied().unwrap_or(true);
-            (0..self.grid.len())
-                .map(|c| {
-                    let p = self.grid.coords(c);
-                    !solid(c) && (0..3).any(|axis| [false, true].iter().any(|&up| across(&self.grid, self.periodic, p, axis, up).is_some_and(solid)))
-                })
-                .collect()
+            self.wall_layer_mask()
         } else {
             Vec::new()
         };

@@ -355,6 +355,65 @@ fn report(name: &str, r: &ChannelResult, bulk_reference: f64, cf_reference: f64)
     );
 }
 
+/// A wall-law channel (slabs on the half-way walls, the wall law sets the stress of the row beside them) is not changed by the
+/// layer MRT study: the same run with it on and off is bit-identical.
+#[test]
+fn the_layer_mrt_leaves_a_wall_law_channel_bit_identical() {
+    let channel = Channel {
+        re_tau: LEE_MOSER_180_RE_TAU,
+        cells: 10,
+        bulk_guess: LEE_MOSER_180_BULK,
+        lattice_bulk: 0.1,
+        collision: Collision::Hrr,
+        sigma: Some(0.95),
+        turbulence: Some(sa(WallModel::SpalartAllmarasBounceSurface)),
+        on_node: false,
+        slabs: true,
+        max_steps: 1,
+        sample: 100,
+        settling: GATED,
+    };
+    let velocities = |mrt: bool| {
+        let (_, mut flow) = prepare(&channel.model(), &channel.obstacles());
+        flow.set_wall_layer_mrt(mrt);
+        for _ in 0..300 {
+            flow.step().unwrap();
+        }
+        (0..flow.grid().len()).map(|c| flow.moments(c).map_or([f64::NAN; 4], |(r, u)| [r, u[0], u[1], u[2]]).map(f64::to_bits)).collect::<Vec<_>>()
+    };
+    assert!(velocities(false) == velocities(true));
+}
+
+/// The layer MRT study's wall layer on a channel whose walls are the domain's faces (no solid cells): the fluid rows beside the two
+/// wall faces, and nothing else (the other axes are periodic).
+#[test]
+fn the_wall_layer_of_a_domain_face_channel_is_the_row_at_each_wall_face() {
+    let channel = Channel {
+        re_tau: LEE_MOSER_180_RE_TAU,
+        cells: 10,
+        bulk_guess: LEE_MOSER_180_BULK,
+        lattice_bulk: 0.1,
+        collision: Collision::Hrr,
+        sigma: Some(0.95),
+        turbulence: None,
+        on_node: false,
+        slabs: false,
+        max_steps: 1,
+        sample: 100,
+        settling: GATED,
+    };
+    let (_, flow) = prepare(&channel.model(), &channel.obstacles());
+    let grid = *flow.grid();
+    let ny = grid.cells[1];
+    let mask = flow.wall_layer_mask();
+    assert!(mask.iter().any(|&m| m), "a domain-face wall has a layer");
+    for c in 0..grid.len() {
+        let y = grid.coords(c)[1];
+        let wall_row = y == 0 || y + 1 == ny;
+        assert_eq!(mask.get(c).copied(), Some(wall_row && flow.is_fluid(c)), "cell {c} at row {y}");
+    }
+}
+
 /// The measuring pipeline on the laminar channel: plane Poiseuille flow at Re_τ = 10, where
 /// U_b⁺ = Re_τ/3 and C_f = 2/U_b⁺² = 18/Re_τ² exactly. On 16 cells per δ with halfway walls (TRT)
 /// the discretisation error is small next to the 0.5 % asked of U_b⁺ and the carried C_f; the

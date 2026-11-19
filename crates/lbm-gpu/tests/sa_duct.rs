@@ -98,7 +98,7 @@ impl Duct {
         let mut p = collide(self.max_steps as f64 * dt, dt, None, Collision::Hrr);
         if let Procedure::Fluid { turbulence, sigma, .. } = &mut p {
             *turbulence = Some(sa);
-            *sigma = Some(HrrSigma::Value(0.99));
+            *sigma = Some(HrrSigma::Value(std::env::var("FIELDCRAFT_DUCT_SIGMA").ok().and_then(|v| v.parse().ok()).unwrap_or(0.99)));
         }
         let m = model(1.0, 1.0 / self.re_tau, d, p);
         let (setup, mut flow) = prepare(&m, &[]);
