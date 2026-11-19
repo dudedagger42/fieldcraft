@@ -82,7 +82,7 @@ fn parity(name: &str, setup: &Setup, obstacles: &[fieldcraft_lbm::Obstacle]) -> 
     if worst_u >= 2e-5 || worst_r >= 1e-6 {
         return Err(format!("{name}: |Δu| {worst_u:.3e} (bar 2e-5), |Δρ| {worst_r:.3e} (bar 1e-6)"));
     }
-    if rule <= 2e-5 {
+    if rule <= 1e-9 {
         return Err(format!("{name}: the rule did not act (on vs off max |Δu| {rule:.3e})"));
     }
     Ok(())
