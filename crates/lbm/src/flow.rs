@@ -178,8 +178,10 @@ pub struct WallSigmaCensus {
     pub box_face_only: usize,
     /// Cells on both (the larger share).
     pub both: usize,
-    /// Cells the margin at the open faces took out of the layer.
+    /// Box-face cells (next to no solid cell) the margin at the open faces took out of the layer.
     pub removed_near_open: usize,
+    /// Cells next to an obstacle or voxel solid inside the margin: the margin keeps them (they are counted above as well).
+    pub kept_solid_near_open: usize,
 }
 
 /// What an open cell holds.
@@ -339,8 +341,8 @@ pub const WALL_LAYER_RULE_BULK: f64 = 0.03;
 /// A curved or stair-stepped wall at small τ − ½ carries the cell-to-cell mode at the small share (a sphere in a channel at τ − ½ 3e-3).
 pub const WALL_LAYER_RULE_BULK_SOLID: f64 = 0.5;
 
-/// The σ = 1 layer leaves out the cells within this many cells of an inlet, outlet or pressure cell, in each axis (a cube around every open
-/// cell): next to an open face the rule bursts a small-τ box channel (a margin of 2 failed, 3 to 6 held; this is 4).
+/// The σ = 1 layer leaves out its box-face cells within this many cells of an inlet, outlet or pressure cell, in each axis (a cube around every
+/// open cell; cells next to an obstacle or voxel solid stay in it): next to an open face the rule bursts a small-τ box channel (a margin of 2 failed, 3 to 6 held; this is 4).
 pub const WALL_LAYER_OPEN_MARGIN: usize = 4;
 
 /// Remove the share `eps` of the non-equilibrium density (trace) mode of the populations `post`: the Hermite component
@@ -2364,7 +2366,7 @@ impl Flow {
 
     /// The σ = 1 rule's layer, one byte per cell: bit 0 in the layer, bit 1 next to an obstacle or voxel solid (the larger density-mode
     /// share). The layer is [`Flow::wall_layer_mask`] (a wall of obstacle cells and a box face alike) without the cells within
-    /// [`WALL_LAYER_OPEN_MARGIN`] cells of an open cell. Built once.
+    /// [`WALL_LAYER_OPEN_MARGIN`] cells of an open cell, except the cells next to a solid, which stay. Built once.
     fn wall_sigma_flags(&self) -> std::sync::Arc<Vec<u8>> {
         self.wall_sigma_flags.get_or_init(|| std::sync::Arc::new(self.build_wall_sigma_flags().0)).clone()
     }
@@ -2380,9 +2382,15 @@ impl Flow {
                 if !(s || f) {
                     return 0;
                 }
+                // The margin takes out box-face cells only: a cell next to a solid keeps its σ = 1 (a dead-end slit between voxel walls that
+                // opens onto an open face would otherwise lose it on its last cells).
                 if near_open.get(c).copied().unwrap_or(false) {
-                    census.removed_near_open += 1;
-                    return 0;
+                    if s {
+                        census.kept_solid_near_open += 1;
+                    } else {
+                        census.removed_near_open += 1;
+                        return 0;
+                    }
                 }
                 match (s, f) {
                     (true, true) => census.both += 1,

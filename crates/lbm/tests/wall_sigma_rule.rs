@@ -7,6 +7,10 @@ use fieldcraft_lbm::{Flow, Limits, Setup, WALL_LAYER_OPEN_MARGIN, WALL_LAYER_RUL
 use fieldcraft_model::{Collision, FaceCondition, HrrSigma, Outflow, Procedure, Profile, Turbulence};
 
 fn ball_bed() -> (Setup, Vec<fieldcraft_lbm::Obstacle>) {
+    ball_bed_at(0.9)
+}
+
+fn ball_bed_at(x: f64) -> (Setup, Vec<fieldcraft_lbm::Obstacle>) {
     let dx = 0.1;
     let dt = 0.08 * dx / 0.1;
     let mut d = domain([0.0; 3], [2.0, 1.0, 1.0], dx);
@@ -14,7 +18,7 @@ fn ball_bed() -> (Setup, Vec<fieldcraft_lbm::Obstacle>) {
     d.faces.x_max = FaceCondition::Pressure { pressure: 0.0, outflow: Outflow::Uniform };
     d.faces.z_max = FaceCondition::Slip {};
     d.obstacles = vec!["Ball".into()];
-    let bodies = vec![obstacle("Ball", sphere([0.9, 0.5, 0.5], 0.2, 3), &["skin"])];
+    let bodies = vec![obstacle("Ball", sphere([x, 0.5, 0.5], 0.2, 3), &["skin"])];
     let sa = Turbulence::SpalartAllmaras { prandtl: 0.9, wall_model: None, inflow_ratio: 3.0, ddes: None };
     let p = Procedure::Fluid {
         domain: "Flow".into(),
@@ -49,11 +53,27 @@ fn the_layer_is_split_by_kind_and_leaves_out_the_cells_near_the_open_faces() {
     assert_eq!(solid.iter().filter(|&&m| m).count(), census.obstacle_only + census.both);
     for c in (0..layer.len()).filter(|&c| layer[c]) {
         let i = grid.coords(c)[0];
-        assert!(i >= WALL_LAYER_OPEN_MARGIN && i + WALL_LAYER_OPEN_MARGIN < nx, "layer cell {c} at x index {i} is within the open-face margin");
+        let inside = i < WALL_LAYER_OPEN_MARGIN || i + WALL_LAYER_OPEN_MARGIN >= nx;
+        assert!(!inside || solid[c], "box-face layer cell {c} at x index {i} is within the open-face margin");
     }
     assert!((0..layer.len()).all(|c| !solid[c] || layer[c]), "a solid-share cell outside the layer");
     // The ball's layer cells are all away from the box faces here (its gap to the walls is more than two cells).
     assert_eq!(census.both, 0);
+    assert_eq!(census.kept_solid_near_open, 0, "{census:?}");
+}
+
+#[test]
+fn a_solid_inside_the_margin_keeps_its_layer() {
+    // The same bed with the ball moved to x = 0.5: part of its layer lies within the margin of the inlet, and the margin leaves it alone.
+    let (setup, bodies) = ball_bed_at(0.5);
+    let flow = Flow::new(&setup, &bodies).expect("flow");
+    let census = flow.wall_sigma_census();
+    println!("{census:?}");
+    assert!(census.kept_solid_near_open > 0, "{census:?}");
+    assert!(census.removed_near_open > 0, "{census:?}");
+    let (layer, solid) = (flow.wall_sigma_layer_mask(), flow.wall_sigma_solid_mask());
+    let kept = (0..layer.len()).filter(|&c| solid[c] && flow.grid().coords(c)[0] < WALL_LAYER_OPEN_MARGIN).count();
+    assert!(kept > 0 && (0..layer.len()).all(|c| !solid[c] || layer[c]));
 }
 
 #[test]
