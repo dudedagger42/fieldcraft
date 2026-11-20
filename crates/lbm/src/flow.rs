@@ -676,6 +676,8 @@ pub struct Flow {
     wall_faces: [[bool; 2]; 3],
     /// A study (off: 0): the share of the non-equilibrium density (trace) mode removed each step in the wall layer, after the collision.
     wall_layer_bulk: f64,
+    /// The share of the density mode the σ = 1 rule removes in its layer ([`WALL_LAYER_RULE_BULK`] by default), see `set_wall_rule_bulk`.
+    wall_rule_bulk: f64,
     /// A study (off): the wall layer collides with the two-relaxation-time MRT scheme instead of the regularised one.
     wall_layer_mrt: bool,
     /// The corner study (see `set_wall_corner_relax`): on or off, an explicit cell set that replaces the pure-corner test, and the
@@ -1832,6 +1834,7 @@ impl Flow {
             wall_layer_sigma_one: 1,
             wall_faces,
             wall_layer_bulk: 0.0,
+            wall_rule_bulk: WALL_LAYER_RULE_BULK,
             wall_layer_mrt: false,
             wall_corner_relax: false,
             wall_tau_floor: 0.0,
@@ -2518,6 +2521,19 @@ impl Flow {
     /// 2 (a study) sets σ = 1 in every other cell, 3 (a study) in the two layers beside a solid cell.
     pub fn set_wall_layer_sigma_one(&mut self, mode: u8) {
         self.wall_layer_sigma_one = mode;
+    }
+
+    /// The share of the density mode the σ = 1 rule removes in its layer (default [`WALL_LAYER_RULE_BULK`], 0.5). A study knob on the
+    /// CPU path: the device always uses the default, so parity holds only there. A value outside 0..=1 (or not a number) is ignored.
+    pub fn set_wall_rule_bulk(&mut self, eps: f64) {
+        if (0.0..=1.0).contains(&eps) {
+            self.wall_rule_bulk = eps;
+        }
+    }
+
+    /// The share [`Flow::set_wall_rule_bulk`] set.
+    pub fn wall_rule_bulk(&self) -> f64 {
+        self.wall_rule_bulk
     }
 
     /// A study (off by default, bit-identical off): in the wall layer (a fluid cell with a solid axis neighbour) the share `eps`
@@ -3435,6 +3451,7 @@ impl Flow {
         let wall_gap = self.wall_gap;
         let wall_layer_sigma_one = self.wall_layer_sigma_one;
         let (wall_bulk, wall_mrt) = (self.wall_layer_bulk, self.wall_layer_mrt);
+        let rule_bulk = self.wall_rule_bulk;
         let wall_tau_floor = self.wall_tau_floor();
         // The wall layer of the two remedy studies: fluid cells with a solid axis neighbour (empty when neither is on).
         let layer: Vec<bool> = if (wall_bulk > 0.0 || wall_mrt) && regularized {
@@ -3719,7 +3736,7 @@ impl Flow {
                     }
                     // The σ = 1 rule's layer also damps its density mode (the hybrid collision only).
                     if rule_damp {
-                        damp_density_mode(&mut post, rho, uu, WALL_LAYER_RULE_BULK);
+                        damp_density_mode(&mut post, rho, uu, rule_bulk);
                     }
                     for (q, v) in post.iter().enumerate() {
                         put(q, *v);
@@ -4197,6 +4214,7 @@ impl crate::backend::Backend for Flow {
             wall_layer_sigma_one: _,
             wall_faces: _,
             wall_layer_bulk: _,
+            wall_rule_bulk: _,
             wall_layer_mrt: _,
             wall_corner_relax: _,
             wall_tau_floor: _,
