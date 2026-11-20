@@ -106,7 +106,7 @@ fn cpu_holds(slotted: bool) {
     let mut cpu = fieldcraft_lbm::Flow::new(&setup, &obstacles).unwrap();
     Backend::advance(&mut cpu, STEPS).unwrap();
     let f = Backend::fields(&mut cpu).unwrap();
-    let umax = f.velocity.iter().map(|u| u.iter().map(|v| v * v).sum::<f64>().sqrt()).fold(0.0, f64::max) / setup.velocity_scale();
+    let umax = f.velocity.iter().map(|u| u.iter().map(|v| v * v).sum::<f64>().sqrt()).fold(0.0, f64::max);
     println!("slotted {slotted}: CPU after {STEPS} steps: max |u| {umax:.4} lattice");
     let rho: Vec<f64> = (0..f.density.len()).filter(|&c| Backend::is_fluid(&cpu, c)).map(|c| f.density[c]).collect();
     assert!(
@@ -146,17 +146,17 @@ fn obstacle_force(b: &mut dyn Backend) -> Result<f64, String> {
 /// What round-off does not amplify, in lattice units: the flow rate through `plane` (the fluid cells of one
 /// layer across the channel at x ≈ 0.68: the slot of the plate, the ball's shoulder), the force on the obstacles
 /// (last step's momentum, along x), the kinetic energy and the mean density of the fluid cells.
-fn integrals(b: &mut dyn Backend, plane: &[usize], scale: f64) -> Result<[f64; 4], String> {
+fn integrals(b: &mut dyn Backend, plane: &[usize]) -> Result<[f64; 4], String> {
     let f = b.fields().map_err(|e| e.to_string())?;
     let forces = b.forces().map_err(|e| e.to_string())?;
     let (mut ke, mut rho, mut n) = (0.0, 0.0, 0usize);
     for c in (0..f.density.len()).filter(|&c| b.is_fluid(c)) {
-        let u2 = f.velocity[c].iter().map(|v| (v / scale).powi(2)).sum::<f64>();
+        let u2 = f.velocity[c].iter().map(|v| v.powi(2)).sum::<f64>();
         ke += 0.5 * f.density[c] * u2;
         rho += f.density[c];
         n += 1;
     }
-    let flow = plane.iter().map(|&c| f.velocity[c][0] / scale).sum::<f64>();
+    let flow = plane.iter().map(|&c| f.velocity[c][0]).sum::<f64>();
     let force = b.groups().iter().zip(&forces).filter(|(g, _)| g.body.is_some()).map(|(_, v)| v[0]).sum::<f64>();
     Ok([flow, force, ke, rho / n.max(1) as f64])
 }
@@ -214,13 +214,13 @@ fn parity(slotted: bool) -> Result<(), String> {
             break;
         }
         forces.push((obstacle_force(&mut cpu)?, obstacle_force(&mut gpu)? * force_scale));
-        let umax = a.velocity.iter().map(|u| u.iter().map(|v| v * v).sum::<f64>().sqrt()).fold(0.0, f64::max) / scale;
+        let umax = a.velocity.iter().map(|u| u.iter().map(|v| v * v).sum::<f64>().sqrt()).fold(0.0, f64::max);
         let (mut du, mut drho, mut sq, mut n) = (0.0f64, 0.0f64, 0.0f64, 0usize);
         for c in 0..a.velocity.len() {
             if !Backend::is_fluid(&cpu, c) {
                 continue;
             }
-            let e = [0, 1, 2].map(|k| (a.velocity[c][k] - b.velocity[c][k]) / scale);
+            let e = [0, 1, 2].map(|k| a.velocity[c][k] - b.velocity[c][k]);
             let e2 = e.iter().map(|v| v * v).sum::<f64>();
             du = du.max(e2.sqrt());
             sq += e2;
@@ -247,7 +247,7 @@ fn parity(slotted: bool) -> Result<(), String> {
             du / umax.max(1e-12)
         );
     }
-    let (ci, gi) = (integrals(&mut cpu, &plane, scale)?, integrals(&mut gpu, &plane, scale)?);
+    let (ci, gi) = (integrals(&mut cpu, &plane)?, integrals(&mut gpu, &plane)?);
     // The force on the obstacle is a start-up transient that changes sign (the ball's runs through ±0.9 at 500 steps), so a single sample can sit near a
     // zero crossing, where a relative bar on that sample measures nothing: each gated sample is checked against the run's largest |force| instead.
     let force_scale_run = forces.iter().map(|(c, g)| c.abs().max(g.abs())).fold(0.0, f64::max).max(1e-12);
@@ -279,7 +279,6 @@ fn a_seed_of_1e_minus_7_grows_alike_on_the_cpu_and_on_the_device() {
     const SEED: f64 = 1e-7;
     let (m, obstacles, _, _) = case(true);
     let setup = Setup::new(&m, None, &obstacles, &Limits::default()).unwrap_or_else(|e| panic!("{e}"));
-    let scale = setup.velocity_scale();
     let (mut a, mut b) = match (fieldcraft_lbm::Flow::new(&setup, &obstacles), fieldcraft_lbm::Flow::new(&setup, &obstacles)) {
         (Ok(a), Ok(b)) => (a, b),
         (Err(e), _) | (_, Err(e)) => panic!("{e}"),
@@ -287,7 +286,7 @@ fn a_seed_of_1e_minus_7_grows_alike_on_the_cpu_and_on_the_device() {
     let f0 = Backend::fields(&mut a).unwrap_or_else(|e| panic!("{e}"));
     let fluid: Vec<usize> = (0..f0.density.len()).filter(|&c| Backend::is_fluid(&a, c)).collect();
     let Some(&seed) = fluid.get(fluid.len() / 2) else { panic!("no fluid cell") };
-    let state = |c: usize, e: f64| (f0.density[c] + if c == seed { e } else { 0.0 }, [0, 1, 2].map(|k| f0.velocity[c][k] / scale));
+    let state = |c: usize, e: f64| (f0.density[c] + if c == seed { e } else { 0.0 }, [0, 1, 2].map(|k| f0.velocity[c][k]));
     a.set_equilibrium(|c| state(c, 0.0));
     b.set_equilibrium(|c| state(c, SEED));
     let policy = Policy::from_env().unwrap_or_else(|e| panic!("{e}"));

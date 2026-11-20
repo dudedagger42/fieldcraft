@@ -65,7 +65,7 @@ fn parity(name: &str, setup: &Setup, obstacles: &[fieldcraft_lbm::Obstacle], cor
         }
         Err(e) => return Err(e.to_string()),
     };
-    let scale = setup.velocity_scale();
+    // `Backend::fields` velocities are lattice units already.
     let layer = cpu.wall_sigma_layer_mask().iter().filter(|&&m| m).count();
     println!("{name}: device {}, {} cells, {layer} in the rule's layer", gpu.adapter_name(), cpu.grid().len());
     assert!(layer > 0, "{name}: the rule's layer is empty");
@@ -78,7 +78,7 @@ fn parity(name: &str, setup: &Setup, obstacles: &[fieldcraft_lbm::Obstacle], cor
         done += CHUNK;
         let (a, b) = (Backend::fields(&mut cpu).map_err(|e| e.to_string())?, Backend::fields(&mut gpu).map_err(|e| e.to_string())?);
         for c in (0..a.velocity.len()).filter(|&c| Backend::is_fluid(&cpu, c)) {
-            let e = [0, 1, 2].map(|k| (a.velocity[c][k] - b.velocity[c][k]) / scale);
+            let e = [0, 1, 2].map(|k| a.velocity[c][k] - b.velocity[c][k]);
             worst_u = worst_u.max(e.iter().map(|v| v * v).sum::<f64>().sqrt());
             worst_r = worst_r.max((a.density[c] - b.density[c]).abs());
         }
@@ -86,12 +86,12 @@ fn parity(name: &str, setup: &Setup, obstacles: &[fieldcraft_lbm::Obstacle], cor
     let (a, o) = (Backend::fields(&mut cpu).map_err(|e| e.to_string())?, Backend::fields(&mut off).map_err(|e| e.to_string())?);
     let rule = (0..a.velocity.len())
         .filter(|&c| Backend::is_fluid(&cpu, c))
-        .map(|c| [0, 1, 2].map(|k| ((a.velocity[c][k] - o.velocity[c][k]) / scale).abs()).into_iter().fold(0.0, f64::max))
+        .map(|c| [0, 1, 2].map(|k| (a.velocity[c][k] - o.velocity[c][k]).abs()).into_iter().fold(0.0, f64::max))
         .fold(0.0, f64::max);
     let p = Backend::fields(&mut plain).map_err(|e| e.to_string())?;
     let corner_effect = (0..a.velocity.len())
         .filter(|&c| Backend::is_fluid(&cpu, c))
-        .map(|c| [0, 1, 2].map(|k| ((a.velocity[c][k] - p.velocity[c][k]) / scale).abs()).into_iter().fold(0.0, f64::max))
+        .map(|c| [0, 1, 2].map(|k| (a.velocity[c][k] - p.velocity[c][k]).abs()).into_iter().fold(0.0, f64::max))
         .fold(0.0, f64::max);
     println!("{name}: CPU vs device max |Δu| {worst_u:.3e}, max |Δρ| {worst_r:.3e}; rule on vs off (CPU) max |Δu| {rule:.3e}; corner cells on vs off {corner_effect:.3e}");
     if worst_u >= 2e-5 || worst_r >= 1e-6 {
