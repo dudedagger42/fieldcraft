@@ -39,8 +39,12 @@ fn duct() -> (Setup, Vec<fieldcraft_lbm::Obstacle>) {
 }
 
 /// A ball in a box with a velocity inlet and a pressure outlet: the layer has box-face cells and ball cells, and the margin at the open faces
-/// takes cells out of it (the flags' bit 2 and the exclusion on the device).
+/// takes box-face cells out of it (the flags' bit 2 and the exclusion on the device); `ball_at(0.5)` puts part of the ball's layer inside the margin, where it stays.
 fn ball() -> (Setup, Vec<fieldcraft_lbm::Obstacle>) {
+    ball_at(0.9)
+}
+
+fn ball_at(x: f64) -> (Setup, Vec<fieldcraft_lbm::Obstacle>) {
     let dx = 0.1;
     let dt = 0.03 * dx / 0.1;
     let mut d = domain([0.0; 3], [2.0, 1.0, 1.0], dx);
@@ -48,7 +52,7 @@ fn ball() -> (Setup, Vec<fieldcraft_lbm::Obstacle>) {
     d.faces.x_max = FaceCondition::Pressure { pressure: 0.0, outflow: Outflow::Uniform };
     d.faces.z_max = FaceCondition::Slip {};
     d.obstacles = vec!["Ball".into()];
-    let bodies = vec![obstacle("Ball", sphere([0.9, 0.5, 0.5], 0.2, 3), &["skin"])];
+    let bodies = vec![obstacle("Ball", sphere([x, 0.5, 0.5], 0.2, 3), &["skin"])];
     let sa = Turbulence::SpalartAllmaras { prandtl: 0.9, wall_model: None, inflow_ratio: 3.0, ddes: None };
     let mut p = collide(STEPS as f64 * dt, dt, None, Collision::Hrr);
     if let Procedure::Fluid { turbulence, sigma, .. } = &mut p {
@@ -134,9 +138,13 @@ fn parity(name: &str, setup: &Setup, obstacles: &[fieldcraft_lbm::Obstacle], cor
 #[ignore = "local: run on the machine whose GPU is to be checked"]
 fn the_cpu_and_the_device_agree_on_the_wall_layer_rule() {
     let mut failures = Vec::new();
-    for (name, (setup, obstacles), corner) in
-        [("slot bed, 8 cells", slot(), false), ("square duct, 8 cells", duct(), false), ("slot bed with corner cells", slot(), true), ("ball in a box, open faces", ball(), false)]
-    {
+    for (name, (setup, obstacles), corner) in [
+        ("slot bed, 8 cells", slot(), false),
+        ("square duct, 8 cells", duct(), false),
+        ("slot bed with corner cells", slot(), true),
+        ("ball in a box, open faces", ball(), false),
+        ("ball inside the inlet margin", ball_at(0.5), false),
+    ] {
         if let Err(e) = parity(name, &setup, &obstacles, corner) {
             failures.push(e);
         }
