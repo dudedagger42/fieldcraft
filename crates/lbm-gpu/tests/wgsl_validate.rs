@@ -36,3 +36,11 @@ fn lbm_wgsl_validates_for_the_collision_variants() {
     let failures: Vec<String> = cases.iter().filter_map(|(name, s)| validate(s).err().map(|e| format!("{name}: {e}"))).collect();
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
+
+/// The shader's fixed share of the density mode the sigma = 1 rule removes is the CPU constant (they must not drift apart).
+#[test]
+fn the_shader_rule_bulk_is_the_cpu_constant() {
+    let line = SHADER.lines().find(|l| l.trim_start().starts_with("const WALL_RULE_BULK")).expect("WALL_RULE_BULK in lbm.wgsl");
+    let value: f64 = line.split('=').nth(1).and_then(|v| v.trim().trim_end_matches(';').parse().ok()).expect("a number after WALL_RULE_BULK =");
+    assert!((value - fieldcraft_lbm::WALL_LAYER_RULE_BULK).abs() < 1e-12, "lbm.wgsl {value} against the CPU constant {}", fieldcraft_lbm::WALL_LAYER_RULE_BULK);
+}

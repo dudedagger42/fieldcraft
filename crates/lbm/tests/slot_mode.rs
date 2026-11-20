@@ -9,7 +9,7 @@
 //! gates that.
 //!
 //! Study environment: `SLOT` (default 8 cells), `TAU_MINUS_HALF` (default 2.4e-3·SLOT/8), `U_LAT` (default 0.047: Re 470 at 8 cells),
-//! `SIGMA` (default 0.95), `STEPS` (default 8,000), `WALL_SIGMA1`, `WALL_MRT`, `WALL_CORNER`, `WALL_BULK` (the study knobs).
+//! `SIGMA` (default 0.95), `STEPS` (default 8,000), `WALL_SIGMA1`, `WALL_MRT`, `WALL_CORNER`, `WALL_BULK`, `RULE_BULK` (the study knobs).
 //!
 //! `cargo test --release -p fieldcraft-lbm --test slot_mode -- --ignored --nocapture slot_mode`
 
@@ -42,6 +42,9 @@ fn run(slot: usize, tau: f64, u_lat: f64, sigma: f64, steps: u64, knobs: Knobs) 
     flow.set_wall_layer_mrt(knobs.wall_mrt);
     flow.set_wall_corner_relax(knobs.wall_corner);
     flow.set_wall_layer_bulk(knobs.wall_bulk);
+    if let Some(share) = std::env::var("RULE_BULK").ok().and_then(|v| v.parse().ok()) {
+        flow.set_wall_rule_bulk(share);
+    }
     let grid = *flow.grid();
     let u_at = |flow: &Flow, x: usize, y: usize| flow.moments(grid.index([x, y, 0])).map_or(f64::NAN, |(_, u)| u[0]);
     let rows = slot..2 * slot;

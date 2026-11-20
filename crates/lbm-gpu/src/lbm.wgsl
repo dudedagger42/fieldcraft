@@ -133,7 +133,7 @@ override WALL_SIGMA1: bool = false;
 // With it, the first word of the layer flags: one per cell, 1 in the rule's layer (the host builds them from the CPU flow's `wall_sigma_layer_mask`).
 override WALL_SIGMA1_BASE: u32 = 0u;
 // The share of the density mode the rule's layer damps (the same constant as flow.rs WALL_LAYER_RULE_BULK).
-const WALL_RULE_BULK: f32 = 0.5;
+const WALL_RULE_BULK: f32 = 0.03;
 // Fans and porous zones (fieldcraft_lbm::flow's zone actions, data in `fluid`: zones.rs); likewise.
 override ZONES: bool = false;
 // The Spalart–Allmaras model (fieldcraft_lbm::sa): ν̃'s passes and its ν_t in the collision; likewise.

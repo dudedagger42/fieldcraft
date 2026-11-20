@@ -324,7 +324,7 @@ pub(crate) fn neighbour(grid: &Grid, periodic: [bool; 3], fluid: &[bool], p: [us
 /// `Σ w H² = 2/3`, the component is `1.5 a w H`; the density and the momentum are untouched (H is orthogonal to both).
 /// The share of the non-equilibrium density mode the σ = 1 rule removes in its layer (the same constant is `WALL_RULE_BULK` in lbm.wgsl).
 /// Without it a layer of pure regularisation carries a cell-to-cell mode along a slot of 8 cells or fewer (tests/slot_mode.rs).
-pub const WALL_LAYER_RULE_BULK: f64 = 0.5;
+pub const WALL_LAYER_RULE_BULK: f64 = 0.03;
 
 fn damp_density_mode(post: &mut [f64; Q], rho: f64, uu: f64, eps: f64) {
     let h = |q: usize| {
