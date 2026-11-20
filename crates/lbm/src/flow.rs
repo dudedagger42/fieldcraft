@@ -317,15 +317,14 @@ pub(crate) fn neighbour(grid: &Grid, periodic: [bool; 3], fluid: &[bool], p: [us
     fluid.get(cell).copied().unwrap_or(false).then_some(cell)
 }
 
-/// The cell next to the cell at `p` along `axis` (towards `+axis` with `up`), fluid or not, across
-/// a periodic face its periodic image; `None` outside a face that is not periodic.
+/// The share of the non-equilibrium density mode the σ = 1 rule removes in its layer (the same constant is `WALL_RULE_BULK` in lbm.wgsl).
+/// Without it a layer of pure regularisation carries a cell-to-cell mode along a slot of 8 cells or fewer (tests/slot_mode.rs); a share of
+/// 0.02 already removes it, while 0.5 and more raise a box channel's pressure drop by about 58 %, so the default is small.
+pub const WALL_LAYER_RULE_BULK: f64 = 0.03;
+
 /// Remove the share `eps` of the non-equilibrium density (trace) mode of the populations `post`: the Hermite component
 /// `H = |c|² − 1` (c_s² = 1/3, so the trace of the equilibrium second moment is ρ(1 + u²)). With `a = Σ post H − ρ u²` and
 /// `Σ w H² = 2/3`, the component is `1.5 a w H`; the density and the momentum are untouched (H is orthogonal to both).
-/// The share of the non-equilibrium density mode the σ = 1 rule removes in its layer (the same constant is `WALL_RULE_BULK` in lbm.wgsl).
-/// Without it a layer of pure regularisation carries a cell-to-cell mode along a slot of 8 cells or fewer (tests/slot_mode.rs).
-pub const WALL_LAYER_RULE_BULK: f64 = 0.03;
-
 fn damp_density_mode(post: &mut [f64; Q], rho: f64, uu: f64, eps: f64) {
     let h = |q: usize| {
         let c = C[q];
@@ -337,6 +336,8 @@ fn damp_density_mode(post: &mut [f64; Q], rho: f64, uu: f64, eps: f64) {
     }
 }
 
+/// The cell next to the cell at `p` along `axis` (towards `+axis` with `up`), fluid or not, across
+/// a periodic face its periodic image; `None` outside a face that is not periodic.
 fn across(grid: &Grid, periodic: [bool; 3], p: [usize; 3], axis: usize, up: bool) -> Option<usize> {
     let n = *grid.cells.get(axis)?;
     let i = *p.get(axis)?;
@@ -2523,7 +2524,7 @@ impl Flow {
         self.wall_layer_sigma_one = mode;
     }
 
-    /// The share of the density mode the σ = 1 rule removes in its layer (default [`WALL_LAYER_RULE_BULK`], 0.5). A study knob on the
+    /// The share of the density mode the σ = 1 rule removes in its layer (default [`WALL_LAYER_RULE_BULK`], 0.03). A study knob on the
     /// CPU path: the device always uses the default, so parity holds only there. A value outside 0..=1 (or not a number) is ignored.
     pub fn set_wall_rule_bulk(&mut self, eps: f64) {
         if (0.0..=1.0).contains(&eps) {
