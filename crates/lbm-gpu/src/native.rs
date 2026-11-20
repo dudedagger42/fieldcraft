@@ -1420,8 +1420,12 @@ impl GpuFlow {
         let wall_sigma_cells = if flow.wall_layer_sigma_one() == 1 && hybrid.is_some() { flow.wall_sigma_layer_mask() } else { Vec::new() };
         // The corner study's cells (bit 1 of the same flag word): they relax fully to equilibrium before any σ rule.
         let wall_corner_cells = if regularized && flow.wall_corner_relax() { flow.wall_corner_mask() } else { Vec::new() };
+        // Bit 2: the layer cells that take the larger density-mode share (next to an obstacle or voxel solid).
+        let wall_solid_cells = if wall_sigma_cells.is_empty() { Vec::new() } else { flow.wall_sigma_solid_mask() };
         if flow.wall_layer_sigma_one() > 1 || flow.wall_aware_gradient() {
-            return Err(Error::Invalid("not supported yet: the wall-layer sigma study modes 2 and 3 and the wall-aware gradient on the GPU; solve on the CPU".into()));
+            return Err(Error::Invalid(
+                "not supported yet: the wall-layer sigma study modes 2 and 3 and the wall-aware gradient on the GPU; solve on the CPU".into(),
+            ));
         }
         let fixed_sigma = match hybrid {
             Some(HrrSigma::Value(s)) => s,
@@ -1530,11 +1534,15 @@ impl GpuFlow {
         let wall_sigma_base = if wall_sigma_cells.iter().chain(&wall_corner_cells).any(|&m| m) {
             let base = u32::try_from(fluid_u32.len()).map_err(|_| Error::Limit("too many cells for the GPU solver".into()))?;
             fluid_u32.extend((0..n).map(|c| {
-                u32::from(wall_sigma_cells.get(c).copied().unwrap_or(false)) | (u32::from(wall_corner_cells.get(c).copied().unwrap_or(false)) << 1)
+                u32::from(wall_sigma_cells.get(c).copied().unwrap_or(false))
+                    | (u32::from(wall_corner_cells.get(c).copied().unwrap_or(false)) << 1)
+                    | (u32::from(wall_solid_cells.get(c).copied().unwrap_or(false)) << 2)
             }));
             let bytes = (fluid_u32.len() as u64).checked_mul(4).ok_or_else(|| Error::Limit("too much GPU zone data".into()))?;
             if bytes > cap {
-                return Err(Error::Limit(format!("GPU cell flags, layer flags and fan/porous data need {bytes} bytes; this device allows {cap} per buffer")));
+                return Err(Error::Limit(format!(
+                    "GPU cell flags, layer flags and fan/porous data need {bytes} bytes; this device allows {cap} per buffer"
+                )));
             }
             Some(base)
         } else {

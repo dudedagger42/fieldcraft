@@ -254,7 +254,11 @@ fn parity(slotted: bool) -> Result<(), String> {
     // Every sample through `GATED_THROUGH` and the last one (the chunks between are the unstable slot's, reported only).
     let gated_force = |i: usize| (i as u64 + 1) * CHUNK <= GATED_THROUGH || i + 1 == forces.len();
     let force_gap = forces.iter().enumerate().filter(|(i, _)| gated_force(*i)).map(|(_, (c, g))| (c - g).abs()).fold(0.0, f64::max) / force_scale_run;
-    println!("step {STEPS}: obstacle force cpu {:.6e} device {:.6e}; worst gated |Δ| {force_gap:.2e} of the run's largest |force| {force_scale_run:.3e} (bar {tol_i:.0e})", forces.last().map_or(0.0, |f| f.0), forces.last().map_or(0.0, |f| f.1));
+    println!(
+        "step {STEPS}: obstacle force cpu {:.6e} device {:.6e}; worst gated |Δ| {force_gap:.2e} of the run's largest |force| {force_scale_run:.3e} (bar {tol_i:.0e})",
+        forces.last().map_or(0.0, |f| f.0),
+        forces.last().map_or(0.0, |f| f.1)
+    );
     if !(force_gap < tol_i) {
         failures.push(format!("obstacle force: |Δ| {force_gap:.2e} of the run's largest |force| (bar {tol_i:.0e})"));
     }

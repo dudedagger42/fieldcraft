@@ -90,7 +90,8 @@ fn a_slot_of_6_and_8_cells_carries_no_wall_layer_mode() {
 #[ignore = "print-only study: see the module docs"]
 fn slot_mode() {
     let slot = env("SLOT", 8.0) as usize;
-    let (tau, u_lat, sigma, steps) = (env("TAU_MINUS_HALF", 2.4e-3 * slot as f64 / 8.0), env("U_LAT", 0.047), env("SIGMA", 0.95), env("STEPS", 8000.0) as u64);
+    let (tau, u_lat, sigma, steps) =
+        (env("TAU_MINUS_HALF", 2.4e-3 * slot as f64 / 8.0), env("U_LAT", 0.047), env("SIGMA", 0.95), env("STEPS", 8000.0) as u64);
     let sigma_mode = env("WALL_SIGMA1", f64::NAN);
     let knobs = Knobs {
         wall_sigma1: sigma_mode.is_finite().then_some(sigma_mode as u8),
@@ -106,7 +107,9 @@ fn slot_mode() {
         env("WALL_BULK", 0.0)
     );
     match run(slot, tau, u_lat, sigma, steps, knobs) {
-        Ok([wall, flux, inside, peak]) => println!("SLOT-MODE {label}: wall-row alternation {wall:.4e} flux alternation {flux:.4e} smallest wall u inside the plate/U {inside:+.4} largest |u|/U {peak:.3}"),
+        Ok([wall, flux, inside, peak]) => println!(
+            "SLOT-MODE {label}: wall-row alternation {wall:.4e} flux alternation {flux:.4e} smallest wall u inside the plate/U {inside:+.4} largest |u|/U {peak:.3}"
+        ),
         Err(e) => println!("SLOT-MODE {label}: {e}"),
     }
 }

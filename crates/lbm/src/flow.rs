@@ -169,6 +169,19 @@ pub struct OpenCell {
     pub target: Target,
 }
 
+/// The σ = 1 layer's cells by kind ([`Flow::wall_sigma_census`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WallSigmaCensus {
+    /// Cells next to an obstacle or voxel solid and on no box face (the larger share).
+    pub obstacle_only: usize,
+    /// Cells on a box face and next to no solid cell (the small share).
+    pub box_face_only: usize,
+    /// Cells on both (the larger share).
+    pub both: usize,
+    /// Cells the margin at the open faces took out of the layer.
+    pub removed_near_open: usize,
+}
+
 /// What an open cell holds.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Target {
@@ -317,10 +330,18 @@ pub(crate) fn neighbour(grid: &Grid, periodic: [bool; 3], fluid: &[bool], p: [us
     fluid.get(cell).copied().unwrap_or(false).then_some(cell)
 }
 
-/// The share of the non-equilibrium density mode the σ = 1 rule removes in its layer (the same constant is `WALL_RULE_BULK` in lbm.wgsl).
-/// Without it a layer of pure regularisation carries a cell-to-cell mode along a slot of 8 cells or fewer (tests/slot_mode.rs); a share of
-/// 0.02 already removes it, while 0.5 and more raise a box channel's pressure drop by about 58 %, so the default is small.
+/// The share of the non-equilibrium density mode the σ = 1 rule removes in its layer cells on a box face (the same constant is
+/// `WALL_RULE_BULK` in lbm.wgsl). Without any a layer of pure regularisation carries a cell-to-cell mode along a slot of 8 cells or fewer
+/// (tests/slot_mode.rs); 0.02 already removes it there, while 0.5 and more raise a box channel's pressure drop by about 58 %, so it is small.
 pub const WALL_LAYER_RULE_BULK: f64 = 0.03;
+
+/// The same share in the layer cells next to an obstacle or voxel solid (`WALL_RULE_BULK_SOLID` in lbm.wgsl; a cell on both takes this one).
+/// A curved or stair-stepped wall at small τ − ½ carries the cell-to-cell mode at the small share (a sphere in a channel at τ − ½ 3e-3).
+pub const WALL_LAYER_RULE_BULK_SOLID: f64 = 0.5;
+
+/// The σ = 1 layer leaves out the cells within this many cells of an inlet, outlet or pressure cell, in each axis (a cube around every open
+/// cell): next to an open face the rule bursts a small-τ box channel (a margin of 2 failed, 3 to 6 held; this is 4).
+pub const WALL_LAYER_OPEN_MARGIN: usize = 4;
 
 /// Remove the share `eps` of the non-equilibrium density (trace) mode of the populations `post`: the Hermite component
 /// `H = |c|² − 1` (c_s² = 1/3, so the trace of the equilibrium second moment is ρ(1 + u²)). With `a = Σ post H − ρ u²` and
@@ -679,6 +700,10 @@ pub struct Flow {
     wall_layer_bulk: f64,
     /// The share of the density mode the σ = 1 rule removes in its layer ([`WALL_LAYER_RULE_BULK`] by default), see `set_wall_rule_bulk`.
     wall_rule_bulk: f64,
+    /// The same for the layer cells next to an obstacle or voxel solid ([`WALL_LAYER_RULE_BULK_SOLID`] by default).
+    wall_rule_bulk_solid: f64,
+    /// The σ = 1 layer's flags per cell (bit 0 in the layer, bit 1 next to an obstacle or voxel solid), built on first use.
+    wall_sigma_flags: std::sync::OnceLock<std::sync::Arc<Vec<u8>>>,
     /// A study (off): the wall layer collides with the two-relaxation-time MRT scheme instead of the regularised one.
     wall_layer_mrt: bool,
     /// The corner study (see `set_wall_corner_relax`): on or off, an explicit cell set that replaces the pure-corner test, and the
@@ -1836,6 +1861,8 @@ impl Flow {
             wall_faces,
             wall_layer_bulk: 0.0,
             wall_rule_bulk: WALL_LAYER_RULE_BULK,
+            wall_rule_bulk_solid: WALL_LAYER_RULE_BULK_SOLID,
+            wall_sigma_flags: std::sync::OnceLock::new(),
             wall_layer_mrt: false,
             wall_corner_relax: false,
             wall_tau_floor: 0.0,
@@ -2335,18 +2362,95 @@ impl Flow {
         self.wall_layer_cells(true)
     }
 
-    /// The wall layer of the σ = 1 rule: [`Flow::wall_layer_mask`], so a wall of obstacle cells and a wall that is a box face are
-    /// treated alike.
-    fn wall_sigma_layer(&self) -> Vec<bool> {
-        self.wall_layer_cells(true)
+    /// The σ = 1 rule's layer, one byte per cell: bit 0 in the layer, bit 1 next to an obstacle or voxel solid (the larger density-mode
+    /// share). The layer is [`Flow::wall_layer_mask`] (a wall of obstacle cells and a box face alike) without the cells within
+    /// [`WALL_LAYER_OPEN_MARGIN`] cells of an open cell. Built once.
+    fn wall_sigma_flags(&self) -> std::sync::Arc<Vec<u8>> {
+        self.wall_sigma_flags.get_or_init(|| std::sync::Arc::new(self.build_wall_sigma_flags().0)).clone()
     }
 
-    /// The cells of the σ = 1 rule's layer ([`Flow::wall_layer_mask`]); the device reads this mask.
+    /// The flags of [`Flow::wall_sigma_flags`] and the census behind them.
+    fn build_wall_sigma_flags(&self) -> (Vec<u8>, WallSigmaCensus) {
+        let (solid_adj, face_adj) = self.wall_layer_parts();
+        let near_open = self.near_open_cells(WALL_LAYER_OPEN_MARGIN);
+        let mut census = WallSigmaCensus::default();
+        let flags = (0..self.grid.len())
+            .map(|c| {
+                let (s, f) = (solid_adj.get(c).copied().unwrap_or(false), face_adj.get(c).copied().unwrap_or(false));
+                if !(s || f) {
+                    return 0;
+                }
+                if near_open.get(c).copied().unwrap_or(false) {
+                    census.removed_near_open += 1;
+                    return 0;
+                }
+                match (s, f) {
+                    (true, true) => census.both += 1,
+                    (true, false) => census.obstacle_only += 1,
+                    _ => census.box_face_only += 1,
+                }
+                1 | (u8::from(s) << 1)
+            })
+            .collect();
+        (flags, census)
+    }
+
+    /// The cells within `margin` cells of an open cell, in every axis (a cube around each one; periodic images are ignored).
+    fn near_open_cells(&self, margin: usize) -> Vec<bool> {
+        let n = self.grid.len();
+        let mut mask = vec![false; n];
+        for o in &self.open {
+            if let Some(slot) = mask.get_mut(o.cell as usize) {
+                *slot = true;
+            }
+        }
+        if margin <= 1 || self.open.is_empty() {
+            return mask;
+        }
+        let reach = margin - 1;
+        for axis in 0..3 {
+            let mut next = mask.clone();
+            for (c, _) in mask.iter().enumerate().filter(|(_, m)| **m) {
+                let p = self.grid.coords(c);
+                let Some(&i) = p.get(axis) else { continue };
+                let hi = (i + reach).min(self.grid.cells.get(axis).copied().unwrap_or(1).saturating_sub(1));
+                for k in i.saturating_sub(reach)..=hi {
+                    let mut q = p;
+                    if let Some(x) = q.get_mut(axis) {
+                        *x = k;
+                    }
+                    if let Some(slot) = next.get_mut(self.grid.index(q)) {
+                        *slot = true;
+                    }
+                }
+            }
+            mask = next;
+        }
+        mask
+    }
+
+    /// The cells of the σ = 1 rule's layer ([`Flow::wall_layer_mask`] without the cells near an open face); the device reads this mask.
     pub fn wall_sigma_layer_mask(&self) -> Vec<bool> {
-        self.wall_sigma_layer()
+        self.wall_sigma_flags().iter().map(|f| f & 1 != 0).collect()
+    }
+
+    /// The σ = 1 layer's cells that take the larger density-mode share (next to an obstacle or voxel solid); the device reads this mask too.
+    pub fn wall_sigma_solid_mask(&self) -> Vec<bool> {
+        self.wall_sigma_flags().iter().map(|f| f & 2 != 0).collect()
+    }
+
+    /// How many cells the σ = 1 layer holds by kind, and how many the margin at the open faces removed from it.
+    pub fn wall_sigma_census(&self) -> WallSigmaCensus {
+        self.build_wall_sigma_flags().1
     }
 
     fn wall_layer_cells(&self, faces: bool) -> Vec<bool> {
+        let (solid_adj, face_adj) = self.wall_layer_parts();
+        if faces { solid_adj.iter().zip(&face_adj).map(|(a, b)| *a || *b).collect() } else { solid_adj }
+    }
+
+    /// The wall layer's two parts: the cells with a solid cell across an axis neighbour, and the cells on a box face that is a resolved wall.
+    fn wall_layer_parts(&self) -> (Vec<bool>, Vec<bool>) {
         let live = self.collides();
         let solid = |c: usize| !self.fluid.get(c).copied().unwrap_or(true);
         // A domain face is a resolved wall too (halfway bounce-back) unless a wall law gives it its stress or the cell is an inlet/outlet there.
@@ -2354,21 +2458,26 @@ impl Flow {
         for o in &self.open {
             opens.insert((o.cell as usize, o.axis));
         }
-        let faces_wall = faces && !self.wall_bounce;
-        (0..self.grid.len())
-            .map(|c| {
-                let p = self.grid.coords(c);
-                live.get(c).copied().unwrap_or(false)
-                    && (0..3).any(|axis| {
-                        [false, true].iter().any(|&up| match across(&self.grid, self.periodic, p, axis, up) {
-                            Some(n) => solid(n),
-                            None => {
-                                faces_wall && self.wall_faces.get(axis).and_then(|a| a.get(usize::from(up))).copied().unwrap_or(false) && !opens.contains(&(c, axis))
-                            }
+        let faces_wall = !self.wall_bounce;
+        let part = |face: bool| -> Vec<bool> {
+            (0..self.grid.len())
+                .map(|c| {
+                    let p = self.grid.coords(c);
+                    live.get(c).copied().unwrap_or(false)
+                        && (0..3).any(|axis| {
+                            [false, true].iter().any(|&up| match across(&self.grid, self.periodic, p, axis, up) {
+                                Some(n) => !face && solid(n),
+                                None => {
+                                    face && faces_wall
+                                        && self.wall_faces.get(axis).and_then(|a| a.get(usize::from(up))).copied().unwrap_or(false)
+                                        && !opens.contains(&(c, axis))
+                                }
+                            })
                         })
-                    })
-            })
-            .collect()
+                })
+                .collect()
+        };
+        (part(false), part(true))
     }
 
     /// What the corner rule did to the velocity inlets (all zero without an on-node wall law).
@@ -2524,8 +2633,8 @@ impl Flow {
         self.wall_layer_sigma_one = mode;
     }
 
-    /// The share of the density mode the σ = 1 rule removes in its layer (default [`WALL_LAYER_RULE_BULK`], 0.03). A study knob on the
-    /// CPU path: the device always uses the default, so parity holds only there. A value outside 0..=1 (or not a number) is ignored.
+    /// The share of the density mode the σ = 1 rule removes in its box-face layer cells (default [`WALL_LAYER_RULE_BULK`], 0.03). A study
+    /// knob on the CPU path: the device always uses the defaults, so parity holds only there. A value outside 0..=1 (or not a number) is ignored.
     pub fn set_wall_rule_bulk(&mut self, eps: f64) {
         if (0.0..=1.0).contains(&eps) {
             self.wall_rule_bulk = eps;
@@ -2535,6 +2644,14 @@ impl Flow {
     /// The share [`Flow::set_wall_rule_bulk`] set.
     pub fn wall_rule_bulk(&self) -> f64 {
         self.wall_rule_bulk
+    }
+
+    /// The share for the layer cells next to an obstacle or voxel solid (default [`WALL_LAYER_RULE_BULK_SOLID`], 0.5); a study knob on the
+    /// CPU path like [`Flow::set_wall_rule_bulk`]. A value outside 0..=1 (or not a number) is ignored.
+    pub fn set_wall_rule_bulk_solid(&mut self, eps: f64) {
+        if (0.0..=1.0).contains(&eps) {
+            self.wall_rule_bulk_solid = eps;
+        }
     }
 
     /// A study (off by default, bit-identical off): in the wall layer (a fluid cell with a solid axis neighbour) the share `eps`
@@ -3452,16 +3569,13 @@ impl Flow {
         let wall_gap = self.wall_gap;
         let wall_layer_sigma_one = self.wall_layer_sigma_one;
         let (wall_bulk, wall_mrt) = (self.wall_layer_bulk, self.wall_layer_mrt);
-        let rule_bulk = self.wall_rule_bulk;
+        let (rule_bulk, rule_bulk_solid) = (self.wall_rule_bulk, self.wall_rule_bulk_solid);
         let wall_tau_floor = self.wall_tau_floor();
         // The wall layer of the two remedy studies: fluid cells with a solid axis neighbour (empty when neither is on).
-        let layer: Vec<bool> = if (wall_bulk > 0.0 || wall_mrt) && regularized {
-            self.wall_layer_mask()
-        } else {
-            Vec::new()
-        };
+        let layer: Vec<bool> = if (wall_bulk > 0.0 || wall_mrt) && regularized { self.wall_layer_mask() } else { Vec::new() };
         // The σ = 1 rule's layer (empty when off).
-        let sigma_layer: Vec<bool> = if wall_layer_sigma_one == 1 && regularized { self.wall_sigma_layer() } else { Vec::new() };
+        let sigma_flags: std::sync::Arc<Vec<u8>> =
+            if wall_layer_sigma_one == 1 && regularized { self.wall_sigma_flags() } else { std::sync::Arc::default() };
         // The corner study's cells (empty when off).
         let corner: Vec<bool> = if regularized { self.wall_corner_mask() } else { Vec::new() };
         // Dynamic σ's cap on the von Kármán length: the box's shortest extent in cells.
@@ -3650,6 +3764,7 @@ impl Flow {
                     // 1 at a wall cell under the wall model.
                     let mut nu_model = None;
                     let mut rule_damp = false;
+                    let mut rule_share = rule_bulk;
                     let blend = local.as_ref().filter(|_| hybrid).map(|(g, nb)| {
                         let cell_sigma = if dynamic {
                             let s = match wall_rate {
@@ -3691,9 +3806,11 @@ impl Flow {
                             cell_sigma
                         } else if wall_layer_sigma_one == 1 {
                             // The resolved walls' layer (`wall_layer_mask`): never a row whose stress comes from a wall law.
-                            if sigma_layer.get(b * block + i).copied().unwrap_or(false) {
+                            let flag = sigma_flags.get(b * block + i).copied().unwrap_or(0);
+                            if flag & 1 != 0 {
                                 // the rule changes the collision only where the blend was not already σ = 1
                                 rule_damp = cell_sigma != 1.0;
+                                rule_share = if flag & 2 != 0 { rule_bulk_solid } else { rule_bulk };
                                 1.0
                             } else {
                                 cell_sigma
@@ -3737,7 +3854,7 @@ impl Flow {
                     }
                     // The σ = 1 rule's layer also damps its density mode (the hybrid collision only).
                     if rule_damp {
-                        damp_density_mode(&mut post, rho, uu, rule_bulk);
+                        damp_density_mode(&mut post, rho, uu, rule_share);
                     }
                     for (q, v) in post.iter().enumerate() {
                         put(q, *v);
@@ -4216,6 +4333,8 @@ impl crate::backend::Backend for Flow {
             wall_faces: _,
             wall_layer_bulk: _,
             wall_rule_bulk: _,
+            wall_rule_bulk_solid: _,
+            wall_sigma_flags: _,
             wall_layer_mrt: _,
             wall_corner_relax: _,
             wall_tau_floor: _,
@@ -4538,5 +4657,49 @@ impl crate::backend::Backend for Flow {
 
     fn conducting(&self) -> &[Vec<u32>] {
         self.thermal.as_ref().and_then(|t| t.solid.as_ref()).map_or(&[], |s| &s.by_solid)
+    }
+}
+
+#[cfg(test)]
+mod damp_tests {
+    use super::*;
+
+    #[test]
+    fn damp_density_mode_conserves_density_and_momentum() {
+        let mut state = 0x9E3779B97F4A7C15u64;
+        let mut rnd = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let (mut worst_rho, mut worst_mom, mut worst_a) = (0.0f64, 0.0f64, 0.0f64);
+        let (mut tot_before, mut tot_after) = (0.0f64, 0.0f64);
+        for _ in 0..2000 {
+            let mut post = [0.0; Q];
+            for (q, v) in post.iter_mut().enumerate() {
+                *v = W[q] * (1.0 + 0.2 * (rnd() - 0.5));
+            }
+            let rho: f64 = post.iter().sum();
+            let mom = |p: &[f64; Q]| [0, 1, 2].map(|k| p.iter().enumerate().map(|(q, v)| v * f64::from(C[q][k])).sum::<f64>());
+            let m0 = mom(&post);
+            let uu = (m0[0] * m0[0] + m0[1] * m0[1] + m0[2] * m0[2]) / (rho * rho);
+            let h = |q: usize| f64::from(C[q][0] * C[q][0] + C[q][1] * C[q][1] + C[q][2] * C[q][2]) - 1.0;
+            let a0: f64 = post.iter().enumerate().map(|(q, v)| v * h(q)).sum::<f64>() - rho * uu;
+            let before = post;
+            damp_density_mode(&mut post, rho, uu, 0.5);
+            let rho1: f64 = post.iter().sum();
+            let m1 = mom(&post);
+            let a1: f64 = post.iter().enumerate().map(|(q, v)| v * h(q)).sum::<f64>() - rho * uu;
+            worst_rho = worst_rho.max((rho1 - rho).abs());
+            worst_mom = worst_mom.max((0..3).map(|k| (m1[k] - m0[k]).abs()).fold(0.0, f64::max));
+            worst_a = worst_a.max((a1 - 0.5 * a0).abs());
+            tot_before += before.iter().sum::<f64>();
+            tot_after += rho1;
+        }
+        println!(
+            "damp_density_mode: worst |d rho| {worst_rho:.3e}, worst |d rho u| {worst_mom:.3e}, worst |a1 - a0/2| {worst_a:.3e}, block sums {tot_before:.12} {tot_after:.12}"
+        );
+        assert!(worst_rho < 1e-14 && worst_mom < 1e-14 && worst_a < 1e-13);
     }
 }

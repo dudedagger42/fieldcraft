@@ -128,12 +128,15 @@ override VREMAN: bool = false;
 // The hybrid collision's dynamic σ from the subgrid model's eddy viscosity (with HRR); likewise.
 override DYNAMIC: bool = false;
 // Per-cell flag words follow the cell flags (from WALL_SIGMA1_BASE) when the σ = 1 rule's layer (bit 0: σ = 1 in every fluid cell with a
-// solid axis neighbour, Flow::set_wall_layer_sigma_one, with HRR) or the corner study's cells (bit 1) are on.
+// solid axis neighbour, Flow::set_wall_layer_sigma_one, with HRR; bit 2: the layer cell is next to an obstacle or voxel solid, the larger
+// density-mode share) or the corner study's cells (bit 1) are on.
 override WALL_SIGMA1: bool = false;
 // With it, the first word of the layer flags: one per cell, 1 in the rule's layer (the host builds them from the CPU flow's `wall_sigma_layer_mask`).
 override WALL_SIGMA1_BASE: u32 = 0u;
-// The share of the density mode the rule's layer damps (the same constant as flow.rs WALL_LAYER_RULE_BULK).
+// The share of the density mode the rule's layer damps in its box-face cells (the same constant as flow.rs WALL_LAYER_RULE_BULK), and in
+// the layer cells next to an obstacle or voxel solid (flag bit 2; flow.rs WALL_LAYER_RULE_BULK_SOLID).
 const WALL_RULE_BULK: f32 = 0.03;
+const WALL_RULE_BULK_SOLID: f32 = 0.5;
 // Fans and porous zones (fieldcraft_lbm::flow's zone actions, data in `fluid`: zones.rs); likewise.
 override ZONES: bool = false;
 // The Spalart–Allmaras model (fieldcraft_lbm::sa): ν̃'s passes and its ν_t in the collision; likewise.
@@ -2086,8 +2089,12 @@ fn collide_regularized(cell: u32, lid: u32, xyz: vec3<i32>, fq: ptr<function, ar
     }
     // The rule changes the collision only where the blend was not already σ = 1 (flow.rs `rule_damp`).
     var rule_damp = false;
+    var rule_share = WALL_RULE_BULK;
     if WALL_SIGMA1 && HRR && (fluid[WALL_SIGMA1_BASE + cell] & 1u) != 0u {
         rule_damp = sigma != 1.0;
+        if (fluid[WALL_SIGMA1_BASE + cell] & 4u) != 0u {
+            rule_share = WALL_RULE_BULK_SOLID;
+        }
         sigma = 1.0;
     }
     if HRR && sigma != 1.0 {
@@ -2151,7 +2158,7 @@ fn collide_regularized(cell: u32, lid: u32, xyz: vec3<i32>, fq: ptr<function, ar
         }
         for (var q = 0u; q < Q; q = q + 1u) {
             let cq = vec3<f32>(c_of(q));
-            out[q] = out[q] - WALL_RULE_BULK * 1.5 * a * w_of(q) * (dot(cq, cq) - 1.0);
+            out[q] = out[q] - rule_share * 1.5 * a * w_of(q) * (dot(cq, cq) - 1.0);
         }
     }
     // The rebuild from (δρ, j, P) keeps mass and momentum only to its f32 rounding, and in a

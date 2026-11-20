@@ -93,7 +93,9 @@ fn parity(name: &str, setup: &Setup, obstacles: &[fieldcraft_lbm::Obstacle], cor
         .filter(|&c| Backend::is_fluid(&cpu, c))
         .map(|c| [0, 1, 2].map(|k| (a.velocity[c][k] - p.velocity[c][k]).abs()).into_iter().fold(0.0, f64::max))
         .fold(0.0, f64::max);
-    println!("{name}: CPU vs device max |Δu| {worst_u:.3e}, max |Δρ| {worst_r:.3e}; rule on vs off (CPU) max |Δu| {rule:.3e}; corner cells on vs off {corner_effect:.3e}");
+    println!(
+        "{name}: CPU vs device max |Δu| {worst_u:.3e}, max |Δρ| {worst_r:.3e}; rule on vs off (CPU) max |Δu| {rule:.3e}; corner cells on vs off {corner_effect:.3e}"
+    );
     if worst_u >= 2e-5 || worst_r >= 1e-6 {
         return Err(format!("{name}: |Δu| {worst_u:.3e} (bar 2e-5), |Δρ| {worst_r:.3e} (bar 1e-6)"));
     }
@@ -110,7 +112,9 @@ fn parity(name: &str, setup: &Setup, obstacles: &[fieldcraft_lbm::Obstacle], cor
 #[ignore = "local: run on the machine whose GPU is to be checked"]
 fn the_cpu_and_the_device_agree_on_the_wall_layer_rule() {
     let mut failures = Vec::new();
-    for (name, (setup, obstacles), corner) in [("slot bed, 8 cells", slot(), false), ("square duct, 8 cells", duct(), false), ("slot bed with corner cells", slot(), true)] {
+    for (name, (setup, obstacles), corner) in
+        [("slot bed, 8 cells", slot(), false), ("square duct, 8 cells", duct(), false), ("slot bed with corner cells", slot(), true)]
+    {
         if let Err(e) = parity(name, &setup, &obstacles, corner) {
             failures.push(e);
         }
