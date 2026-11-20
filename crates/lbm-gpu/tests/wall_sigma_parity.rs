@@ -42,7 +42,7 @@ fn duct() -> (Setup, Vec<fieldcraft_lbm::Obstacle>) {
 /// takes cells out of it (the flags' bit 2 and the exclusion on the device).
 fn ball() -> (Setup, Vec<fieldcraft_lbm::Obstacle>) {
     let dx = 0.1;
-    let dt = 0.08 * dx / 0.1;
+    let dt = 0.03 * dx / 0.1;
     let mut d = domain([0.0; 3], [2.0, 1.0, 1.0], dx);
     d.faces.x_min = FaceCondition::Velocity { velocity: [0.1, 0.0, 0.0], profile: Profile::Uniform };
     d.faces.x_max = FaceCondition::Pressure { pressure: 0.0, outflow: Outflow::Uniform };
@@ -55,7 +55,7 @@ fn ball() -> (Setup, Vec<fieldcraft_lbm::Obstacle>) {
         *turbulence = Some(sa);
         *sigma = Some(HrrSigma::Value(0.99));
     }
-    let m = model(1.0, 2.4e-4 / 3.0 * dx * dx / dt, d, p);
+    let m = model(1.0, 6e-3 / 3.0 * dx * dx / dt, d, p);
     let setup = Setup::new(&m, None, &bodies, &Limits::default()).expect("the ball bed's setup");
     (setup, bodies)
 }
