@@ -285,6 +285,7 @@ impl Quantities for FluidDomain {
             absorbing,
             radial_inflow,
             moving_wall_ramp,
+            inlet_ramp,
         } = self;
         each(min, Q::Length, f);
         each(max, Q::Length, f);
@@ -376,6 +377,9 @@ impl Quantities for FluidDomain {
             }
         }
         if let Some(t) = moving_wall_ramp {
+            f(Q::Time, t);
+        }
+        if let Some(t) = inlet_ramp {
             f(Q::Time, t);
         }
     }

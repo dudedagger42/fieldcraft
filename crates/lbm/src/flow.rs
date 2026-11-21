@@ -634,6 +634,10 @@ pub struct Flow {
     /// step's factor on every link's moving-wall term.
     ramp_steps: u64,
     wall_ramp: f64,
+    /// The inlet ramp in time steps (0 without one) and the velocity of each open cell at full
+    /// strength (empty without a ramp; the open cells' targets are `r` times these while it runs).
+    inlet_ramp_steps: u64,
+    inlet_base: Vec<Target>,
     /// Obstacles that cover no cell centre (smaller than the spacing, or outside the box).
     empty_obstacles: Vec<String>,
     /// The temperature lattice, with thermal settings.
@@ -780,6 +784,7 @@ impl Flow {
         let lines = n.div_ceil(8);
         let stride = 8 * (lines + 1 - lines % 2);
         let ramp_steps = crate::lattice::ramp_steps(setup.domain.moving_wall_ramp, setup.time_step);
+        let inlet_ramp_steps = crate::lattice::ramp_steps(setup.domain.inlet_ramp, setup.time_step);
         let q_n = stride.checked_mul(Q).ok_or_else(|| Error::Limit("the grid is too large".into()))?;
 
         // Solid cells, obstacle by obstacle (the first obstacle that covers a cell owns it).
@@ -1697,6 +1702,7 @@ impl Flow {
                 node_list.iter().filter(|w| w.sampled()).map(|w| (w.interior as usize, usize::from(w.axis), i32::from(w.inward))),
             );
         }
+        let inlet_base: Vec<Target> = if inlet_ramp_steps > 0 { open.iter().map(|oc| oc.target).collect() } else { Vec::new() };
         let mut flow = Flow {
             grid,
             n,
@@ -1758,6 +1764,8 @@ impl Flow {
             steps_done: 0,
             ramp_steps,
             wall_ramp: crate::lattice::wall_ramp(1, ramp_steps),
+            inlet_ramp_steps,
+            inlet_base,
             empty_obstacles,
             thermal,
             cell_force,
@@ -2412,6 +2420,11 @@ impl Flow {
         }
     }
 
+    /// The inlet ramp in time steps (0 without one).
+    pub fn inlet_ramp_steps(&self) -> u64 {
+        self.inlet_ramp_steps
+    }
+
     /// The moving walls' ramp in time steps (0 without one; `lattice::wall_ramp`).
     pub fn ramp_steps(&self) -> u64 {
         self.ramp_steps
@@ -2646,6 +2659,21 @@ impl Flow {
         m
     }
 
+    /// Set the velocity of every velocity open cell to its full value times the inlet ramp's factor
+    /// for this step (`lattice::wall_ramp`; no work without a ramp or once it is over).
+    fn ramp_inlets(&mut self) {
+        if self.inlet_ramp_steps == 0 {
+            return;
+        }
+        let step = self.steps_done.saturating_add(1);
+        let r = crate::lattice::wall_ramp(step, self.inlet_ramp_steps);
+        for (oc, base) in self.open.iter_mut().zip(&self.inlet_base) {
+            if let (Target::Velocity(v), Target::Velocity(full)) = (&mut oc.target, base) {
+                *v = full.map(|c| c * r);
+            }
+        }
+    }
+
     /// One time step. Fails with [`Error::Unstable`] when a density stops being a positive
     /// number or a lattice speed exceeds [`MAX_LATTICE_SPEED`].
     pub fn step(&mut self) -> Result<()> {
@@ -2657,6 +2685,7 @@ impl Flow {
     /// flow ([`crate::refine`]) sets the populations of its interface cells between the two halves.
     pub(crate) fn step_collide(&mut self) -> Result<()> {
         self.wall_ramp = crate::lattice::wall_ramp(self.steps_done.saturating_add(1), self.ramp_steps);
+        self.ramp_inlets();
         self.targets()?;
         self.refresh_buoyancy();
         self.refresh_fans();
@@ -3939,6 +3968,8 @@ impl crate::backend::Backend for Flow {
             // The ramp's length is the setup's; its factor is set from `steps_done` each step.
             ramp_steps: _,
             wall_ramp: _,
+            inlet_ramp_steps: _,
+            inlet_base: _,
             empty_obstacles: _,
             thermal,
             cell_force,

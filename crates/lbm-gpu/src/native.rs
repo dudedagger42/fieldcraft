@@ -933,6 +933,9 @@ impl GpuFlow {
                     .into(),
             ));
         }
+        if flow.inlet_ramp_steps() > 0 {
+            return Err(Error::Invalid("not supported yet on the GPU: an inlet ramp (`inlet_ramp`); solve on the CPU (`backend: \"cpu\"`)".into()));
+        }
         if flow.free_surface() {
             return Err(Error::Invalid("a free surface is not on the GPU backend yet: solve on the CPU (`backend: \"cpu\"`)".into()));
         }

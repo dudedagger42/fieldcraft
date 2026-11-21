@@ -32,6 +32,7 @@ pub fn domain(min: [f64; 3], max: [f64; 3], spacing: f64) -> FluidDomain {
         absorbing: None,
         radial_inflow: None,
         moving_wall_ramp: None,
+        inlet_ramp: None,
     }
 }
 

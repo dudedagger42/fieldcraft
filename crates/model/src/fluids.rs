@@ -946,6 +946,12 @@ pub struct FluidDomain {
     /// `u_w`. `None` or 0 for the full velocity from the first step.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub moving_wall_ramp: Option<f64>,
+    /// How long the velocity faces take to reach their velocity from rest (a time): every open
+    /// cell of a velocity face runs at `r(t) u` with `r = ½ (1 − cos(π t / T))` until `T`, then
+    /// at `u`. It starts a closed or slow domain without the impulsive start that loads its
+    /// standing waves. `None` or 0 for the full velocity from the first step.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inlet_ramp: Option<f64>,
 }
 
 fn is_zero(v: &[f64; 3]) -> bool {
@@ -1066,6 +1072,9 @@ impl FluidDomain {
         }
         if let Some(t) = self.moving_wall_ramp {
             nonnegative("moving wall ramp", t)?;
+        }
+        if let Some(t) = self.inlet_ramp {
+            nonnegative("inlet ramp", t)?;
         }
         Ok(())
     }
@@ -1238,6 +1247,7 @@ mod tests {
             absorbing: None,
             radial_inflow: None,
             moving_wall_ramp: None,
+            inlet_ramp: None,
         }
     }
 
