@@ -150,11 +150,24 @@ fn all_periodic(n: [usize; 3]) -> FluidDomain {
 
 /// A periodic box with a negligible eddy-viscosity model, at the given τ − ½ of the coarse level.
 fn wave_pair(n: [usize; 3], strip: Strip, eps: f64) -> Refined {
+    wave_pair_with(n, strip, eps, false, 0.0)
+}
+
+/// [`wave_pair`], optionally with no-slip walls on y and a body force `accel` (lattice units of the coarse level) along x.
+fn wave_pair_with(n: [usize; 3], strip: Strip, eps: f64, walls: bool, accel: f64) -> Refined {
     let dx: f64 = 0.05;
     let dt: f64 = 0.05 * dx / 0.1;
     let nu = eps / 3.0 * dx * dx / dt;
     let smag = Some(Turbulence::Smagorinsky { constant: 1e-4, prandtl: 0.9, van_driest: None, wall_model: None });
-    let m = model(1.0, nu, all_periodic(n), procedure(Collision::Hrr, smag));
+    let mut d = all_periodic(n);
+    if walls {
+        // WALL=slip: free-slip walls on y instead of no-slip ones (a test of the interface cells at the walls without shear).
+        let slip = std::env::var("WALL").is_ok_and(|v| v == "slip");
+        d.faces.y_min = if slip { FaceCondition::Slip {} } else { FaceCondition::Wall {} };
+        d.faces.y_max = if slip { FaceCondition::Slip {} } else { FaceCondition::Wall {} };
+    }
+    d.acceleration = [accel * dx / (dt * dt), 0.0, 0.0];
+    let m = model(1.0, nu, d, procedure(Collision::Hrr, smag));
     Refined::new(&m, None, &[], &Limits::default(), strip).unwrap_or_else(|e| panic!("{e}"))
 }
 
@@ -1366,6 +1379,276 @@ fn the_time_coupling_keeps_mass_a_uniform_flow_and_the_checkerboard_decay() {
                 assert!(worst(&r) <= 1.5 * a0, "eps {eps:e} density {density}: the checkerboard grew to {:e} at step {step}", worst(&r));
             }
             assert!(worst(&r) <= 0.5 * a0, "eps {eps:e} density {density}: left {:e} of {a0:e} after 400 steps", worst(&r));
+        }
+    }
+}
+
+/// The amplitude of the fundamental standing acoustic wave of a periodic box `nx` cells long: `ρ'` on `cos(kx)` and `u/c_s`
+/// on `sin(kx)` added in quadrature, so it does not swing with the phase (lattice units).
+fn standing_amplitude(r: &Refined, m: &[(f64, [f64; 3])], nx: usize) -> f64 {
+    let g = r.coarse().grid();
+    // The wave's velocity is what is left of u after the mean along x of the same row (so a mean flow or a channel profile drops out).
+    let mut row = std::collections::BTreeMap::new();
+    for (cell, (_, u)) in m.iter().enumerate() {
+        let c = g.coords(cell);
+        let e = row.entry((c[1], c[2])).or_insert((0.0, 0.0));
+        e.0 += u[0];
+        e.1 += 1.0;
+    }
+    let (mut c, mut s, mut n) = (0.0, 0.0, 0.0);
+    for (cell, (rho, u)) in m.iter().enumerate() {
+        let co = g.coords(cell);
+        let k = 2.0 * std::f64::consts::PI * (co[0] as f64 + 0.5) / nx as f64;
+        let mean = row.get(&(co[1], co[2])).map_or(0.0, |(sum, count)| sum / count);
+        c += (rho - 1.0) * k.cos();
+        s += (u[0] - mean) * 3f64.sqrt() * k.sin();
+        n += 1.0;
+    }
+    (2.0 * c / n).hypot(2.0 * s / n)
+}
+
+/// Report only: a standing acoustic wave in a periodic box, with and without a refinement strip at its pressure antinode
+/// or at its velocity antinode; no inlet, walls or obstacles. Printed: the amplitude's growth per period (negative: decay)
+/// for the unrefined run and for the strip with the time coupling off, at weight 1/2 and at weight 1/4. A strip
+/// that adds energy to the wave shows as a rate above the unrefined run's.
+#[test]
+#[ignore = "report: the standing acoustic wave through the strip"]
+fn the_standing_acoustic_wave_through_the_strip() {
+    let nx = 96usize;
+    let period = nx as f64 * 3f64.sqrt();
+    // U0: a mean flow along the box (lattice units, 0 by default); the wave rides on it. WALLS=1: no-slip walls on y
+    // (a channel of 8 cells, the flow forced by a body force and started from its parabolic profile).
+    let walls = std::env::var("WALLS").is_ok_and(|v| v == "1");
+    let u0: f64 = std::env::var("U0").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0);
+    let periods = std::env::var("PERIODS").ok().and_then(|v| v.parse().ok()).unwrap_or(200usize);
+    let steps = (period * periods as f64) as usize;
+    for eps in [5.1e-3] {
+        for (place, strip) in
+            [("pressure antinode", Strip { first: 40, last: 56, linear: true }), ("velocity antinode", Strip { first: 16, last: 32, linear: true })]
+        {
+            let delta = 1e-4;
+            let init = move |x: [f64; 3]| {
+                let profile = if walls { 6.0 * (x[1] / 8.0) * (1.0 - x[1] / 8.0) } else { 1.0 };
+                (1.0 + delta * (2.0 * std::f64::consts::PI * x[0] / nx as f64).cos(), [u0 * profile, 0.0, 0.0])
+            };
+            let mut runs: Vec<(&str, Refined, bool)> = Vec::new();
+            for (name, tc, w, unrefined) in
+                [("unrefined", false, 0.5, true), ("off", false, 0.5, false), ("weight 1/2", true, 0.5, false), ("weight 1/4", true, 0.25, false)]
+            {
+                let ny = if walls { 8 } else { 4 };
+                let accel = if walls && std::env::var("FORCE").map_or(true, |v| v != "0") { 12.0 * eps / 3.0 * u0 / (ny * ny) as f64 } else { 0.0 };
+                let mut r = wave_pair_with([nx, ny, 4], strip, eps, walls, accel);
+                r.time_coupling(tc);
+                r.time_coupling_weight(w);
+                r.initialise(&init);
+                runs.push((name, r, unrefined));
+            }
+            let a0: Vec<f64> = runs
+                .iter()
+                .map(|(_, r, u)| {
+                    let m = if *u { r.coarse_moments() } else { r.composite_moments() };
+                    standing_amplitude(r, &m, nx)
+                })
+                .collect();
+            let chunk = (steps / 10).max(1);
+            let mut history = vec![Vec::new(); runs.len()];
+            for _ in 0..10 {
+                for _ in 0..chunk {
+                    for (_, r, u) in runs.iter_mut() {
+                        if *u { r.step_unrefined().unwrap() } else { r.step().unwrap() }
+                    }
+                }
+                for ((_, r, u), h) in runs.iter().zip(history.iter_mut()) {
+                    let m = if *u { r.coarse_moments() } else { r.composite_moments() };
+                    h.push(standing_amplitude(r, &m, nx));
+                }
+            }
+            for ((name, _, _), h) in runs.iter().zip(&history) {
+                eprintln!("  history {place}, {name}: {}", h.iter().map(|a| format!("{a:.2e}")).collect::<Vec<_>>().join(" "));
+            }
+            for ((name, r, u), a0) in runs.iter().zip(&a0) {
+                let m = if *u { r.coarse_moments() } else { r.composite_moments() };
+                let a = standing_amplitude(r, &m, nx);
+                eprintln!(
+                    "eps {eps:.1e}, strip at the {place}, {name}: amplitude {a0:.3e} -> {a:.3e}, growth per period {:+.3e}",
+                    (a / a0).ln() / periods as f64
+                );
+            }
+        }
+    }
+}
+
+/// Report only: a compact (Taylor) vortex convected at the lattice speed 0.05 round a periodic box, through the strip once
+/// per pass (PASSES, 10 by default). A refinement interface that cannot pass vorticity cleanly radiates sound; it is read
+/// as the rms of the density deviation over the rows far from the vortex's row (the vortex's own pressure field is
+/// small there and is the same in the unrefined twin), averaged over each pass. Printed per pass for the unrefined twin,
+/// the strip with the time coupling off, at weight 1/2 and 1/4, and at weight 1/4 with the non-equilibrium rescaling.
+#[test]
+#[ignore = "report: a vortex convected through the strip"]
+fn a_vortex_convected_through_the_strip() {
+    let (nx, ny) = (64usize, 64usize);
+    let u0 = 0.05;
+    let passes: usize = std::env::var("PASSES").ok().and_then(|v| v.parse().ok()).unwrap_or(10);
+    let pass_steps = (nx as f64 / u0).round() as usize;
+    // VORTEX_CORE (3 cells) and VORTEX_UMAX (0.02): the core radius and the peak swirl speed.
+    let core: f64 = std::env::var("VORTEX_CORE").ok().and_then(|v| v.parse().ok()).unwrap_or(3.0);
+    let umax: f64 = std::env::var("VORTEX_UMAX").ok().and_then(|v| v.parse().ok()).unwrap_or(0.02);
+    let strip = Strip { first: 26, last: 38, linear: true };
+    let init = move |x: [f64; 3]| {
+        let (dx, dy) = (x[0] - 16.0, x[1] - ny as f64 / 2.0);
+        let r2 = (dx * dx + dy * dy) / (core * core);
+        let ut = umax * r2.sqrt() * ((1.0 - r2) / 2.0).exp();
+        let r = r2.sqrt() * core;
+        let (ex, ey) = if r > 0.0 { (-dy / r, dx / r) } else { (0.0, 0.0) };
+        (1.0 - 1.5 * umax * umax * (1.0 - r2).exp(), [u0 + ut * ex, ut * ey, 0.0])
+    };
+    let mut runs: Vec<(&str, Refined, bool)> = Vec::new();
+    for (name, tc, w, rescale, unrefined) in [
+        ("unrefined", false, 0.5, false, true),
+        ("off", false, 0.5, false, false),
+        ("weight 1/2", true, 0.5, false, false),
+        ("weight 1/4", true, 0.25, false, false),
+        ("weight 1/4 + rescale", true, 0.25, true, false),
+    ] {
+        let mut r = wave_pair([nx, ny, 4], strip, 5.1e-3);
+        r.time_coupling(tc);
+        r.time_coupling_weight(w);
+        r.rescale_non_equilibrium(rescale);
+        r.initialise(&init);
+        runs.push((name, r, unrefined));
+    }
+    let far = |r: &Refined, m: &[(f64, [f64; 3])]| {
+        let g = r.coarse().grid();
+        let (mut sum, mut n) = (0.0, 0.0);
+        for (cell, (rho, _)) in m.iter().enumerate() {
+            let dy = (g.coords(cell)[1] as f64 + 0.5 - ny as f64 / 2.0).abs();
+            if dy.min(ny as f64 - dy) > 14.0 {
+                sum += (rho - 1.0) * (rho - 1.0);
+                n += 1.0;
+            }
+        }
+        (sum / n).sqrt()
+    };
+    let mut table = vec![Vec::new(); runs.len()];
+    for _ in 0..passes {
+        let mut acc = vec![0.0; runs.len()];
+        let samples = 16;
+        for s in 0..samples {
+            for _ in 0..pass_steps / samples {
+                for (_, r, u) in runs.iter_mut() {
+                    if *u { r.step_unrefined().unwrap() } else { r.step().unwrap() }
+                }
+            }
+            for ((_, r, u), a) in runs.iter().zip(acc.iter_mut()) {
+                let m = if *u { r.coarse_moments() } else { r.composite_moments() };
+                *a += far(r, &m) / samples as f64;
+            }
+            let _ = s;
+        }
+        for (t, a) in table.iter_mut().zip(acc) {
+            t.push(a);
+        }
+    }
+    for ((name, _, _), t) in runs.iter().zip(&table) {
+        eprintln!("vortex far-field rms of rho' per pass, {name}: {}", t.iter().map(|a| format!("{a:.2e}")).collect::<Vec<_>>().join(" "));
+    }
+}
+
+/// Report only: a laminar channel (no-slip walls on y) driven by a body force, steady state, across a strip of the
+/// middle third of its length. Printed: the velocity profile in a column outside the strip and one at the strip's
+/// centre against the analytic Poiseuille profile and the unrefined run's, and the mean speed of each. A fine level
+/// that gets the force wrong (scaling with dt/dx, or the half-force term per sub-step) shows as a profile that differs
+/// from the unrefined one inside the strip only.
+#[test]
+#[ignore = "report: a body-forced laminar channel across the strip"]
+fn a_forced_laminar_channel_across_the_strip() {
+    let (nx, ny) = (96usize, 16usize);
+    let eps = 5.1e-3;
+    let nu = eps / 3.0;
+    let u_mean = 0.02;
+    let accel = if std::env::var("FORCE").is_ok_and(|v| v == "0") { 0.0 } else { 12.0 * nu * u_mean / (ny * ny) as f64 };
+    let steps: usize = std::env::var("STEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(80_000);
+    // STRIP_W (32 columns), RESCALE=1 (the non-equilibrium rescaling), NOFINE=1 (skip the uniform fine reference), WALL=slip.
+    let width: usize = std::env::var("STRIP_W").ok().and_then(|v| v.parse().ok()).unwrap_or(32);
+    let strip = Strip { first: 48 - width / 2, last: 48 + width / 2, linear: true };
+    let rescale = std::env::var("RESCALE").is_ok_and(|v| v == "1");
+    let mut runs: Vec<(&str, Refined, bool)> = Vec::new();
+    for (name, w, unrefined) in [("unrefined", 0.25, true), ("strip", 0.25, false)] {
+        let mut r = wave_pair_with([nx, ny, 4], strip, eps, true, accel);
+        r.rescale_non_equilibrium(rescale);
+        r.time_coupling(std::env::var("TC").map_or(true, |v| v != "0"));
+        r.time_coupling_weight(w);
+        // PLUG=1: start from a uniform flow of the mean speed (with FORCE=0 and slip walls the momentum must stay).
+        let plug = if std::env::var("PLUG").is_ok_and(|v| v == "1") { u_mean } else { 0.0 };
+        r.initialise(&move |_x| (1.0, [plug, 0.0, 0.0]));
+        runs.push((name, r, unrefined));
+    }
+    for _ in 0..steps {
+        for (_, r, u) in runs.iter_mut() {
+            if *u { r.step_unrefined().unwrap() } else { r.step().unwrap() }
+        }
+    }
+    // The uniform fine run of the same physics: twice the cells, twice the lattice viscosity, half the lattice force, twice the steps.
+    if std::env::var("NOFINE").is_err() {
+        let mut fine = wave_pair_with([2 * nx, 2 * ny, 8], Strip { first: 10, last: 20, linear: true }, 2.0 * eps, true, accel / 2.0);
+        fine.initialise(&|_x| (1.0, [0.0; 3]));
+        for _ in 0..2 * steps {
+            fine.step_unrefined().unwrap();
+        }
+        let m = fine.coarse_moments();
+        let g = fine.coarse().grid();
+        let col: Vec<f64> = (0..2 * ny).map(|y| m[g.index([nx, y, 1])].1[0]).collect();
+        eprintln!(
+            "channel uniform fine run: mean u {:.5e} (Poiseuille {u_mean:.5e}), centre {:.4e}",
+            col.iter().sum::<f64>() / (2 * ny) as f64,
+            col[ny]
+        );
+    }
+    let h = ny as f64;
+    for (name, r, u) in &runs {
+        let m = if *u { r.coarse_moments() } else { r.composite_moments() };
+        let g = r.coarse().grid();
+        // The momentum budget per column: the pressure-like density (x 1e5), the streamwise flux sum rho u, and the
+        // residual of the steady balance, force minus wall drag minus the flux of momentum and pressure out of the column.
+        {
+            let col = |x: usize| -> (f64, f64, f64, f64) {
+                let (mut rho, mut ru, mut flux, mut wall) = (0.0, 0.0, 0.0, 0.0);
+                for y in 0..ny {
+                    let (r, u) = m[g.index([x, y, 1])];
+                    rho += r;
+                    ru += r * u[0];
+                    flux += r * u[0] * u[0] + r / 3.0;
+                    if y == 0 || y == ny - 1 {
+                        wall += r * nu * u[0] / 0.5;
+                    }
+                }
+                (rho, ru, flux, wall)
+            };
+            let mut line = String::new();
+            for x in (2..nx - 2).step_by(2) {
+                let (rho, ru, _, wall) = col(x);
+                let (_, _, f1, _) = col(x + 1);
+                let (_, _, f0, _) = col(x - 1);
+                let residual = accel * rho - wall - (f1 - f0) / 2.0;
+                line += &format!(" x{x}:rho {:+.1} ru {:.3e} res {:+.2e}", (rho / ny as f64 - 1.0) * 1e5, ru, residual);
+            }
+            eprintln!("budget {name}:{line}");
+        }
+        for (label, x) in [("outside the strip (x 16)", 16usize), ("strip centre (x 48)", 48)] {
+            let col: Vec<f64> = (0..ny).map(|y| m[g.index([x, y, 1])].1[0]).collect();
+            let exact: Vec<f64> = (0..ny).map(|y| accel / (2.0 * nu) * (y as f64 + 0.5) * (h - y as f64 - 0.5)).collect();
+            let rel = col.iter().zip(&exact).map(|(a, b)| (a - b) / b).fold(0.0f64, |w, e| if e.abs() > w.abs() { e } else { w });
+            let mean = col.iter().sum::<f64>() / h;
+            if std::env::var("DUMP").is_ok() {
+                eprintln!("  profile {name} {label}: {}", col.iter().map(|v| format!("{v:.3e}")).collect::<Vec<_>>().join(" "));
+            }
+            eprintln!(
+                "channel {name}, {label}: mean u {mean:.5e} (Poiseuille {u_mean:.5e}), worst relative profile error {rel:+.2e}, wall cell {:.4e} (exact {:.4e}), centre {:.4e} (exact {:.4e})",
+                col[0],
+                exact[0],
+                col[ny / 2],
+                exact[ny / 2]
+            );
         }
     }
 }
