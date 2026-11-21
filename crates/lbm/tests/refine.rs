@@ -564,6 +564,35 @@ fn a_driven_channel_with_sa_matches_the_unrefined_one() {
     assert!(with_model <= without_model + 0.005, "SA: {with_model:e} against {without_model:e} without the model");
 }
 
+/// With an eddy viscosity the rescale factor is each interface cell's own: a uniform stream with a uniform ν̃ stays
+/// uniform with the rescaling on, the factor is a finite number in its limits, and (the eddy viscosity being positive)
+/// it differs from the levels' own-τ one, which would be the factor at ν_t = 0.
+#[test]
+fn the_local_rescale_factor_keeps_a_uniform_eddy_viscous_stream_uniform() {
+    let n = [64, 4, 4];
+    let mut r = Refined::new(&sa_model(all_periodic(n), None), None, &[], &Limits::default(), Strip { first: 24, last: 40, linear: true })
+        .unwrap_or_else(|e| panic!("{e}"));
+    r.rescale_non_equilibrium(true).unwrap();
+    let nu0 = 4.0 * r.nu_tilde_coarse(2, 1, 1).unwrap_or(1.0);
+    r.initialise(&|_x| (1.0, [0.04, 0.0, 0.0]));
+    r.initialise_nu_tilde(&|_x| nu0).unwrap_or_else(|e| panic!("{e}"));
+    let c0 = r.composite_moments();
+    for _ in 0..200 {
+        r.step().unwrap();
+    }
+    let c = r.composite_moments();
+    let worst = c0.iter().zip(&c).map(|(a, b)| (a.0 - b.0).abs().max((0..3).map(|k| (a.1[k] - b.1[k]).abs()).fold(0.0, f64::max))).fold(0.0f64, f64::max);
+    assert!(worst <= 1e-6, "the uniform eddy-viscous stream moved by {worst:e}");
+    let (lo, hi, mean) = r.rescale_factor_statistics().unwrap_or_else(|| panic!("no factor statistics"));
+    assert!(0.1 <= lo && lo <= mean && mean <= hi && hi <= 10.0, "factor {lo} {mean} {hi}");
+    let global = {
+        let (tc, tf) = (1.0 / r.coarse().omegas().0, 1.0 / r.fine().omegas().0);
+        (tf - 1.0) / (2.0 * (tc - 1.0))
+    };
+    eprintln!("local factor {lo:.5} / {mean:.5} / {hi:.5}, own-tau {global:.5}");
+    assert!((mean - global).abs() > 1e-9, "the local factor equals the global one ({mean})");
+}
+
 /// A smooth ν̃ wave carried through the strip by a uniform stream (transport only): the amplitude
 /// and phase after crossing, against the coarse level alone and against a uniform fine run
 /// (printed), for a wavelength of 32 coarse cells.
@@ -757,7 +786,7 @@ fn turbulent_channel_job() {
     let strip = if fine { Strip { first: 48, last: 80, linear: true } } else { Strip { first: 24, last: 40, linear: true } };
     let mut r = Refined::new(&m, None, &[], &Limits::default(), strip).unwrap_or_else(|e| panic!("{e}"));
     // JOB_RESCALE=1: the non-equilibrium rescaling across the interface; JOB_TC=1: the time coupling at weight 1/4.
-    r.rescale_non_equilibrium(std::env::var("JOB_RESCALE").is_ok_and(|v| v == "1"));
+    r.rescale_non_equilibrium(std::env::var("JOB_RESCALE").is_ok_and(|v| v == "1")).unwrap();
     r.time_coupling(std::env::var("JOB_TC").is_ok_and(|v| v == "1"));
     let nu = (1.0 / r.coarse().omegas().0 - 0.5) / 3.0 / if fine { 2.0 } else { 1.0 };
     let (u_tau, kappa): (f64, f64) = (0.003, 0.41);
@@ -819,6 +848,10 @@ fn turbulent_channel_job() {
         }
     }
     writeln!(profiles, "nu {nu:.8e}").ok();
+    if let Some((lo, hi, mean)) = r.rescale_factor_statistics() {
+        writeln!(profiles, "rescale_factor min {lo:.6} max {hi:.6} mean {mean:.6}").ok();
+        println!("rescale factor over the interface: min {lo:.6} max {hi:.6} mean {mean:.6}");
+    }
 }
 
 type Profiles = std::collections::HashMap<(usize, usize), (f64, f64)>;
@@ -1273,7 +1306,7 @@ fn interpolated_walls_off_the_cell_faces_act_on_both_levels() {
 fn the_non_equilibrium_rescaling_is_off_by_default() {
     let mut a = refined(closed_box(), STRIP).unwrap_or_else(|e| panic!("{e}"));
     let mut b = refined(closed_box(), STRIP).unwrap_or_else(|e| panic!("{e}"));
-    b.rescale_non_equilibrium(false);
+    b.rescale_non_equilibrium(false).unwrap();
     for _ in 0..200 {
         a.step().unwrap();
         b.step().unwrap();
@@ -1287,7 +1320,7 @@ fn the_non_equilibrium_rescaling_is_off_by_default() {
 fn the_non_equilibrium_rescaling_keeps_mass_and_a_uniform_flow() {
     let mut r = refined(closed_box(), STRIP).unwrap_or_else(|e| panic!("{e}"));
     let mut plain = refined(closed_box(), STRIP).unwrap_or_else(|e| panic!("{e}"));
-    r.rescale_non_equilibrium(true);
+    r.rescale_non_equilibrium(true).unwrap();
     let m0 = r.mass();
     let mut worst = 0.0f64;
     for step in 0..600 {
@@ -1303,7 +1336,7 @@ fn the_non_equilibrium_rescaling_keeps_mass_and_a_uniform_flow() {
     assert!(moved > 1e-9, "the rescaling changed nothing ({moved:e})");
     assert!(a.iter().all(|(rho, u)| rho.is_finite() && u.iter().all(|v| v.is_finite())));
     let mut u = refined(periodic_box(), STRIP).unwrap_or_else(|e| panic!("{e}"));
-    u.rescale_non_equilibrium(true);
+    u.rescale_non_equilibrium(true).unwrap();
     let c0 = u.composite_moments();
     for _ in 0..200 {
         u.step().unwrap();
@@ -1516,7 +1549,7 @@ fn a_vortex_convected_through_the_strip() {
         let mut r = wave_pair([nx, ny, 4], strip, 5.1e-3);
         r.time_coupling(tc);
         r.time_coupling_weight(w);
-        r.rescale_non_equilibrium(rescale);
+        r.rescale_non_equilibrium(rescale).unwrap();
         r.initialise(&init);
         runs.push((name, r, unrefined));
     }
@@ -1578,7 +1611,7 @@ fn a_forced_laminar_channel_across_the_strip() {
     let mut runs: Vec<(&str, Refined, bool)> = Vec::new();
     for (name, w, unrefined) in [("unrefined", 0.25, true), ("strip", 0.25, false)] {
         let mut r = wave_pair_with([nx, ny, 4], strip, eps, true, accel);
-        r.rescale_non_equilibrium(rescale);
+        r.rescale_non_equilibrium(rescale).unwrap();
         r.time_coupling(std::env::var("TC").map_or(true, |v| v != "0"));
         r.time_coupling_weight(w);
         // PLUG=1: start from a uniform flow of the mean speed (with FORCE=0 and slip walls the momentum must stay).

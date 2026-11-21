@@ -135,6 +135,8 @@ pub struct Refined {
     /// Whether the non-equilibrium part of the populations that cross the interface is rescaled between the levels
     /// (see [`Refined::rescale_non_equilibrium`]). Off by default.
     rescale: bool,
+    /// The rescale factor's minimum, maximum and mean over the interface cells of the last coarse step.
+    rescale_stats: Option<(f64, f64, f64)>,
     /// Whether the second fine sub-step reads the coarse data extrapolated to its own time (see [`Refined::time_coupling`]).
     time_coupling: bool,
     /// The weight of the coarse populations' backward difference in the two fine layers (1/4 by default: the linear fit through the coarse flux times).
@@ -362,6 +364,7 @@ impl Refined {
             nu_tilde: Vec::new(),
             nu_tilde_next: Vec::new(),
             rescale: false,
+            rescale_stats: None,
             time_coupling: false,
             population_weight: 0.25,
             moments_prev: Vec::new(),
@@ -814,6 +817,7 @@ impl Refined {
         self.replenish.clear();
         let [_, ny, nz] = self.nc;
         let linear = self.strip.linear;
+        let mut stats: Vec<f64> = Vec::new();
         for side in 0..2 {
             let xa = self.interface_column(side);
             let (g, perm) = (*self.coarse.grid(), self.perm);
@@ -830,16 +834,20 @@ impl Refined {
                         continue;
                     }
                     let into = |q: usize| into_strip(self.perm, side, q);
-                    let factor = self.rescale_factor();
                     let own = self.coarse.cell_populations(at(y, z));
-                    let scale = |f: [f64; Q]| if self.rescale { self.rescaled(&f, moments_of(&f), factor, &into) } else { f };
-                    let a = scale(own);
+                    let scale = |cell: usize, f: [f64; Q]| {
+                        if self.rescale { self.rescaled(&f, moments_of(&f), self.rescale_factor(cell), &into) } else { f }
+                    };
+                    if self.rescale {
+                        stats.push(self.rescale_factor(at(y, z)));
+                    }
+                    let a = scale(at(y, z), own);
                     // Slopes along y and z: central, one-sided next to a wall (the periodic or missing neighbour
                     // does not count), zero where neither neighbour is a fluid cell.
                     let slope = |n: Option<usize>, p: Option<usize>| -> [f64; Q] {
                         let fluid = |c: Option<usize>| c.filter(|&c| self.coarse.is_fluid(c));
                         let (n, p) = (fluid(n), fluid(p));
-                        let pop = |c: usize| scale(self.coarse.cell_populations(c));
+                        let pop = |c: usize| scale(c, self.coarse.cell_populations(c));
                         let mut s = [0.0; Q];
                         match (n, p) {
                             (Some(n), Some(p)) => {
@@ -907,6 +915,16 @@ impl Refined {
                 }
             }
         }
+        if !stats.is_empty() {
+            let n = stats.len() as f64;
+            self.rescale_stats = Some((stats.iter().copied().fold(f64::INFINITY, f64::min), stats.iter().copied().fold(f64::NEG_INFINITY, f64::max), stats.iter().sum::<f64>() / n));
+        }
+    }
+
+    /// The smallest, largest and mean factor of the non-equilibrium rescale over the coarse interface cells of the
+    /// last coarse step (`None` without it, or before the first step).
+    pub fn rescale_factor_statistics(&self) -> Option<(f64, f64, f64)> {
+        self.rescale_stats
     }
 
     /// After the first fine step: what wall reflection has left in the outer ghost layer, pointing
@@ -997,7 +1015,7 @@ impl Refined {
                     }
                     if self.rescale {
                         let out = |q: usize| cdir(self.perm, q, 0) != 0 && !into_strip(self.perm, side, q);
-                        sum = self.rescaled(&sum, moments_of(&a), 1.0 / self.rescale_factor(), &out);
+                        sum = self.rescaled(&sum, moments_of(&a), 1.0 / self.rescale_factor(cell), &out);
                     }
                     // The slots that point out of the strip take what the fine flow sends. A population
                     // that wall reflection turned around inside a ghost cell is back in the inward
@@ -1031,8 +1049,12 @@ impl Refined {
     /// fine to coarse, with τ = 1/ω⁺ of each level. The change of the populations that cross is projected so that its
     /// mass and its momentum along the interface vanish (the momentum across it equals the mass for these directions): the
     /// crossing stays conservative. Off by default: nothing changes then, bit for bit.
-    pub fn rescale_non_equilibrium(&mut self, on: bool) {
+    pub fn rescale_non_equilibrium(&mut self, on: bool) -> Result<()> {
         self.rescale = on;
+        if on {
+            self.coarse.record_eddy_viscosity()?;
+        }
+        Ok(())
     }
 
     /// Switch on (or off) the time coupling of the second fine sub-step.
@@ -1060,7 +1082,20 @@ impl Refined {
     }
 
     /// The factor on the non-equilibrium part of populations passing from the coarse to the fine level.
-    fn rescale_factor(&self) -> f64 {
+    ///
+    /// With an eddy viscosity the relaxation time is the cell's own: the coarse interface cell `cell` relaxed with
+    /// τ_c = 1/ω⁺ + 3 ν_t (its last collision's, after any limiter), the fine level's ν_t is the coarse one in fine
+    /// units (acoustic scaling), τ_f − ½ = r (τ_c − ½), and the same cell's factor serves both directions, so they stay
+    /// exact inverses. Without one (ν_t = 0) it is the levels' own τ, as before, bit for bit. The factor is kept in
+    /// [0.1, 10], and is 1 where τ_c is within 1e-6 of 1.
+    fn rescale_factor(&self, cell: usize) -> f64 {
+        let nu_t = self.coarse.eddy_viscosity(cell);
+        if nu_t > 0.0 {
+            let tc = 1.0 / self.coarse.omegas().0 + 3.0 * nu_t;
+            let tf = 0.5 + RATIO as f64 * (tc - 0.5);
+            let d = RATIO as f64 * (tc - 1.0);
+            return if d.abs() > 1e-6 { ((tf - 1.0) / d).clamp(0.1, 10.0) } else { 1.0 };
+        }
         let (tc, tf) = (1.0 / self.coarse.omegas().0, 1.0 / self.fine.omegas().0);
         let d = RATIO as f64 * (tc - 1.0);
         if d.abs() > 1e-12 { (tf - 1.0) / d } else { 1.0 }

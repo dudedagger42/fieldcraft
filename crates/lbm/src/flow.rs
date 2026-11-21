@@ -2465,6 +2465,22 @@ impl Flow {
         self.vreman
     }
 
+    /// Keep each fluid cell's eddy viscosity of the last collision (lattice units), as the heat lattice does,
+    /// for [`Flow::eddy_viscosity`]. Nothing about the flow changes; it is a record only. Without an eddy
+    /// viscosity it does nothing.
+    pub fn record_eddy_viscosity(&mut self) -> Result<()> {
+        if self.turbulent() && self.cell_nu_t.is_empty() {
+            self.cell_nu_t = filled(self.n, 0.0, "eddy viscosities")?;
+        }
+        Ok(())
+    }
+
+    /// The eddy viscosity (lattice units) the cell's last collision relaxed with: 0 for a cell without one, and
+    /// everywhere unless [`Flow::record_eddy_viscosity`] (or heat with an eddy viscosity) keeps it.
+    pub fn eddy_viscosity(&self, cell: usize) -> f64 {
+        self.cell_nu_t.get(cell).copied().unwrap_or(0.0)
+    }
+
     /// Whether a subgrid model (Smagorinsky's or Vreman's) gives the cells an eddy viscosity.
     pub fn turbulent(&self) -> bool {
         self.smagorinsky > 0.0 || self.vreman > 0.0 || self.sa.is_some()

@@ -169,7 +169,7 @@ fn run(refined: bool) -> Vec<Sample> {
         let last = (strip_x()[1] / dx).round() as usize;
         let mut rr = Refined::new(&m, None, &obstacles, &Limits::default(), Strip { first, last, linear: true }).unwrap_or_else(|e| panic!("{e}"));
         rr.interpolate_walls_with(&obstacles, order, fix()).unwrap_or_else(|e| panic!("{e}"));
-        rr.rescale_non_equilibrium(env("RESCALE", 0.0) > 0.5);
+        rr.rescale_non_equilibrium(env("RESCALE", 0.0) > 0.5).unwrap();
         rr.time_coupling(env("TCOUPLE", 0.0) > 0.5);
         rr.time_coupling_weight(env("TCOUPLE_W", 0.25));
         bx = rr.coarse().grid().cells[0];
