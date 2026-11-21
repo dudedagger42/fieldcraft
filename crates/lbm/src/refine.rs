@@ -283,7 +283,7 @@ impl Refined {
         if last < first + MIN_COLUMNS {
             return Err(Error::Invalid(format!("the strip {first}..{last} is narrower than {MIN_COLUMNS} coarse columns")));
         }
-        let layer = coarse.absorbing_cells().iter().map(|&c| coarse.grid().coords(c as usize)[perm[0]]);
+        let mut layer = coarse.absorbing_cells().iter().map(|&c| coarse.grid().coords(c as usize)[perm[0]]);
         if let Some(column) = layer.find(|&c| c + 3 >= first && c <= last + 3) {
             return Err(Error::Invalid(format!(
                 "not supported yet: an absorbing layer that reaches the strip: its column {column} lies within 3 columns of the strip {first}..{last}; shorten the layer's thickness or move the strip"

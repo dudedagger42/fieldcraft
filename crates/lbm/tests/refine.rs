@@ -1745,7 +1745,7 @@ fn an_absorbing_layer_clear_of_the_strip_absorbs_what_leaves_it() {
             let g = r.coarse().grid();
             assert!(cells.iter().all(|&c| {
                 let x = g.coords(c as usize)[0];
-                x < 10 || x >= 86
+                !(10..86).contains(&x)
             }));
         }
         r.initialise(&|x| (1.0 + 1e-3 * (-((x[0] - 48.0) / 4.0).powi(2)).exp(), [0.0; 3]));
