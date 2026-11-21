@@ -11,7 +11,7 @@
 //! the volume flux through five sections (x = 0.5, 0.7, 1.0, 1.4, 2.1 m), out/in, the throat Reynolds number and the drift of K
 //! over the last third of the run. The gates: K within 2 % and the section fluxes within 0.3 % between the two runs.
 //!
-//! Environment: INLET_P (a pressure inlet instead of the velocity one), OUTFLOW (uniform|convective), INLET_RAMP (0; base steps of the inlet's cosine start), TCOUPLE_W (0.25; the weight of the populations' difference), TCOUPLE (0; 1 extrapolates the coarse data of the second fine sub-step in time), RESCALE (0; 1 rescales the non-equilibrium part across the interface), SAMPLE (20, steps between samples), REPORT (2000, steps between printed samples), WINDOW (20000), SLOT_BASE (6), STEPS (base steps, 40000), TAU (tau - 1/2 of the base grid, 5.1e-3), ROUND (0.3), ULAT (0.014),
+//! Environment: INLET_P (a pressure inlet instead of the velocity one), OUTFLOW (uniform|convective), LAYER (0; an absorbing layer's thickness in m at both ends, the same on every grid), INLET_RAMP (0; base steps of the inlet's cosine start), TCOUPLE_W (0.25; the weight of the populations' difference), TCOUPLE (0; 1 extrapolates the coarse data of the second fine sub-step in time), RESCALE (0; 1 rescales the non-equilibrium part across the interface), SAMPLE (20, steps between samples), REPORT (2000, steps between printed samples), WINDOW (20000), SLOT_BASE (6), STEPS (base steps, 40000), TAU (tau - 1/2 of the base grid, 5.1e-3), ROUND (0.3), ULAT (0.014),
 //! QUAD (1: quadratic wall interpolation), FIX (local | spread | off, default spread), REPORT (base steps between samples,
 //! 1000), CASE (both | refined | uniform), SIGMA (the hybrid collision's sigma, 0.95).
 #[path = "common/mod.rs"]
@@ -106,6 +106,9 @@ fn case(cells: f64, steps: u64, base: f64) -> (Model, Vec<Obstacle>) {
     // INLET_RAMP: the inlet's cosine start over this many base steps (the same time on both grids).
     let ramp = env("INLET_RAMP", 0.0);
     d.inlet_ramp = (ramp > 0.0).then_some(ramp * dt_base);
+    // LAYER: an absorbing layer of this thickness (m) at the inlet and the outlet, the same on every grid.
+    let layer = env("LAYER", 0.0);
+    d.absorbing = (layer > 0.0).then_some(fieldcraft_model::AbsorbingLayer { thickness: Some(layer), strength: None, filter_time: None });
     let round = env("ROUND", 0.3);
     let r = round * SLOT;
     let faces = ["x_min", "x_max", "wall"];
