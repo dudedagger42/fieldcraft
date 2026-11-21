@@ -1251,3 +1251,49 @@ fn interpolated_walls_off_the_cell_faces_act_on_both_levels() {
     let worst = plain.iter().zip(&interp).map(|(a, b)| (a.1[0] - b.1[0]).abs()).fold(0.0, f64::max);
     assert!(worst > 1e-9, "interpolation changed nothing ({worst:e})");
 }
+
+/// The non-equilibrium rescaling is off by default: switching it off explicitly changes nothing, bit for bit.
+#[test]
+fn the_non_equilibrium_rescaling_is_off_by_default() {
+    let mut a = refined(closed_box(), STRIP).unwrap_or_else(|e| panic!("{e}"));
+    let mut b = refined(closed_box(), STRIP).unwrap_or_else(|e| panic!("{e}"));
+    b.rescale_non_equilibrium(false);
+    for _ in 0..200 {
+        a.step().unwrap();
+        b.step().unwrap();
+    }
+    assert_eq!(a.composite_moments(), b.composite_moments());
+}
+
+/// With the rescaling on, the mass of a closed box is still conserved while the flow crosses the strip, a uniform flow
+/// stays uniform, and the flow differs from the one without it (the rescaling acts).
+#[test]
+fn the_non_equilibrium_rescaling_keeps_mass_and_a_uniform_flow() {
+    let mut r = refined(closed_box(), STRIP).unwrap_or_else(|e| panic!("{e}"));
+    let mut plain = refined(closed_box(), STRIP).unwrap_or_else(|e| panic!("{e}"));
+    r.rescale_non_equilibrium(true);
+    let m0 = r.mass();
+    let mut worst = 0.0f64;
+    for step in 0..600 {
+        r.step().unwrap();
+        plain.step().unwrap();
+        if step % 50 == 49 {
+            worst = worst.max(((r.mass() - m0) / m0).abs());
+        }
+    }
+    assert!(worst <= 1e-10, "relative mass drift {worst:e}");
+    let (a, b) = (r.composite_moments(), plain.composite_moments());
+    let moved = a.iter().zip(&b).map(|(x, y)| (x.1[0] - y.1[0]).abs()).fold(0.0f64, f64::max);
+    assert!(moved > 1e-9, "the rescaling changed nothing ({moved:e})");
+    assert!(a.iter().all(|(rho, u)| rho.is_finite() && u.iter().all(|v| v.is_finite())));
+    let mut u = refined(periodic_box(), STRIP).unwrap_or_else(|e| panic!("{e}"));
+    u.rescale_non_equilibrium(true);
+    let c0 = u.composite_moments();
+    for _ in 0..200 {
+        u.step().unwrap();
+    }
+    let c = u.composite_moments();
+    let worst =
+        c0.iter().zip(&c).map(|(a, b)| (a.0 - b.0).abs().max((0..3).map(|k| (a.1[k] - b.1[k]).abs()).fold(0.0, f64::max))).fold(0.0f64, f64::max);
+    assert!(worst <= 1e-12, "the uniform state moved by {worst:e}");
+}

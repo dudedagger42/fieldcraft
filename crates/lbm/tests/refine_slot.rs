@@ -11,7 +11,7 @@
 //! the volume flux through five sections (x = 0.5, 0.7, 1.0, 1.4, 2.1 m), out/in, the throat Reynolds number and the drift of K
 //! over the last third of the run. The gates: K within 2 % and the section fluxes within 0.3 % between the two runs.
 //!
-//! Environment: SAMPLE (20, steps between samples), REPORT (2000, steps between printed samples), WINDOW (20000), SLOT_BASE (6), STEPS (base steps, 40000), TAU (tau - 1/2 of the base grid, 5.1e-3), ROUND (0.3), ULAT (0.014),
+//! Environment: RESCALE (0; 1 rescales the non-equilibrium part across the interface), SAMPLE (20, steps between samples), REPORT (2000, steps between printed samples), WINDOW (20000), SLOT_BASE (6), STEPS (base steps, 40000), TAU (tau - 1/2 of the base grid, 5.1e-3), ROUND (0.3), ULAT (0.014),
 //! QUAD (1: quadratic wall interpolation), FIX (local | spread | off, default spread), REPORT (base steps between samples,
 //! 1000), CASE (both | refined | uniform), SIGMA (the hybrid collision's sigma, 0.95).
 #[path = "common/mod.rs"]
@@ -156,6 +156,7 @@ fn run(refined: bool) -> Vec<Sample> {
         let last = (strip_x()[1] / dx).round() as usize;
         let mut rr = Refined::new(&m, None, &obstacles, &Limits::default(), Strip { first, last, linear: true }).unwrap_or_else(|e| panic!("{e}"));
         rr.interpolate_walls_with(&obstacles, order, fix()).unwrap_or_else(|e| panic!("{e}"));
+        rr.rescale_non_equilibrium(env("RESCALE", 0.0) > 0.5);
         bx = rr.coarse().grid().cells[0];
         by = rr.coarse().grid().cells[1];
         bz = rr.coarse().grid().cells[2];

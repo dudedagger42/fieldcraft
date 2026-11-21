@@ -129,6 +129,9 @@ pub struct Refined {
     nu_tilde: Vec<Vec<f64>>,
     /// The same after the coarse step's transport (the end of the coarse step).
     nu_tilde_next: Vec<Vec<f64>>,
+    /// Whether the non-equilibrium part of the populations that cross the interface is rescaled between the levels
+    /// (see [`Refined::rescale_non_equilibrium`]). Off by default.
+    rescale: bool,
 }
 
 /// What the interface columns hold, see [`Refined::interface_report`].
@@ -337,6 +340,7 @@ impl Refined {
             saved: Vec::new(),
             nu_tilde: Vec::new(),
             nu_tilde_next: Vec::new(),
+            rescale: false,
         };
         refined.check_interface_cells()?;
         // The ghost cells hold nothing between steps.
@@ -782,13 +786,17 @@ impl Refined {
                     if !self.coarse.is_fluid(at(y, z)) {
                         continue;
                     }
-                    let a = self.coarse.cell_populations(at(y, z));
+                    let into = |q: usize| into_strip(self.perm, side, q);
+                    let factor = self.rescale_factor();
+                    let own = self.coarse.cell_populations(at(y, z));
+                    let scale = |f: [f64; Q]| if self.rescale { self.rescaled(&f, moments_of(&f), factor, &into) } else { f };
+                    let a = scale(own);
                     // Slopes along y and z: central, one-sided next to a wall (the periodic or missing neighbour
                     // does not count), zero where neither neighbour is a fluid cell.
                     let slope = |n: Option<usize>, p: Option<usize>| -> [f64; Q] {
                         let fluid = |c: Option<usize>| c.filter(|&c| self.coarse.is_fluid(c));
                         let (n, p) = (fluid(n), fluid(p));
-                        let pop = |c: usize| self.coarse.cell_populations(c);
+                        let pop = |c: usize| scale(self.coarse.cell_populations(c));
                         let mut s = [0.0; Q];
                         match (n, p) {
                             (Some(n), Some(p)) => {
@@ -926,6 +934,10 @@ impl Refined {
                             }
                         }
                     }
+                    if self.rescale {
+                        let out = |q: usize| cdir(self.perm, q, 0) != 0 && !into_strip(self.perm, side, q);
+                        sum = self.rescaled(&sum, moments_of(&a), 1.0 / self.rescale_factor(), &out);
+                    }
                     // The slots that point out of the strip take what the fine flow sends. A population
                     // that wall reflection turned around inside a ghost cell is back in the inward
                     // direction: it belongs to the coarse cell's outgoing population of the opposite
@@ -944,6 +956,64 @@ impl Refined {
         }
         self.pending.iter_mut().for_each(|p| *p = [0.0; Q]);
         self.replenished.iter_mut().for_each(|p| *p = [0.0; Q]);
+    }
+
+    /// Switch on (or off) the rescaling of the non-equilibrium part of the populations that cross the interface.
+    ///
+    /// The strain stress a cell carries is f_neq ≈ −τ·Δt·(gradient in lattice units) times a weight, so with the fine
+    /// level's τ and Δt, and the gradient in its cells, the same physical stress has f_neq,fine = (τ_f / (r τ_c)) f_neq,coarse
+    /// (r = 2 the refinement ratio). This is the rescaling of the non-equilibrium part of the populations between grids of
+    /// B. Dupuis and B. Chopard, *Theory and applications of an alternative lattice Boltzmann grid refinement algorithm*,
+    /// Phys. Rev. E 67:066707 (2003); here it is applied to the post-collision populations (their non-equilibrium part is
+    /// (1 − 1/τ) times the pre-collision one), so the factor is (τ_f − 1) / (r (τ_c − 1)) coarse to fine and its inverse
+    /// fine to coarse, with τ = 1/ω⁺ of each level. The change of the populations that cross is projected so that its
+    /// mass and its momentum along the interface vanish (the momentum across it equals the mass for these directions): the
+    /// crossing stays conservative. Off by default: nothing changes then, bit for bit.
+    pub fn rescale_non_equilibrium(&mut self, on: bool) {
+        self.rescale = on;
+    }
+
+    /// The factor on the non-equilibrium part of populations passing from the coarse to the fine level.
+    fn rescale_factor(&self) -> f64 {
+        let (tc, tf) = (1.0 / self.coarse.omegas().0, 1.0 / self.fine.omegas().0);
+        let d = RATIO as f64 * (tc - 1.0);
+        if d.abs() > 1e-12 { (tf - 1.0) / d } else { 1.0 }
+    }
+
+    /// The populations of `f` selected by `sent`, with their difference from the equilibrium of (`rho`, `u`) scaled by
+    /// `factor`; the change is projected to carry no mass and no momentum along the interface.
+    fn rescaled(&self, f: &[f64; Q], rho_u: (f64, [f64; 3]), factor: f64, sent: &dyn Fn(usize) -> bool) -> [f64; Q] {
+        let eq = equilibrium(rho_u.0, rho_u.1);
+        let mut delta = [0.0; Q];
+        let (mut n, mut s1, mut s2) = (0.0, 0.0, 0.0);
+        let (mut m0, mut m1, mut m2) = (0.0, 0.0, 0.0);
+        for q in (0..Q).filter(|&q| sent(q)) {
+            let d = (factor - 1.0) * (f[q] - eq[q]);
+            delta[q] = d;
+            let (c1, c2) = (f64::from(cdir(self.perm, q, 1)), f64::from(cdir(self.perm, q, 2)));
+            n += 1.0;
+            m0 += d;
+            m1 += d * c1;
+            m2 += d * c2;
+            s1 += c1 * c1;
+            s2 += c2 * c2;
+        }
+        let mut out = *f;
+        for q in (0..Q).filter(|&q| sent(q)) {
+            let (c1, c2) = (f64::from(cdir(self.perm, q, 1)), f64::from(cdir(self.perm, q, 2)));
+            let mut d = delta[q];
+            if n > 0.0 {
+                d -= m0 / n;
+            }
+            if s1 > 0.0 {
+                d -= c1 * m1 / s1;
+            }
+            if s2 > 0.0 {
+                d -= c2 * m2 / s2;
+            }
+            out[q] += d;
+        }
+        out
     }
 
     /// One coarse step (two fine steps).
