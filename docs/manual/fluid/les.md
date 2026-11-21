@@ -56,7 +56,7 @@ Han, Ooka & Kikumoto's wall-function bounce, as their paper sets it up:
 | `turbulence.type` | `"smagorinsky"`, `"vreman"` | The subgrid model ([Turbulence](turbulence.md)). Malaspinas & Sagaut's wall model is validated with Smagorinsky's only. |
 | `turbulence.constant` | 0.08–0.1 | Smagorinsky's C. Malaspinas & Sagaut use 0.08, Han, Ooka & Kikumoto 0.1. |
 | `turbulence.wall_model` | `"musker"` | Malaspinas & Sagaut: rebuild the cells next to no-slip walls from Musker's profile. |
-| | `"spalding_bounce"` | Han, Ooka & Kikumoto's eq. 14, on-node: the fluid cells next to a wall (the outermost cell layer at a no-slip box face, the fluid layer next to an obstacle) are the wall. The wall passes through the nodes' centres, so an obstacle grows by Δx/2 on each face it meets (its blockage and drag coefficients change with it). At edges, corners and plate ends eq. 14 runs on the link pairs whose fluid side is whole and the other links bounce back; a node with more than one wall direction reports its force on its first. Where a wall meets an inlet, outlet or slip face, that face's cell keeps its own rule (an inlet cell that touches two walls is a wall cell, the inlet's velocity raised to deliver the requested flow). The box is periodic along its walls except where it meets such a face; no moving walls or heat; obstacles, edges and corners run on the CPU only. |
+| | `"spalding_bounce"` | Han, Ooka & Kikumoto's eq. 14, on-node: the fluid cells next to a wall (the outermost cell layer at a no-slip box face, the fluid layer next to an obstacle) are the wall. The wall passes through the nodes' centres, so an obstacle grows by Δx/2 on each face it meets (its blockage and drag coefficients change with it). At edges, corners and plate ends eq. 14 runs on the link pairs whose fluid side is whole and the other links bounce back; a node with more than one wall direction reports its force on its first. Where a wall meets an inlet, outlet or slip face, that face's cell keeps its own rule (an inlet cell that touches two walls is a wall cell, the inlet's velocity raised to deliver the requested flow). The box is periodic along its walls except where it meets such a face; no moving walls or heat. |
 | | `"spalding_bounce_halfway"` | Disabled because its wall-row checkerboard grows. Files preserve this selection when loaded, but solves refuse it at setup. Select a supported treatment explicitly; the on-node variant changes the wall location. |
 | | omitted | The bounce-back alone. |
 | `turbulence.van_driest` | 26 or omit | Van Driest's damping. Han, Ooka & Kikumoto use it with their wall model; Malaspinas & Sagaut's model replaces it, so don't combine the two. |
@@ -90,7 +90,7 @@ Malaspinas & Sagaut's halfway wall, one cell with Han, Ooka & Kikumoto's on-node
 | Law of the wall | Musker's profile (κ 0.41) | Spalding's law (κ 0.41, B 5.5) |
 | The first cell | rebuilt: equilibrium plus regularised stress, relaxed with a mixing-length ν_t | the boundary node does not collide: bounce-back plus the stress on its diagonals |
 | Drag the flow carries | what the rebuilt cell carries; the model's u_τ is 8–11 % above it | τ_w exactly, to round-off (7 × 10⁻¹⁵) |
-| Walls | any no-slip wall: exact on plane walls, within a fraction of a cell on curved ones | plane box faces only |
+| Walls | any no-slip wall: exact on plane walls, within a fraction of a cell on curved ones | box faces and obstacle walls at rest (edges, corners and the cells beside open faces included) |
 | Reproduced | yes, Re_τ 950, E within 8 % of the paper on three grids | no, at A20 on MRT or the hybrid collision |
 | Carried C_f against Dean | −14 to −17 % (Re_τ 950, MRT) | +53 % (MRT), −52 to −55 % (hybrid) at Re_τ 640 |
 
@@ -457,8 +457,9 @@ and `FIELDCRAFT_HAN_END` (δ/u_τ, default 20 and 150) shorten a smoke test, whi
 - **No wall heat flux model.** Malaspinas & Sagaut's model leaves the thermal lattice's bounce-back
   walls as they are, and the wall-function bounce refuses heat, so wall heat transfer on a
   wall-modelled grid is not validated.
-- **Han, Ooka & Kikumoto on box faces only.** The wall-function bounce needs plane box faces,
-  periodic along the walls, with no obstacles or moving walls.
+- **Han, Ooka & Kikumoto at walls at rest.** The wall-function bounce runs on box faces and on
+  obstacle walls (edges, corners, plate ends and the cells beside an open face included), on the CPU
+  and the GPU; it refuses moving walls and heat.
 
 ## References
 
