@@ -33,9 +33,9 @@ const SLOT: f64 = 0.2;
 const PLATE: [f64; 2] = [0.6, 0.8];
 /// The strip's extent along x (metres); its columns are these over the base cell size.
 const STRIP_X: [f64; 2] = [0.4, 1.8];
-/// The strip's x range (m): `STRIP_X` unless STRIP_END moves its end.
+/// The strip's x range (m): `STRIP_X` unless STRIP_START and STRIP_END move its ends.
 fn strip_x() -> [f64; 2] {
-    [STRIP_X[0], env("STRIP_END", STRIP_X[1])]
+    [env("STRIP_START", STRIP_X[0]), env("STRIP_END", STRIP_X[1])]
 }
 const SECTIONS: [f64; 5] = [0.5, 0.7, 1.0, 1.4, 2.1];
 
