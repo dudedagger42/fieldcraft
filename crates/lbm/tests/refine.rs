@@ -756,6 +756,9 @@ fn turbulent_channel_job() {
     let m = turbulent_channel_at(fine);
     let strip = if fine { Strip { first: 48, last: 80, linear: true } } else { Strip { first: 24, last: 40, linear: true } };
     let mut r = Refined::new(&m, None, &[], &Limits::default(), strip).unwrap_or_else(|e| panic!("{e}"));
+    // JOB_RESCALE=1: the non-equilibrium rescaling across the interface; JOB_TC=1: the time coupling at weight 1/4.
+    r.rescale_non_equilibrium(std::env::var("JOB_RESCALE").is_ok_and(|v| v == "1"));
+    r.time_coupling(std::env::var("JOB_TC").is_ok_and(|v| v == "1"));
     let nu = (1.0 / r.coarse().omegas().0 - 0.5) / 3.0 / if fine { 2.0 } else { 1.0 };
     let (u_tau, kappa): (f64, f64) = (0.003, 0.41);
     let scale = if fine { 0.5 } else { 1.0 };
