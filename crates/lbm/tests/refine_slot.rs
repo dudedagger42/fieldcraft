@@ -314,8 +314,12 @@ fn run(refined: bool) -> Vec<Sample> {
                 format!("{:.2} %", 100.0 * 0.5 * (h - l) / m)
             })
             .collect();
+        // The ringing pressure (lattice: p = rho / 3) over the throat's dynamic head (0.5 u_nom^2): K is only read below 5 %.
+        let head = 0.5 * (env("ULAT", 0.014) / SLOT).powi(2);
+        let ringing = amp / mean / 3.0 / head;
         print!(
-            "WINDOW {name} steps {lo}-{hi}: total mass mean {mean:.1}, amplitude {amp:.1} ({:.3} %), period {period:.1} steps ({} crossings); band amplitudes x 0-0.4 / 0.4-1.0 / 1.0-1.8 / 1.8-2.3 / 2.3-2.5: {band_amp:?}",
+            "WINDOW {name} steps {lo}-{hi}: ringing pressure {:.1} % of the throat's dynamic head, total mass mean {mean:.1}, amplitude {amp:.1} ({:.3} %), period {period:.1} steps ({} crossings); band amplitudes x 0-0.4 / 0.4-1.0 / 1.0-1.8 / 1.8-2.3 / 2.3-2.5: {band_amp:?}",
+            100.0 * ringing,
             100.0 * amp / mean,
             ups.len()
         );
