@@ -1369,3 +1369,32 @@ fn the_time_coupling_keeps_mass_a_uniform_flow_and_the_checkerboard_decay() {
         }
     }
 }
+
+/// A uniform flow between free-slip walls keeps its speed through the strip: the wall rows of the interface create
+/// no momentum (the reflection at a slip wall is specular, so the ghost cells next to it need no replenishing).
+#[test]
+fn a_flow_between_slip_walls_keeps_its_momentum_through_the_strip() {
+    let (nx, ny) = (48usize, 8usize);
+    let u = 0.02;
+    let slip = {
+        let dx: f64 = 0.05;
+        let dt: f64 = 0.05 * dx / 0.1;
+        let nu = 5.1e-3 / 3.0 * dx * dx / dt;
+        let mut d = all_periodic([nx, ny, 4]);
+        d.faces.y_min = FaceCondition::Slip {};
+        d.faces.y_max = FaceCondition::Slip {};
+        let smag = Some(Turbulence::Smagorinsky { constant: 1e-4, prandtl: 0.9, van_driest: None, wall_model: None });
+        let m = model(1.0, nu, d, procedure(Collision::Hrr, smag));
+        Refined::new(&m, None, &[], &Limits::default(), Strip { first: 16, last: 32, linear: true }).unwrap_or_else(|e| panic!("{e}"))
+    };
+    let mut r = slip;
+    r.initialise(&move |_x| (1.0, [u, 0.0, 0.0]));
+    for _ in 0..600 {
+        r.step().unwrap();
+    }
+    let m = r.composite_moments();
+    let mean = m.iter().map(|(_, v)| v[0]).sum::<f64>() / m.len() as f64;
+    let spread = m.iter().map(|(_, v)| (v[0] - u).abs()).fold(0.0f64, f64::max);
+    assert!((mean - u).abs() < 1e-7, "mean speed {mean:e} against {u:e}");
+    assert!(spread < 1e-6, "the speed departs from the plug by {spread:e}");
+}

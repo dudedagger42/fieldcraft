@@ -109,6 +109,9 @@ pub struct Refined {
     nf: [usize; 3],
     /// Whether the y and z faces are periodic (a population toward a wall face bounces back in its cell: it crosses nothing).
     periodic: [bool; 2],
+    /// Whether the low and high face along y and along z is a free-slip wall: its reflection is specular, so a population
+    /// toward it keeps its direction along the strip and the ghost cells need no replenishing next to it.
+    slip: [[bool; 2]; 2],
     /// ρ and u of the coarse cells in the columns around the interface, by column offset (see `moment_columns`).
     moments: Vec<Vec<(f64, [f64; 3])>>,
     /// Outbound populations that wall reflection left in the outer ghost layer after the first fine step, per side and coarse (y, z) cell, in coarse units.
@@ -332,6 +335,7 @@ impl Refined {
             return Err(Error::Invalid(format!("the fine grid {nf:?} does not cover the strip {first}..{last} of the coarse grid {nc:?}")));
         }
         let periodic = [perm[1], perm[2]].map(|a| faces_along(&domain.faces, a).iter().all(|f| matches!(f, FaceCondition::Periodic {})));
+        let slip = [perm[1], perm[2]].map(|a| faces_along(&domain.faces, a).map(|f| matches!(f, FaceCondition::Slip {})));
         let mut refined = Refined {
             coarse,
             fine,
@@ -340,6 +344,7 @@ impl Refined {
             nc,
             nf,
             periodic,
+            slip,
             moments: Vec::new(),
             pending: vec![[0.0; Q]; 2 * nc[1] * nc[2]],
             replenish: Vec::new(),
@@ -559,6 +564,13 @@ impl Refined {
         };
         let (Some(y), Some(z)) = (wrap(y, n[1], self.periodic[0]), wrap(z, n[2], self.periodic[1])) else { return false };
         if coarse { self.coarse.is_fluid(self.cidx([x, y, z])) } else { self.fine.is_fluid(self.fidx([x, y, z])) }
+    }
+
+    /// Whether the tangential position `(y, z)` of the coarse (`coarse`) or fine level lies beyond a free-slip wall face.
+    fn slip_beyond(&self, coarse: bool, y: i64, z: i64) -> bool {
+        let n = if coarse { self.nc } else { self.nf };
+        let beyond = |i: i64, n: usize, slip: [bool; 2]| (i < 0 && slip[0]) || (i >= n as i64 && slip[1]);
+        beyond(y, n[1], self.slip[0]) || beyond(z, n[2], self.slip[1])
     }
 
     fn interface_column(&self, side: usize) -> usize {
@@ -875,7 +887,8 @@ impl Refined {
                             let (yf, zf) = ((RATIO * y + dy) as i64, (RATIO * z + dz) as i64);
                             let xi = if side == 0 { RATIO - 1 } else { self.nf[0] - RATIO };
                             for &q in &sent {
-                                if !self.tangential_fluid(false, xi, yf - i64::from(cdir(self.perm, q, 1)), zf - i64::from(cdir(self.perm, q, 2))) {
+                                let (ty, tz) = (yf - i64::from(cdir(self.perm, q, 1)), zf - i64::from(cdir(self.perm, q, 2)));
+                                if !self.tangential_fluid(false, xi, ty, tz) && !self.slip_beyond(false, ty, tz) {
                                     self.replenish.push((fine_cell, q, g_second[q], (side * nz + z) * ny + y));
                                 }
                             }
@@ -988,7 +1001,8 @@ impl Refined {
                         a[q] = sum[q] + self.pending.get((side * nz + z) * ny + y).map_or(0.0, |p| p[q]);
                     }
                     for q in (0..Q).filter(|&q| cdir(self.perm, q, 0) != 0 && into_strip(self.perm, side, q)) {
-                        if !self.neighbour_exists(y, z, -cdir(self.perm, q, 1), -cdir(self.perm, q, 2)) {
+                        let (ty, tz) = (y as i64 - i64::from(cdir(self.perm, q, 1)), z as i64 - i64::from(cdir(self.perm, q, 2)));
+                        if !self.neighbour_exists(y, z, -cdir(self.perm, q, 1), -cdir(self.perm, q, 2)) && !self.slip_beyond(true, ty, tz) {
                             a[q] += sum[q] - self.replenished.get((side * nz + z) * ny + y).map_or(0.0, |r| r[q]);
                         }
                     }
