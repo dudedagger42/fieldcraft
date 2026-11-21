@@ -1179,3 +1179,75 @@ fn spalart_allmaras_with_obstacle_walls_matches_the_unrefined_flow() {
         assert!(sa <= plain + 0.005, "offset {off}: SA {sa:e} against {plain:e} without the model");
     }
 }
+
+/// A driven channel (walls in y, periodic in x and z, 64 x 12 x 4 coarse cells) with a block of solid in the middle of the strip
+/// 24..40 (the block's faces `off` coarse cells off the cell faces), refined, with its walls interpolated on both levels or not,
+/// run for `steps`: the composite moments and the reports.
+fn interpolated_block(
+    off: f64,
+    steps: usize,
+    fix: Option<fieldcraft_lbm::interpolated::MassFix>,
+    tolerance: f64,
+) -> (Vec<(f64, [f64; 3])>, Option<(fieldcraft_lbm::interpolated::InterpolationReport, fieldcraft_lbm::interpolated::InterpolationReport)>) {
+    use fieldcraft_lbm::interpolated::WallOrder;
+    let dx: f64 = 0.05;
+    let mut d = all_periodic([64, 12, 4]);
+    d.faces.y_min = FaceCondition::Wall {};
+    d.faces.y_max = FaceCondition::Wall {};
+    d.acceleration = [0.002, 0.0, 0.0];
+    d.obstacles = vec!["Block".into()];
+    let obstacles =
+        [obstacle("Block", cuboid([(28.0 + off) * dx, (4.0 + off) * dx, -1.0], [(36.0 - off) * dx, (8.0 - off) * dx, 2.0]), &CUBOID_FACES)];
+    let dt: f64 = 0.05 * dx / 0.1;
+    let smag = Some(Turbulence::Smagorinsky { constant: 1e-4, prandtl: 0.9, van_driest: None, wall_model: None });
+    let m = model(1.0, 0.1 / 3.0 * dx * dx / dt, d, procedure(Collision::Hrr, smag));
+    let strip = Strip { first: 24, last: 40, linear: true };
+    let mut r = Refined::new(&m, None, &obstacles, &Limits::default(), strip).unwrap_or_else(|e| panic!("{e}"));
+    let reports = fix.map(|fix| r.interpolate_walls_with(&obstacles, WallOrder::Linear, fix).unwrap_or_else(|e| panic!("{e}")));
+    let mass = r.mass();
+    for _ in 0..steps {
+        r.step().unwrap();
+    }
+    assert!(((r.mass() - mass) / mass).abs() <= tolerance, "mass drift {}", (r.mass() - mass) / mass);
+    (r.composite_moments(), reports)
+}
+
+/// The spread correction holds mass in flight on the two levels, so the composite's mass drifts by a bounded amount (about 1e-6 of
+/// the total at 200 to 800 steps in this case; the local correction is exact to round-off), and a block on the cell faces is untouched.
+#[test]
+fn the_spread_mass_correction_stays_within_a_bounded_drift_on_both_levels() {
+    use fieldcraft_lbm::interpolated::MassFix;
+    let (_, reports) = interpolated_block(0.25, 400, Some(MassFix::Spread), 5e-6);
+    assert!(reports.is_some());
+}
+
+/// A block whose faces lie on the coarse cell faces has every link half way on both levels, so interpolating its walls changes
+/// nothing beyond round-off.
+#[test]
+fn interpolated_walls_on_cell_faces_equal_the_half_way_ones() {
+    use fieldcraft_lbm::interpolated::MassFix;
+    let (plain, _) = interpolated_block(0.0, 200, None, 1e-12);
+    let (interp, reports) = interpolated_block(0.0, 200, Some(MassFix::Local), 1e-12);
+    let (c, f) = reports.unwrap_or_else(|| panic!("no reports"));
+    assert!(c.links > 0 && f.links > 0, "no wall links: {c:?} {f:?}");
+    assert_eq!((c.interpolated, f.interpolated), (0, 0), "{c:?} {f:?}");
+    let worst = plain
+        .iter()
+        .zip(&interp)
+        .map(|(a, b)| (a.0 - b.0).abs().max((0..3).map(|k| (a.1[k] - b.1[k]).abs()).fold(0.0, f64::max)))
+        .fold(0.0, f64::max);
+    assert!(worst <= 1e-12, "interpolated half-way walls moved the flow by {worst:e}");
+}
+
+/// A block between the cell faces interpolates on both levels; mass stays exact, the flow is finite and differs from half way.
+#[test]
+fn interpolated_walls_off_the_cell_faces_act_on_both_levels() {
+    use fieldcraft_lbm::interpolated::MassFix;
+    let (plain, _) = interpolated_block(0.25, 200, None, 1e-12);
+    let (interp, reports) = interpolated_block(0.25, 200, Some(MassFix::Local), 1e-12);
+    let (c, f) = reports.unwrap_or_else(|| panic!("no reports"));
+    assert!(c.interpolated > 0 && f.interpolated > 0, "{c:?} {f:?}");
+    assert!(interp.iter().all(|m| m.0.is_finite() && m.1.iter().all(|v| v.is_finite())));
+    let worst = plain.iter().zip(&interp).map(|(a, b)| (a.1[0] - b.1[0]).abs()).fold(0.0, f64::max);
+    assert!(worst > 1e-9, "interpolation changed nothing ({worst:e})");
+}

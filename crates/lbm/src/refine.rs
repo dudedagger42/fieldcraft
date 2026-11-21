@@ -120,6 +120,9 @@ pub struct Refined {
     replenished: Vec<[f64; Q]>,
     /// Whether the Spalart–Allmaras model runs on both levels.
     sa: bool,
+    /// The setups of the two levels, kept for [`Refined::interpolate_walls_with`].
+    coarse_setup: Setup,
+    fine_setup: Setup,
     /// Scratch of [`Refined::step`]: the ghost cells' populations, kept for its capacity.
     saved: Vec<(usize, [f64; Q])>,
     /// ν̃ of the coarse cells in the same columns as `moments`.
@@ -329,6 +332,8 @@ impl Refined {
             replenish: Vec::new(),
             replenished: vec![[0.0; Q]; 2 * nc[1] * nc[2]],
             sa,
+            coarse_setup,
+            fine_setup,
             saved: Vec::new(),
             nu_tilde: Vec::new(),
             nu_tilde_next: Vec::new(),
@@ -403,6 +408,25 @@ impl Refined {
             }
         }
         Ok(())
+    }
+
+    /// Switch the obstacle walls at rest to interpolated bounce-back on both levels (see
+    /// [`Flow::interpolate_walls_with`]), with the same mass correction on each. Call once, on a fresh
+    /// refined flow, with the obstacles it was built from. Each level finds the surface through its own
+    /// grid; in the two coarse layers at each interface the fine grid's solid cells are the coarse
+    /// grid's, so a link there into a cell the surface does not cut keeps the half-way rule (counted in
+    /// the reports). Returns the coarse and the fine level's reports.
+    pub fn interpolate_walls_with(
+        &mut self,
+        obstacles: &[Obstacle],
+        order: crate::interpolated::WallOrder,
+        fix: crate::interpolated::MassFix,
+    ) -> Result<(crate::interpolated::InterpolationReport, crate::interpolated::InterpolationReport)> {
+        let coarse = self.coarse.interpolate_walls_with(&self.coarse_setup, obstacles, order)?;
+        let fine = self.fine.interpolate_walls_with(&self.fine_setup, obstacles, order)?;
+        self.coarse.set_wall_mass_correction(fix)?;
+        self.fine.set_wall_mass_correction(fix)?;
+        Ok((coarse, fine))
     }
 
     /// The populations of a coarse cell, for studies.
