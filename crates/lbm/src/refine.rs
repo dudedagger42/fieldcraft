@@ -283,9 +283,8 @@ impl Refined {
         if last < first + MIN_COLUMNS {
             return Err(Error::Invalid(format!("the strip {first}..{last} is narrower than {MIN_COLUMNS} coarse columns")));
         }
-        // An absorbing layer works on base cells only: it must stay clear of the strip, its interface columns and their neighbours.
         let layer = coarse.absorbing_cells().iter().map(|&c| coarse.grid().coords(c as usize)[perm[0]]);
-        if let Some(column) = layer.filter(|&c| c + 3 >= first && c <= last + 3).next() {
+        if let Some(column) = layer.find(|&c| c + 3 >= first && c <= last + 3) {
             return Err(Error::Invalid(format!(
                 "not supported yet: an absorbing layer that reaches the strip: its column {column} lies within 3 columns of the strip {first}..{last}; shorten the layer's thickness or move the strip"
             )));
@@ -296,7 +295,6 @@ impl Refined {
         fine_domain.min[perm[0]] = domain.min[perm[0]] + (first - 1) as f64 * dx;
         fine_domain.max[perm[0]] = domain.min[perm[0]] + (last + 1) as f64 * dx;
         fine_domain.spacing = dx / RATIO as f64;
-        // The fine level is periodic along the strip and has no open face: the absorbing layer is the base level's.
         fine_domain.absorbing = None;
         match perm[0] {
             0 => (fine_domain.faces.x_min, fine_domain.faces.x_max) = (FaceCondition::Periodic {}, FaceCondition::Periodic {}),
