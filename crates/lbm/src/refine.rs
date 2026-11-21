@@ -134,6 +134,8 @@ pub struct Refined {
     rescale: bool,
     /// Whether the second fine sub-step reads the coarse data extrapolated to its own time (see [`Refined::time_coupling`]).
     time_coupling: bool,
+    /// The weight of the coarse populations' backward difference in the two fine layers (1/4 by default: the linear fit through the coarse flux times).
+    population_weight: f64,
     /// The coarse moments of the previous step, in the layout of `moments`.
     moments_prev: Vec<Vec<(f64, [f64; 3])>>,
     /// The populations each ghost cell pair received at the previous coarse step (per side, coarse (y, z) cell and fine (dy, dz)).
@@ -350,6 +352,7 @@ impl Refined {
             nu_tilde_next: Vec::new(),
             rescale: false,
             time_coupling: false,
+            population_weight: 0.25,
             moments_prev: Vec::new(),
             ghost_prev: vec![[0.0; Q]; 2 * nc[1] * nc[2] * RATIO * RATIO],
             coupling_primed: false,
@@ -857,7 +860,7 @@ impl Refined {
                                 if self.coupling_primed {
                                     let prev = self.ghost_prev.get(slot).copied().unwrap_or(g);
                                     for &q in &sent {
-                                        g_second[q] = g[q] + 0.5 * (g[q] - prev[q]);
+                                        g_second[q] = g[q] + self.population_weight * (g[q] - prev[q]);
                                         g_first[q] = 2.0 * g[q] - g_second[q];
                                     }
                                 }
@@ -1022,6 +1025,15 @@ impl Refined {
     /// crossing conserves mass and momentum exactly. Off by default: nothing changes then, bit for bit.
     /// (Time interpolation of the coupling data of the two levels: B. Dupuis and B. Chopard, Phys. Rev. E 67:066707 (2003);
     /// O. Lagrava, O. Malaspinas, J. Latt and B. Chopard, J. Comput. Phys. 231:4808 (2012).)
+    /// The weight `w` of the coarse populations' backward difference in the two fine layers: they carry `a_t ∓ w (a_t − a_(t−1))`.
+    /// The default 1/4 is the linear fit through the coarse flux times (a standing acoustic wave through the strip then decays as in the unrefined run, to 2e-6 per period); 1/2 over-corrects and adds energy. Needs [`Refined::time_coupling`];
+    /// a non-finite `w` is ignored. The two layers still sum to `2 a_t`, so mass is untouched.
+    pub fn time_coupling_weight(&mut self, w: f64) {
+        if w.is_finite() {
+            self.population_weight = w.clamp(0.0, 1.0);
+        }
+    }
+
     pub fn time_coupling(&mut self, on: bool) {
         self.time_coupling = on;
         self.coupling_primed = false;
