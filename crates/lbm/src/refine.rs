@@ -69,7 +69,7 @@
 //! One strip with interfaces normal to one box axis ([`Refined::new_along`]; x for [`Refined::new`]), spanning the box in the other two; the hybrid recursive
 //! regularised or regularised collision with no eddy-viscosity model but Spalart–Allmaras (also
 //! with DDES; a Smagorinsky constant below 1e-3 is allowed: it is how a low τ is admitted); no heat, free surface, porous zone, fan,
-//! absorbing layer, moving wall or obstacle surface condition; no wall-function bounce. Each is
+//! moving wall or obstacle surface condition; an absorbing layer only clear of the strip (3 columns), on the base level; no wall-function bounce. Each is
 //! refused with the reason.
 
 use fieldcraft_model::{Collision, FaceCondition, Model, Procedure, Turbulence};
@@ -244,9 +244,6 @@ impl Refined {
         if !domain.porous.is_empty() || !domain.fans.is_empty() {
             return refuse("porous zones and fans");
         }
-        if domain.absorbing.is_some() {
-            return refuse("an absorbing layer");
-        }
         if !domain.surfaces.is_empty() {
             return refuse("conditions on obstacle surfaces");
         }
@@ -284,12 +281,21 @@ impl Refined {
         if last < first + MIN_COLUMNS {
             return Err(Error::Invalid(format!("the strip {first}..{last} is narrower than {MIN_COLUMNS} coarse columns")));
         }
+        // An absorbing layer works on base cells only: it must stay clear of the strip, its interface columns and their neighbours.
+        let layer = coarse.absorbing_cells().iter().map(|&c| coarse.grid().coords(c as usize)[perm[0]]);
+        if let Some(column) = layer.filter(|&c| c + 3 >= first && c <= last + 3).next() {
+            return Err(Error::Invalid(format!(
+                "not supported yet: an absorbing layer that reaches the strip: its column {column} lies within 3 columns of the strip {first}..{last}; shorten the layer's thickness or move the strip"
+            )));
+        }
         // The fine model: the strip and a ghost column on each side, half the spacing and time step.
         let dx = domain.spacing;
         let mut fine_domain = domain.clone();
         fine_domain.min[perm[0]] = domain.min[perm[0]] + (first - 1) as f64 * dx;
         fine_domain.max[perm[0]] = domain.min[perm[0]] + (last + 1) as f64 * dx;
         fine_domain.spacing = dx / RATIO as f64;
+        // The fine level is periodic along the strip and has no open face: the absorbing layer is the base level's.
+        fine_domain.absorbing = None;
         match perm[0] {
             0 => (fine_domain.faces.x_min, fine_domain.faces.x_max) = (FaceCondition::Periodic {}, FaceCondition::Periodic {}),
             1 => (fine_domain.faces.y_min, fine_domain.faces.y_max) = (FaceCondition::Periodic {}, FaceCondition::Periodic {}),

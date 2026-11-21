@@ -118,12 +118,12 @@ fn what_is_not_supported_is_refused_with_the_reason() {
     refused(build(closed_box(), procedure(Collision::Hrr, Some(sa_wall)), STRIP, &[]), "eddy-viscosity");
     let vreman = Turbulence::Vreman { constant: 0.18, prandtl: 0.9, wall_model: None };
     refused(build(closed_box(), procedure(Collision::Hrr, Some(vreman)), STRIP, &[]), "eddy-viscosity");
-    // An absorbing layer.
+    // An absorbing layer that reaches the strip (a layer clear of it is accepted: see the absorbing-layer test).
     let mut d = closed_box();
     d.faces.x_min = FaceCondition::Velocity { velocity: [0.1, 0.0, 0.0], profile: fieldcraft_model::Profile::Uniform };
     d.faces.x_max = FaceCondition::Pressure { pressure: 0.0, outflow: fieldcraft_model::Outflow::Uniform };
     d.absorbing = Some(fieldcraft_model::AbsorbingLayer { thickness: None, strength: None, filter_time: None });
-    refused(build(d, procedure(Collision::Hrr, None), STRIP, &[]), "absorbing");
+    refused(build(d, procedure(Collision::Hrr, None), Strip { first: 8, last: 20, linear: true }, &[]), "absorbing");
     // A strip too close to the box face, or too narrow.
     refused(build(closed_box(), procedure(Collision::Hrr, None), Strip { first: 1, last: 12, linear: true }, &[]), "inside");
     refused(build(closed_box(), procedure(Collision::Hrr, None), Strip { first: 12, last: 18, linear: true }, &[]), "narrower");
@@ -1680,4 +1680,49 @@ fn a_flow_between_slip_walls_keeps_its_momentum_through_the_strip() {
     let spread = m.iter().map(|(_, v)| (v[0] - u).abs()).fold(0.0f64, f64::max);
     assert!((mean - u).abs() < 1e-7, "mean speed {mean:e} against {u:e}");
     assert!(spread < 1e-6, "the speed departs from the plug by {spread:e}");
+}
+
+/// An absorbing layer at the open faces of a refined box, clear of the strip, works on the base level as it does without
+/// a strip: the layer cells are the plain flow's, and a density pulse that leaves the strip in both directions is
+/// absorbed instead of coming back from the faces. A layer that reaches the strip is refused with the columns.
+#[test]
+fn an_absorbing_layer_clear_of_the_strip_absorbs_what_leaves_it() {
+    let n = [96, 4, 4];
+    let strip = Strip { first: 36, last: 60, linear: true };
+    let dx: f64 = 0.05;
+    let dt: f64 = 0.05 * dx / 0.1;
+    let nu = 5.1e-3 / 3.0 * dx * dx / dt;
+    let box_with = |layer: Option<f64>| {
+        let mut d = all_periodic(n);
+        d.faces.x_min = FaceCondition::Velocity { velocity: [0.0, 0.0, 0.0], profile: fieldcraft_model::Profile::Uniform };
+        d.faces.x_max = FaceCondition::Pressure { pressure: 0.0, outflow: fieldcraft_model::Outflow::Uniform };
+        d.absorbing = layer.map(|t| fieldcraft_model::AbsorbingLayer { thickness: Some(t * dx), strength: None, filter_time: None });
+        let smag = Some(Turbulence::Smagorinsky { constant: 1e-4, prandtl: 0.9, van_driest: None, wall_model: None });
+        model(1.0, nu, d, procedure(Collision::Hrr, smag))
+    };
+    // 10 columns at each face: clear of the strip (columns 36..60) by more than 3.
+    let rms_after = |layer: Option<f64>| {
+        let mut r = Refined::new(&box_with(layer), None, &[], &Limits::default(), strip).unwrap_or_else(|e| panic!("{e}"));
+        if layer.is_some() {
+            let cells = r.coarse().absorbing_cells();
+            assert!(!cells.is_empty());
+            let g = r.coarse().grid();
+            assert!(cells.iter().all(|&c| {
+                let x = g.coords(c as usize)[0];
+                x < 10 || x >= 86
+            }));
+        }
+        r.initialise(&|x| (1.0 + 1e-3 * (-((x[0] - 48.0) / 4.0).powi(2)).exp(), [0.0; 3]));
+        for _ in 0..700 {
+            r.step().unwrap();
+        }
+        let m = r.composite_moments();
+        (m.iter().map(|(rho, _)| (rho - 1.0) * (rho - 1.0)).sum::<f64>() / m.len() as f64).sqrt()
+    };
+    let (open, absorbed) = (rms_after(None), rms_after(Some(10.0)));
+    assert!(absorbed < 0.5 * open, "the layer left {absorbed:e} of {open:e}");
+    // A layer that reaches the strip.
+    let near = Strip { first: 20, last: 60, linear: true };
+    let e = Refined::new(&box_with(Some(18.0)), None, &[], &Limits::default(), near).err().map(|e| e.to_string()).unwrap_or_default();
+    assert!(e.contains("not supported yet") && e.contains("absorbing layer") && e.contains("20..60"), "{e}");
 }
