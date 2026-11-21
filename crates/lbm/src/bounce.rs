@@ -62,11 +62,15 @@
 //! concave corner (two wall directions) has no normal and only bounces. A stress a node can't
 //! carry is set to zero, so the wall takes exactly the stress it applies. A plane node runs [`on_node`] unchanged.
 //!
-//! **Where it runs.** On walls at rest: plane box faces with the box periodic along them, and
-//! obstacles. Moving walls and obstacle faces, a box-face wall meeting another face that is not
-//! periodic, an obstacle's node in the layer of an inlet, outlet or slip face, and heat are
-//! refused ("not supported yet"). The GPU backend runs the plane box-face scheme
-//! (`crates/lbm-gpu/src/lbm.wgsl`, `node_bounce`) and refuses the rest.
+//! **Junctions.** Where a wall meets an inlet, outlet or slip face, the cell in that face's layer
+//! keeps the face's rule and is no node (one rule per cell, as at the edge of two open faces): its
+//! links to the wall stay halfway bounce-back, and the node beside it treats it as fluid. Walls
+//! that meet at an edge or corner of the box give corner nodes, which only bounce.
+//!
+//! **Where it runs.** On walls at rest: box faces and obstacles. Moving walls and obstacle faces,
+//! and heat, are refused ("not supported yet"), as is a geometry that leaves no fluid cell. The
+//! GPU backend runs the plane box-face scheme (`crates/lbm-gpu/src/lbm.wgsl`, `node_bounce`) and
+//! refuses the rest.
 //!
 //! No code of any lattice Boltzmann package was read; this is written from the paper.
 
@@ -410,7 +414,6 @@ impl WallNodes {
             w.stress = [0.0; 3];
             let axis = usize::from(w.axis).min(2);
             let inward = i32::from(w.inward);
-            // A node with no Han link along its normal has no fluid node to sample.
             if !w.sampled() {
                 return;
             }
