@@ -1297,3 +1297,75 @@ fn the_non_equilibrium_rescaling_keeps_mass_and_a_uniform_flow() {
         c0.iter().zip(&c).map(|(a, b)| (a.0 - b.0).abs().max((0..3).map(|k| (a.1[k] - b.1[k]).abs()).fold(0.0, f64::max))).fold(0.0f64, f64::max);
     assert!(worst <= 1e-12, "the uniform state moved by {worst:e}");
 }
+
+/// The time coupling is off by default: switching it off explicitly changes nothing, bit for bit.
+#[test]
+fn the_time_coupling_is_off_by_default() {
+    let mut a = refined(closed_box(), STRIP).unwrap_or_else(|e| panic!("{e}"));
+    let mut b = refined(closed_box(), STRIP).unwrap_or_else(|e| panic!("{e}"));
+    b.time_coupling(false);
+    for _ in 0..200 {
+        a.step().unwrap();
+        b.step().unwrap();
+    }
+    assert_eq!(a.composite_moments(), b.composite_moments());
+}
+
+/// With the time coupling on: the mass of a closed box is conserved to round-off, a uniform flow stays uniform, the
+/// flow differs from the one without it, and a grid-scale checkerboard still decays across the strip.
+#[test]
+fn the_time_coupling_keeps_mass_a_uniform_flow_and_the_checkerboard_decay() {
+    let mut r = refined(closed_box(), STRIP).unwrap_or_else(|e| panic!("{e}"));
+    let mut plain = refined(closed_box(), STRIP).unwrap_or_else(|e| panic!("{e}"));
+    r.time_coupling(true);
+    let m0 = r.mass();
+    let mut worst = 0.0f64;
+    for step in 0..600 {
+        r.step().unwrap();
+        plain.step().unwrap();
+        if step % 50 == 49 {
+            worst = worst.max(((r.mass() - m0) / m0).abs());
+        }
+    }
+    assert!(worst <= 1e-12, "relative mass drift {worst:e}");
+    let (a, b) = (r.composite_moments(), plain.composite_moments());
+    let moved = a.iter().zip(&b).map(|(x, y)| (x.1[0] - y.1[0]).abs()).fold(0.0f64, f64::max);
+    assert!(moved > 1e-9, "the time coupling changed nothing ({moved:e})");
+    let mut u = refined(periodic_box(), STRIP).unwrap_or_else(|e| panic!("{e}"));
+    u.time_coupling(true);
+    let c0 = u.composite_moments();
+    for _ in 0..200 {
+        u.step().unwrap();
+    }
+    let c = u.composite_moments();
+    let worst =
+        c0.iter().zip(&c).map(|(a, b)| (a.0 - b.0).abs().max((0..3).map(|k| (a.1[k] - b.1[k]).abs()).fold(0.0, f64::max))).fold(0.0f64, f64::max);
+    assert!(worst <= 1e-12, "the uniform state moved by {worst:e}");
+    for eps in [2.4e-4, 1e-2] {
+        for density in [false, true] {
+            let n = [48, 4, 4];
+            let strip = Strip { first: 16, last: 32, linear: true };
+            let a0 = 1e-3;
+            let state = move |x: [f64; 3]| {
+                let s = if (16.0..32.0).contains(&x[0]) { 2.0 } else { 1.0 };
+                let parity = (0..3).map(|a| (x[a] * s).floor() as i64).sum::<i64>().rem_euclid(2);
+                let v = if parity == 0 { a0 } else { -a0 };
+                if density { (1.0 + v, [0.0; 3]) } else { (1.0, [0.0, v, 0.0]) }
+            };
+            let mut r = wave_pair(n, strip, eps);
+            r.time_coupling(true);
+            r.initialise(&state);
+            let worst = |r: &Refined| {
+                r.composite_moments()
+                    .iter()
+                    .map(|(rho, u)| (rho - 1.0).abs().max(u.iter().fold(0.0f64, |m, v| m.max(v.abs()))))
+                    .fold(0.0f64, f64::max)
+            };
+            for step in 0..400 {
+                r.step().unwrap();
+                assert!(worst(&r) <= 1.5 * a0, "eps {eps:e} density {density}: the checkerboard grew to {:e} at step {step}", worst(&r));
+            }
+            assert!(worst(&r) <= 0.5 * a0, "eps {eps:e} density {density}: left {:e} of {a0:e} after 400 steps", worst(&r));
+        }
+    }
+}

@@ -132,6 +132,14 @@ pub struct Refined {
     /// Whether the non-equilibrium part of the populations that cross the interface is rescaled between the levels
     /// (see [`Refined::rescale_non_equilibrium`]). Off by default.
     rescale: bool,
+    /// Whether the second fine sub-step reads the coarse data extrapolated to its own time (see [`Refined::time_coupling`]).
+    time_coupling: bool,
+    /// The coarse moments of the previous step, in the layout of `moments`.
+    moments_prev: Vec<Vec<(f64, [f64; 3])>>,
+    /// The populations each ghost cell pair received at the previous coarse step (per side, coarse (y, z) cell and fine (dy, dz)).
+    ghost_prev: Vec<[f64; Q]>,
+    /// Whether `moments_prev` and `ghost_prev` hold the previous step.
+    coupling_primed: bool,
 }
 
 /// What the interface columns hold, see [`Refined::interface_report`].
@@ -341,6 +349,10 @@ impl Refined {
             nu_tilde: Vec::new(),
             nu_tilde_next: Vec::new(),
             rescale: false,
+            time_coupling: false,
+            moments_prev: Vec::new(),
+            ghost_prev: vec![[0.0; Q]; 2 * nc[1] * nc[2] * RATIO * RATIO],
+            coupling_primed: false,
         };
         refined.check_interface_cells()?;
         // The ghost cells hold nothing between steps.
@@ -594,6 +606,7 @@ impl Refined {
 
     /// ρ and u of the coarse cells in the columns that the ghost interpolation reads.
     fn snapshot_moments(&mut self) {
+        self.moments_prev = std::mem::take(&mut self.moments);
         let Strip { first, last, .. } = self.strip;
         let [_, ny, nz] = self.nc;
         let columns = [first - 2, first - 1, first, last - 1, last, last + 1];
@@ -715,11 +728,20 @@ impl Refined {
     }
 
     /// The coarse moments at fine ghost cell `(dx, yf, zf)` of `side`.
-    fn interpolate(&self, side: usize, dx: usize, yf: usize, zf: usize) -> (f64, [f64; 3]) {
+    fn interpolate(&self, side: usize, dx: usize, yf: usize, zf: usize, later: f64) -> (f64, [f64; 3]) {
         let mut rho = 0.0;
         let mut j = [0.0; 3];
         for (c, i, w) in self.stencil(side, dx, yf, zf) {
-            let (r, u) = self.moments.get(c).and_then(|m| m.get(i)).copied().unwrap_or((1.0, [0.0; 3]));
+            let (mut r, mut u) = self.moments.get(c).and_then(|m| m.get(i)).copied().unwrap_or((1.0, [0.0; 3]));
+            if self.time_coupling && self.coupling_primed && later > 0.0 {
+                // The coarse state at `later` of a coarse step after the snapshot, extrapolated from the last two.
+                if let Some(&(rp, up)) = self.moments_prev.get(c).and_then(|m| m.get(i)) {
+                    r += later * (r - rp);
+                    for a in 0..3 {
+                        u[a] += later * (u[a] - up[a]);
+                    }
+                }
+            }
             rho += w * r;
             for a in 0..3 {
                 j[a] += w * u[a];
@@ -749,7 +771,7 @@ impl Refined {
                 for yf in 0..RATIO * ny {
                     for dx in 0..RATIO {
                         let xf = if side == 0 { dx } else { self.nf[0] - RATIO + dx };
-                        let (rho, u) = self.interpolate(side, dx, yf, zf);
+                        let (rho, u) = self.interpolate(side, dx, yf, zf, later);
                         let cell = self.fidx([xf, yf, zf]);
                         if !self.fine.is_fluid(cell) {
                             continue;
@@ -826,6 +848,23 @@ impl Refined {
                             for &q in &sent {
                                 g[q] = a[q] + oy * sy[q] + oz * sz[q];
                             }
+                            // With the time coupling: the layer that reaches the strip in the second fine sub-step carries the
+                            // value extrapolated to its time, the layer that reaches it in the first one the rest, so the pair
+                            // still sums to what the coarse cell gave up.
+                            let slot = (((side * nz + z) * ny + y) * RATIO + dz) * RATIO + dy;
+                            let (mut g_first, mut g_second) = (g, g);
+                            if self.time_coupling {
+                                if self.coupling_primed {
+                                    let prev = self.ghost_prev.get(slot).copied().unwrap_or(g);
+                                    for &q in &sent {
+                                        g_second[q] = g[q] + 0.5 * (g[q] - prev[q]);
+                                        g_first[q] = 2.0 * g[q] - g_second[q];
+                                    }
+                                }
+                                if let Some(p) = self.ghost_prev.get_mut(slot) {
+                                    *p = g;
+                                }
+                            }
                             // Next to a wall the reflection of the cell's own outgoing population, which a ghost
                             // cell does not have, would give the population that the inner ghost cell passes on in the second fine step.
                             let inner = if side == 0 { RATIO - 1 } else { 0 };
@@ -834,12 +873,12 @@ impl Refined {
                             let xi = if side == 0 { RATIO - 1 } else { self.nf[0] - RATIO };
                             for &q in &sent {
                                 if !self.tangential_fluid(false, xi, yf - i64::from(cdir(self.perm, q, 1)), zf - i64::from(cdir(self.perm, q, 2))) {
-                                    self.replenish.push((fine_cell, q, g[q], (side * nz + z) * ny + y));
+                                    self.replenish.push((fine_cell, q, g_second[q], (side * nz + z) * ny + y));
                                 }
                             }
                             for dx in 0..RATIO {
                                 let cell = self.ghost(side, y, z, [dx, dy, dz]);
-                                self.fine.set_cell_populations(cell, &g);
+                                self.fine.set_cell_populations(cell, if dx == inner { &g_first } else { &g_second });
                             }
                         }
                     }
@@ -973,6 +1012,21 @@ impl Refined {
         self.rescale = on;
     }
 
+    /// Switch on (or off) the time coupling of the second fine sub-step.
+    ///
+    /// Without it the second sub-step (fine time t + ½ of a coarse step) reads the coarse state of time t: the
+    /// ghost cells' density and velocity for the strain stencil, and the populations the ghost layer pushes into the strip.
+    /// That is a lag of half a coarse step, first order in the time step. With it both are extrapolated linearly in time from
+    /// the last two coarse steps (the first step has no previous one and runs as without). The two ghost layers carry the
+    /// extrapolated population and its complement, so that together they still equal what the coarse cell gives up: each
+    /// crossing conserves mass and momentum exactly. Off by default: nothing changes then, bit for bit.
+    /// (Time interpolation of the coupling data of the two levels: B. Dupuis and B. Chopard, Phys. Rev. E 67:066707 (2003);
+    /// O. Lagrava, O. Malaspinas, J. Latt and B. Chopard, J. Comput. Phys. 231:4808 (2012).)
+    pub fn time_coupling(&mut self, on: bool) {
+        self.time_coupling = on;
+        self.coupling_primed = false;
+    }
+
     /// The factor on the non-equilibrium part of populations passing from the coarse to the fine level.
     fn rescale_factor(&self) -> f64 {
         let (tc, tf) = (1.0 / self.coarse.omegas().0, 1.0 / self.fine.omegas().0);
@@ -1041,6 +1095,7 @@ impl Refined {
         self.saved = saved;
         self.fine.step_stream()?;
         self.restrict();
+        self.coupling_primed = self.time_coupling;
         Ok(())
     }
 
