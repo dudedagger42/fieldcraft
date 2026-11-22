@@ -1342,8 +1342,7 @@ fn the_non_equilibrium_rescaling_keeps_mass_and_a_uniform_flow() {
         u.step().unwrap();
     }
     let c = u.composite_moments();
-    let worst =
-        c0.iter().zip(&c).map(|(a, b)| (a.0 - b.0).abs().max((0..3).map(|k| (a.1[k] - b.1[k]).abs()).fold(0.0, f64::max))).fold(0.0f64, f64::max);
+    let worst = c0.iter().zip(&c).map(|(a, b)| (a.0 - b.0).abs().max((0..3).map(|k| (a.1[k] - b.1[k]).abs()).fold(0.0, f64::max))).fold(0.0f64, f64::max);
     assert!(worst <= 1e-12, "the uniform state moved by {worst:e}");
 }
 
@@ -1387,8 +1386,7 @@ fn the_time_coupling_keeps_mass_a_uniform_flow_and_the_checkerboard_decay() {
         u.step().unwrap();
     }
     let c = u.composite_moments();
-    let worst =
-        c0.iter().zip(&c).map(|(a, b)| (a.0 - b.0).abs().max((0..3).map(|k| (a.1[k] - b.1[k]).abs()).fold(0.0, f64::max))).fold(0.0f64, f64::max);
+    let worst = c0.iter().zip(&c).map(|(a, b)| (a.0 - b.0).abs().max((0..3).map(|k| (a.1[k] - b.1[k]).abs()).fold(0.0, f64::max))).fold(0.0f64, f64::max);
     assert!(worst <= 1e-12, "the uniform state moved by {worst:e}");
     for eps in [2.4e-4, 1e-2] {
         for density in [false, true] {
@@ -1761,4 +1759,100 @@ fn an_absorbing_layer_clear_of_the_strip_absorbs_what_leaves_it() {
     let near = Strip { first: 20, last: 60, linear: true };
     let e = Refined::new(&box_with(Some(18.0)), None, &[], &Limits::default(), near).err().map(|e| e.to_string()).unwrap_or_default();
     assert!(e.contains("not supported yet") && e.contains("absorbing layer") && e.contains("20..60"), "{e}");
+}
+
+// ---- the shear stress through the interface --------------------------------------------------
+
+/// Amplitude of `u_x` in column `x` of a periodic wave `sin(2π y / ny)` over the exact decay after `steps` steps.
+fn wave_over_exact(r: &Refined, m: &[(f64, [f64; 3])], x: usize, ny: usize, amp: f64, eps: f64, steps: usize) -> f64 {
+    let k = 2.0 * std::f64::consts::PI / ny as f64;
+    let g = r.coarse().grid();
+    let a = (0..ny).map(|y| m[g.index([x, y, 1])].1[0] * (k * (y as f64 + 0.5)).sin()).sum::<f64>() * 2.0 / ny as f64 / amp;
+    a / (-(eps / 3.0) * k * k * steps as f64).exp()
+}
+
+/// A shear wave along the interface of a periodic box (48 coarse columns, a strip of 24 fine ones in the middle, 24 rows):
+/// the wave in the coarse region against the coarse flow alone, and in the strip against a uniform fine run, as relative
+/// differences. The strip readout is a mean over 2 x 2 x 2 fine cells, a quarter of a coarse cell off the centre along y,
+/// which scales the wave by cos(k / 4). The amplitude is small because the interface error also has a part that grows with the
+/// amplitude (the u² of the equilibrium; below 1e-3 the result no longer changes).
+fn shear_through_the_strip(steps: usize) -> (f64, f64) {
+    let (nx, ny, amp, eps) = (48, 24, 1e-3, 5.1e-3);
+    let strip = Strip { first: 12, last: 36, linear: true };
+    let k = 2.0 * std::f64::consts::PI / ny as f64;
+    let state = move |x: [f64; 3]| (1.0, [amp * (k * x[1]).sin(), 0.0, 0.0]);
+    let (mut with, mut without) = (wave_pair([nx, ny, 4], strip, eps), wave_pair([nx, ny, 4], strip, eps));
+    // The uniform fine run: half the spacing, twice τ − ½ per step, and the wave's wavelength is twice the rows.
+    let kf = k / 2.0;
+    let mut fine = wave_pair([16, 2 * ny, 4], Strip { first: 4, last: 12, linear: true }, 2.0 * eps);
+    with.initialise(&state);
+    without.initialise(&state);
+    fine.initialise(&move |x: [f64; 3]| (1.0, [amp * (kf * x[1]).sin(), 0.0, 0.0]));
+    for _ in 0..steps {
+        with.step().unwrap();
+        without.step_unrefined().unwrap();
+        fine.step_unrefined().unwrap();
+        fine.step_unrefined().unwrap();
+    }
+    let (cm, rm, fm) = (with.composite_moments(), without.coarse_moments(), fine.coarse_moments());
+    let outside = wave_over_exact(&with, &cm, 0, ny, amp, eps, steps) / wave_over_exact(&without, &rm, 0, ny, amp, eps, steps) - 1.0;
+    let strip_wave = wave_over_exact(&with, &cm, nx / 2, ny, amp, eps, steps) / (k / 4.0).cos();
+    let fine_wave = wave_over_exact(&fine, &fm, 5, 2 * ny, amp, 2.0 * eps, 2 * steps);
+    (outside, strip_wave / fine_wave - 1.0)
+}
+
+/// The stress the coarse level hands to the strip is the fine level's: the wave decays in the strip as in the uniform
+/// fine run (within 0.25 %) and in the coarse region as in the coarse flow alone (within 0.2 %).
+#[test]
+#[ignore = "expected to fail until the layer shift"]
+fn the_shear_stress_through_the_interface_is_the_fine_levels() {
+    let (outside, strip) = shear_through_the_strip(1500);
+    assert!(
+        outside.abs() < 2e-3 && strip.abs() < 2.5e-3,
+        "coarse region {outside:+.2e} against coarse-only, strip {strip:+.2e} against uniform fine"
+    );
+}
+
+/// The same after 4000 steps, where the error of a missing correction has grown to 1 %: the strip is within 0.5 % of the uniform fine run (its
+/// remaining 0.34 % is the error of the interface itself) and the coarse region within 0.2 % of the coarse flow alone.
+#[test]
+#[ignore = "heavy: cargo xtask test --heavy (CI heavy job); fails until the layer shift"]
+fn the_shear_stress_through_the_interface_is_the_fine_levels_long() {
+    let (outside, strip) = shear_through_the_strip(4000);
+    assert!(outside.abs() < 2e-3 && strip.abs() < 5e-3, "coarse region {outside:+.2e} against coarse-only, strip {strip:+.2e} against uniform fine");
+}
+
+/// A driven channel (48 x 24 x 4 coarse cells, walls on y, a strip of 24 fine columns in the middle) between the coarse flow
+/// alone and the uniform fine one: the mean flux through the strip lies between the two, within the fine run's own.
+#[test]
+#[ignore = "heavy: cargo xtask test --heavy (CI heavy job); fails until the layer shift"]
+fn a_driven_channel_through_the_strip_carries_a_flux_between_the_coarse_and_the_fine_runs() {
+    let (nx, ny, eps, steps) = (48usize, 24usize, 5.1e-3, 40000usize);
+    let setup = |n: [usize; 3], eps: f64, strip: Strip| {
+        let nu = eps / 3.0;
+        let accel = 12.0 * nu * 0.02 / (n[1] * n[1]) as f64;
+        let mut r = wave_pair_with(n, strip, eps, true, accel);
+        let h = n[1] as f64;
+        r.initialise(&move |x| (1.0, [accel / (2.0 * nu) * x[1] * (h - x[1]), 0.0, 0.0]));
+        r
+    };
+    let middle = Strip { first: 12, last: 36, linear: true };
+    let flux = |r: &Refined, composite: bool| {
+        let m = if composite { r.composite_moments() } else { r.coarse_moments() };
+        m.iter().map(|(rho, u)| rho * u[0]).sum::<f64>() / m.len() as f64
+    };
+    let (mut with, mut coarse, mut fine) = (
+        setup([nx, ny, 4], eps, middle),
+        setup([nx, ny, 4], eps, middle),
+        setup([16, 2 * ny, 4], 2.0 * eps, Strip { first: 4, last: 12, linear: true }),
+    );
+    for _ in 0..steps {
+        with.step().unwrap();
+        coarse.step_unrefined().unwrap();
+        fine.step_unrefined().unwrap();
+        fine.step_unrefined().unwrap();
+    }
+    let (fw, fc, ff) = (flux(&with, true), flux(&coarse, false), flux(&fine, false));
+    eprintln!("flux: composite {fw:.6e}, coarse only {fc:.6e}, uniform fine {ff:.6e}");
+    assert!(fc < fw && fw < ff, "the composite flux {fw:e} is not between the coarse-only {fc:e} and the uniform fine {ff:e}");
 }
