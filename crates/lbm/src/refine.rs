@@ -1047,6 +1047,12 @@ impl Refined {
     /// fine to coarse, with τ = 1/ω⁺ of each level. The change of the populations that cross is projected so that its
     /// mass and its momentum along the interface vanish (the momentum across it equals the mass for these directions): the
     /// crossing stays conservative. Off by default: nothing changes then, bit for bit.
+    ///
+    /// Do not switch it on: it is not usable as it stands. The populations the outer ghost layer gave up early at a wall
+    /// (`pending`) join the crossing set after the fine-to-coarse rescale, not in it, and the rescale is unstable near the interface.
+    /// Rescaling them with the set does not make it work either: the projection that keeps the momentum along the interface
+    /// unchanged removes exactly the shear part (the c_y-odd non-equilibrium), so on a shear flow the rescale does nothing by
+    /// construction.
     pub fn rescale_non_equilibrium(&mut self, on: bool) -> Result<()> {
         self.rescale = on;
         if on {
