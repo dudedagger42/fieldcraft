@@ -424,6 +424,12 @@ impl Refined {
         self.fine.sa_value(self.fine.grid().index([x, y, z])).map(|v| v / RATIO as f64)
     }
 
+    /// The hybrid collision's wall-layer σ = 1 rule on both levels (1 by default, 0 off), see [`Flow::set_wall_layer_sigma_one`].
+    pub fn set_wall_layer_sigma_one(&mut self, mode: u8) {
+        self.coarse.set_wall_layer_sigma_one(mode);
+        self.fine.set_wall_layer_sigma_one(mode);
+    }
+
     /// Both levels transport ν̃ without production or destruction, for verification.
     pub fn set_sa_transport_only(&mut self) {
         self.coarse.set_sa_model(false);

@@ -956,6 +956,9 @@ fn walls_made_of_obstacles_act_like_the_box_walls_at_the_interface() {
         Refined::new(&box_model(walls, procedure(Collision::Hrr, None)), None, &[], &Limits::default(), strip).unwrap_or_else(|e| panic!("{e}"));
     let mut b = Refined::new(&box_model(slabs, procedure(Collision::Hrr, None)), None, &obstacles, &Limits::default(), strip)
         .unwrap_or_else(|e| panic!("{e}"));
+    // The walls are what is compared: the σ = 1 rule (on by default) takes another share of the density mode at a box face than at an obstacle's solid cells.
+    a.set_wall_layer_sigma_one(0);
+    b.set_wall_layer_sigma_one(0);
     let (m0, m1) = (a.mass(), b.mass());
     assert!((m0 - m1).abs() < 1e-9 * m0, "the same fluid: {m0} against {m1}");
     for _ in 0..400 {

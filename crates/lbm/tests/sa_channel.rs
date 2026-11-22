@@ -420,6 +420,49 @@ fn the_wall_layer_sigma_leaves_a_wall_law_channel_bit_identical() {
     assert!(velocities(0) == velocities(1));
 }
 
+/// The hybrid collision's wall-layer σ = 1 rule is on by default, and mode 0 is the behaviour before it was: on a half-way channel
+/// between obstacle slabs, with no wall law, the default run is the explicit mode 1 bit for bit, the rule changes the flow, and the opt-out
+/// reproduces the hash recorded with the rule absent (the default before the rule was switched on).
+#[test]
+fn the_wall_layer_sigma_rule_is_on_by_default_and_mode_zero_is_the_old_behaviour() {
+    let channel = Channel {
+        re_tau: 20.0,
+        cells: 8,
+        bulk_guess: 12.0,
+        lattice_bulk: 0.1,
+        collision: Collision::Hrr,
+        sigma: Some(0.95),
+        turbulence: None,
+        on_node: false,
+        slabs: true,
+        max_steps: 1,
+        sample: 100,
+        settling: GATED,
+    };
+    let run = |mode: Option<u8>| {
+        let (_, mut flow) = prepare(&channel.model(), &channel.obstacles());
+        assert_eq!(flow.wall_layer_sigma_one(), 1, "the rule is on by default");
+        assert!(flow.wall_sigma_layer_mask().iter().any(|&m| m), "the half-way slab walls have a layer for the rule");
+        if let Some(mode) = mode {
+            flow.set_wall_layer_sigma_one(mode);
+        }
+        for _ in 0..200 {
+            flow.step().unwrap();
+        }
+        (0..flow.grid().len())
+            .flat_map(|c| flow.moments(c).map_or([f64::NAN; 4], |(r, u)| [r, u[0], u[1], u[2]]))
+            .fold(0xcbf2_9ce4_8422_2325u64, |h, x| (h ^ x.to_bits()).wrapping_mul(0x0000_0100_0000_01b3))
+    };
+    let (default, on, off) = (run(None), run(Some(1)), run(Some(0)));
+    println!("sigma rule hashes: default {default:#018x} on {on:#018x} off {off:#018x}");
+    assert_eq!(default, on, "the default is the rule on");
+    assert_ne!(on, off, "the rule acts on a half-way wall");
+    assert_eq!(
+        off, 0xe68c_caf8_0bc4_26d7,
+        "the opt-out is the behaviour before the rule (the hash of the run at the commit before the rule was the default)"
+    );
+}
+
 /// The layer MRT study's wall layer on a channel whose walls are the domain's faces (no solid cells): the fluid rows beside the two
 /// wall faces, and nothing else (the other axes are periodic).
 #[test]
