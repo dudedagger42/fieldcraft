@@ -892,8 +892,19 @@ impl Refined {
                                     *p = g;
                                 }
                             }
+                            // The two layers are half a fine step apart in time, and a population moves half a coarse cell
+                            // along c per fine step: the inner layer takes the transverse profile a quarter cell upstream
+                            // of the outer one. Without it both carry the coarse post-collision shear stress, twice the
+                            // fine value. The shifts are opposite, so the pair still sums to what the coarse cell gave up.
+                            if linear {
+                                for &q in &sent {
+                                    let shift = 0.25 * (f64::from(cdir(self.perm, q, 1)) * sy[q] + f64::from(cdir(self.perm, q, 2)) * sz[q]);
+                                    g_first[q] -= shift;
+                                    g_second[q] += shift;
+                                }
+                            }
                             // Next to a wall the reflection of the cell's own outgoing population, which a ghost
-                            // cell does not have, would give the population that the inner ghost cell passes on in the second fine step.
+                            // cell does not have, is what the inner layer passes on in the second fine step: it takes the inner value.
                             let inner = if side == 0 { RATIO - 1 } else { 0 };
                             let fine_cell = self.ghost(side, y, z, [inner, dy, dz]);
                             let (yf, zf) = ((RATIO * y + dy) as i64, (RATIO * z + dz) as i64);
@@ -901,7 +912,7 @@ impl Refined {
                             for &q in &sent {
                                 let (ty, tz) = (yf - i64::from(cdir(self.perm, q, 1)), zf - i64::from(cdir(self.perm, q, 2)));
                                 if !self.tangential_fluid(false, xi, ty, tz) && !self.slip_beyond(false, ty, tz) {
-                                    self.replenish.push((fine_cell, q, g_second[q], (side * nz + z) * ny + y));
+                                    self.replenish.push((fine_cell, q, g_first[q], (side * nz + z) * ny + y));
                                 }
                             }
                             for dx in 0..RATIO {

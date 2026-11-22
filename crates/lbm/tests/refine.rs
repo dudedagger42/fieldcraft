@@ -1804,7 +1804,6 @@ fn shear_through_the_strip(steps: usize) -> (f64, f64) {
 /// The stress the coarse level hands to the strip is the fine level's: the wave decays in the strip as in the uniform
 /// fine run (within 0.25 %) and in the coarse region as in the coarse flow alone (within 0.2 %).
 #[test]
-#[ignore = "expected to fail until the layer shift"]
 fn the_shear_stress_through_the_interface_is_the_fine_levels() {
     let (outside, strip) = shear_through_the_strip(1500);
     assert!(
@@ -1816,7 +1815,7 @@ fn the_shear_stress_through_the_interface_is_the_fine_levels() {
 /// The same after 4000 steps, where the error of a missing correction has grown to 1 %: the strip is within 0.5 % of the uniform fine run (its
 /// remaining 0.34 % is the error of the interface itself) and the coarse region within 0.2 % of the coarse flow alone.
 #[test]
-#[ignore = "heavy: cargo xtask test --heavy (CI heavy job); fails until the layer shift"]
+#[ignore = "heavy: cargo xtask test --heavy (CI heavy job)"]
 fn the_shear_stress_through_the_interface_is_the_fine_levels_long() {
     let (outside, strip) = shear_through_the_strip(4000);
     assert!(outside.abs() < 2e-3 && strip.abs() < 5e-3, "coarse region {outside:+.2e} against coarse-only, strip {strip:+.2e} against uniform fine");
@@ -1825,7 +1824,7 @@ fn the_shear_stress_through_the_interface_is_the_fine_levels_long() {
 /// A driven channel (48 x 24 x 4 coarse cells, walls on y, a strip of 24 fine columns in the middle) between the coarse flow
 /// alone and the uniform fine one: the mean flux through the strip lies between the two, within the fine run's own.
 #[test]
-#[ignore = "heavy: cargo xtask test --heavy (CI heavy job); fails until the layer shift"]
+#[ignore = "heavy: cargo xtask test --heavy (CI heavy job)"]
 fn a_driven_channel_through_the_strip_carries_a_flux_between_the_coarse_and_the_fine_runs() {
     let (nx, ny, eps, steps) = (48usize, 24usize, 5.1e-3, 40000usize);
     let setup = |n: [usize; 3], eps: f64, strip: Strip| {
