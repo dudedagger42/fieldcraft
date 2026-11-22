@@ -116,6 +116,15 @@ override HRR: bool = false;
 override VREMAN: bool = false;
 // The hybrid collision's dynamic σ from the subgrid model's eddy viscosity (with HRR); likewise.
 override DYNAMIC: bool = false;
+// The hybrid collision's wall-layer rule (fieldcraft_lbm::flow::Flow::set_wall_layer_sigma_one, with HRR): one flag word per cell
+// follows the cell flags from WALL_SIGMA1_BASE (bit 0: the cell is in the rule's layer, σ = 1 and a share of the density mode removed;
+// bit 2: it is next to an obstacle or voxel solid, the larger share). The host builds the words from the CPU flow's layer.
+override WALL_SIGMA1: bool = false;
+override WALL_SIGMA1_BASE: u32 = 0u;
+// The shares of the density mode removed in the layer's box-face cells and in its cells next to a solid (flow.rs WALL_LAYER_RULE_BULK
+// and WALL_LAYER_RULE_BULK_SOLID).
+const WALL_RULE_BULK: f32 = 0.03;
+const WALL_RULE_BULK_SOLID: f32 = 0.5;
 // Fans and porous zones (fieldcraft_lbm::flow's zone actions, data in `fluid`: zones.rs); likewise.
 override ZONES: bool = false;
 // The largest lattice speed (fieldcraft_lbm::setup::MAX_LATTICE_SPEED): the cap of a convective
@@ -1407,6 +1416,16 @@ fn collide_regularized(cell: u32, lid: u32, xyz: vec3<i32>, fq: ptr<function, ar
             record_eddy(cell, lid, omega, u);
         }
     }
+    // The rule changes the collision only where the blend was not already σ = 1 (flow.rs `rule_damp`).
+    var rule_damp = false;
+    var rule_share = WALL_RULE_BULK;
+    if WALL_SIGMA1 && HRR && (fluid[WALL_SIGMA1_BASE + cell] & 1u) != 0u {
+        rule_damp = sigma != 1.0;
+        if (fluid[WALL_SIGMA1_BASE + cell] & 4u) != 0u {
+            rule_share = WALL_RULE_BULK_SOLID;
+        }
+        sigma = 1.0;
+    }
     if HRR && sigma != 1.0 {
         let s = strain(g);
         let fd = -2.0 * (1.0 / 3.0) * rho / omega;
@@ -1456,6 +1475,20 @@ fn collide_regularized(cell: u32, lid: u32, xyz: vec3<i32>, fq: ptr<function, ar
         }
         f[post_index(q, cell, xyz)] = even + odd;
         f[post_index(q + 1u, cell, xyz)] = even - odd;
+    }
+    // The rule's layer also damps its non-equilibrium density mode: with h_q = c² − 1 and a = Σ f_q h_q − ρ u² (the deviations from the
+    // weights have Σ w h = 0), f_q −= share · 1.5 a w_q h_q; density and momentum are untouched.
+    if rule_damp {
+        var a = -rho * uu;
+        for (var q = 0u; q < Q; q = q + 1u) {
+            let cq = vec3<f32>(c_of(q));
+            a = a + f[post_index(q, cell, xyz)] * (dot(cq, cq) - 1.0);
+        }
+        for (var q = 0u; q < Q; q = q + 1u) {
+            let cq = vec3<f32>(c_of(q));
+            let i = post_index(q, cell, xyz);
+            f[i] = f[i] - rule_share * 1.5 * a * w_of(q) * (dot(cq, cq) - 1.0);
+        }
     }
 }
 

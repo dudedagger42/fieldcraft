@@ -349,11 +349,10 @@ fn cell_state(fq: &mut [f64; Q], cell: usize, a: [f64; 3], walls: Option<&Walls>
     Some(CellState { rho, u, force, wall })
 }
 
-/// The fluid cell next to the cell at `p` along `axis` (towards `+axis` with `up`): across a
-/// periodic face its periodic image, as streaming pulls; `None` when that cell is not a fluid
-/// cell or lies outside a face that is not periodic.
+/// The cell next to the cell at `p` along `axis` (towards `+axis` with `up`), fluid or not: across a
+/// periodic face its periodic image; `None` outside a face that is not periodic.
 #[inline(always)]
-fn neighbour(grid: &Grid, periodic: [bool; 3], fluid: &[bool], p: [usize; 3], axis: usize, up: bool) -> Option<usize> {
+fn across(grid: &Grid, periodic: [bool; 3], p: [usize; 3], axis: usize, up: bool) -> Option<usize> {
     let n = *grid.cells.get(axis)?;
     let i = *p.get(axis)?;
     let periodic = periodic.get(axis).copied().unwrap_or(false);
@@ -366,8 +365,44 @@ fn neighbour(grid: &Grid, periodic: [bool; 3], fluid: &[bool], p: [usize; 3], ax
     };
     let mut q = p;
     *q.get_mut(axis)? = next;
-    let cell = grid.index(q);
+    Some(grid.index(q))
+}
+
+/// The fluid cell next to the cell at `p` along `axis` (towards `+axis` with `up`): across a
+/// periodic face its periodic image, as streaming pulls; `None` when that cell is not a fluid
+/// cell or lies outside a face that is not periodic.
+#[inline(always)]
+fn neighbour(grid: &Grid, periodic: [bool; 3], fluid: &[bool], p: [usize; 3], axis: usize, up: bool) -> Option<usize> {
+    let cell = across(grid, periodic, p, axis, up)?;
     fluid.get(cell).copied().unwrap_or(false).then_some(cell)
+}
+
+/// The share of the non-equilibrium density mode the hybrid collision's wall-layer rule removes in its layer cells on a box face (the same
+/// constant is `WALL_RULE_BULK` in lbm.wgsl). Without any a layer of pure regularisation carries a cell-to-cell mode along a slot of 8 cells
+/// or fewer; 0.02 already removes it there, while 0.5 and more raise a box channel's pressure drop by about 58 %, so it is small.
+pub const WALL_LAYER_RULE_BULK: f64 = 0.03;
+
+/// The same share in the layer cells next to an obstacle or voxel solid (`WALL_RULE_BULK_SOLID` in lbm.wgsl; a cell on both takes this one).
+/// A curved or stair-stepped wall at small τ − ½ carries the cell-to-cell mode at the small share (a sphere in a channel at τ − ½ 3e-3).
+pub const WALL_LAYER_RULE_BULK_SOLID: f64 = 0.5;
+
+/// The rule's layer leaves out its box-face cells within this many cells of an inlet, outlet or pressure cell, in each axis (a cube around
+/// every open cell; cells next to an obstacle or voxel solid stay in it): next to an open face the rule bursts a small-τ box channel
+/// (a margin of 2 failed, 3 to 6 held; this is 4).
+pub const WALL_LAYER_OPEN_MARGIN: usize = 4;
+
+/// Remove the share `eps` of the non-equilibrium density (trace) mode of the populations `post`: the Hermite component
+/// `H = |c|² − 1` (c_s² = 1/3, so the trace of the equilibrium second moment is ρ(1 + u²)). With `a = Σ post H − ρ u²` and
+/// `Σ w H² = 2/3`, the component is `1.5 a w H`; the density and the momentum are untouched (H is orthogonal to both).
+fn damp_density_mode(post: &mut [f64; Q], rho: f64, uu: f64, eps: f64) {
+    let h = |q: usize| {
+        let c = C[q];
+        f64::from(c[0] * c[0] + c[1] * c[1] + c[2] * c[2]) - 1.0
+    };
+    let a: f64 = post.iter().enumerate().map(|(q, v)| v * h(q)).sum::<f64>() - rho * uu;
+    for (q, v) in post.iter_mut().enumerate() {
+        *v -= eps * 1.5 * a * W[q] * h(q);
+    }
 }
 
 /// A cell's action: its zone's, with the resistance of its liquid fraction `liquid` (with a phase
@@ -607,6 +642,12 @@ pub struct Flow {
     wall_model: bool,
     /// Whether the wall-function bounce gives the walls their stress (`spalding_bounce_halfway`).
     wall_bounce: bool,
+    /// The hybrid collision's wall-layer rule ([`Flow::set_wall_layer_sigma_one`]): on (1, the default) or off (0).
+    wall_layer_sigma_one: u8,
+    /// Which box faces are walls (axis, at the upper end): the rule's layer includes the cells on them.
+    wall_faces: [[bool; 2]; 3],
+    /// The rule's layer per cell (bit 0 in the layer, bit 1 next to an obstacle or voxel solid), built on first use.
+    wall_sigma_flags: std::sync::OnceLock<std::sync::Arc<Vec<u8>>>,
     /// Han et al.'s on-node wall-function bounce (`spalding_bounce`): its boundary nodes.
     nodes: Option<WallNodes>,
     /// With it, the cells that collide: the fluid cells less the boundary nodes (empty
@@ -808,6 +849,14 @@ impl Flow {
             _ => None,
         };
         let is_slip = |face: BoxFace| matches!(domain.faces.get(face), FaceCondition::Slip {});
+        let mut wall_faces = [[false; 2]; 3];
+        for face in BoxFace::ALL {
+            if matches!(domain.faces.get(face), FaceCondition::Wall {} | FaceCondition::MovingWall { .. })
+                && let Some(slot) = wall_faces.get_mut(face.axis()).and_then(|a| a.get_mut(usize::from(face.is_max())))
+            {
+                *slot = true;
+            }
+        }
         // The wall-function bounce reflects at its walls instead of bouncing back; only at rest.
         let wall_bounce = setup.wall_model == Some(WallModel::SpaldingBounceHalfway);
         if wall_bounce && let Some(face) = BoxFace::ALL.iter().find(|f| matches!(domain.faces.get(**f), FaceCondition::MovingWall { .. })) {
@@ -1284,6 +1333,9 @@ impl Flow {
             walls,
             wall_model: setup.wall_model == Some(WallModel::Musker),
             wall_bounce: setup.wall_model == Some(WallModel::SpaldingBounceHalfway),
+            wall_layer_sigma_one: 1,
+            wall_faces,
+            wall_sigma_flags: std::sync::OnceLock::new(),
             nodes: on_node.then(|| WallNodes::new(node_list, nu)),
             bulk,
             rheology: setup.rheology,
@@ -1583,6 +1635,111 @@ impl Flow {
     /// wall-function bounce.
     fn collides(&self) -> &[bool] {
         if self.bulk.is_empty() { &self.fluid } else { &self.bulk }
+    }
+
+    /// The hybrid collision's wall-layer rule: σ = 1 in the layer of the resolved walls, and a small share of the layer's density
+    /// (trace) mode removed ([`WALL_LAYER_RULE_BULK`], the larger [`WALL_LAYER_RULE_BULK_SOLID`] next to an obstacle or voxel solid).
+    /// The blend's finite-difference strain is first-order at a wall and its error is amplified by τ̄ / (τ̄ − ½), so the layer takes the
+    /// regularised flux alone. On by default: 1 is on, 0 is off (the blend everywhere); any other value counts as on. It acts
+    /// with the hybrid collision only. A row beside a boundary node of the on-node wall-function bounce is not in the layer: the wall law
+    /// sets its stress.
+    pub fn set_wall_layer_sigma_one(&mut self, mode: u8) {
+        self.wall_layer_sigma_one = mode;
+    }
+
+    /// The mode [`Flow::set_wall_layer_sigma_one`] set (1 by default, 0 off).
+    pub fn wall_layer_sigma_one(&self) -> u8 {
+        self.wall_layer_sigma_one
+    }
+
+    /// The rule's layer, one byte per cell: bit 0 in the layer, bit 1 next to an obstacle or voxel solid (the larger density-mode
+    /// share). The layer is the cells that collide with a solid cell or a wall box face across an axis neighbour, without the box-face
+    /// cells within [`WALL_LAYER_OPEN_MARGIN`] cells of an open cell. Built once.
+    fn wall_sigma_flags(&self) -> std::sync::Arc<Vec<u8>> {
+        self.wall_sigma_flags.get_or_init(|| std::sync::Arc::new(self.build_wall_sigma_flags())).clone()
+    }
+
+    fn build_wall_sigma_flags(&self) -> Vec<u8> {
+        let live = self.collides();
+        let solid = |c: usize| !self.fluid.get(c).copied().unwrap_or(true);
+        // A domain face is a resolved wall too (half-way bounce-back) unless a wall law gives it its stress or the cell is an inlet/outlet there.
+        let mut opens = std::collections::HashSet::new();
+        for o in &self.open {
+            opens.insert((o.cell as usize, o.axis));
+        }
+        let faces_wall = !self.wall_bounce;
+        let near_open = self.near_open_cells(WALL_LAYER_OPEN_MARGIN);
+        (0..self.grid.len())
+            .map(|c| {
+                if !live.get(c).copied().unwrap_or(false) {
+                    return 0;
+                }
+                let p = self.grid.coords(c);
+                let (mut s, mut f) = (false, false);
+                for axis in 0..3 {
+                    for up in [false, true] {
+                        match across(&self.grid, self.periodic, p, axis, up) {
+                            Some(n) => s |= solid(n),
+                            None => {
+                                f |= faces_wall
+                                    && self.wall_faces.get(axis).and_then(|a| a.get(usize::from(up))).copied().unwrap_or(false)
+                                    && !opens.contains(&(c, axis));
+                            }
+                        }
+                    }
+                }
+                // The margin takes out box-face cells only: a cell next to a solid keeps its σ = 1 (a dead-end slit between voxel walls that
+                // opens onto an open face would otherwise lose it on its last cells).
+                if !(s || f) || (!s && near_open.get(c).copied().unwrap_or(false)) {
+                    return 0;
+                }
+                1 | (u8::from(s) << 1)
+            })
+            .collect()
+    }
+
+    /// The cells within `margin` cells of an open cell, in every axis (a cube around each one; periodic images are ignored).
+    fn near_open_cells(&self, margin: usize) -> Vec<bool> {
+        let n = self.grid.len();
+        let mut mask = vec![false; n];
+        for o in &self.open {
+            if let Some(slot) = mask.get_mut(o.cell as usize) {
+                *slot = true;
+            }
+        }
+        if margin <= 1 || self.open.is_empty() {
+            return mask;
+        }
+        let reach = margin - 1;
+        for axis in 0..3 {
+            let mut next = mask.clone();
+            for (c, _) in mask.iter().enumerate().filter(|(_, m)| **m) {
+                let p = self.grid.coords(c);
+                let Some(&i) = p.get(axis) else { continue };
+                let hi = (i + reach).min(self.grid.cells.get(axis).copied().unwrap_or(1).saturating_sub(1));
+                for k in i.saturating_sub(reach)..=hi {
+                    let mut q = p;
+                    if let Some(x) = q.get_mut(axis) {
+                        *x = k;
+                    }
+                    if let Some(slot) = next.get_mut(self.grid.index(q)) {
+                        *slot = true;
+                    }
+                }
+            }
+            mask = next;
+        }
+        mask
+    }
+
+    /// The cells of the rule's layer; the device reads this mask.
+    pub fn wall_sigma_layer_mask(&self) -> Vec<bool> {
+        self.wall_sigma_flags().iter().map(|f| f & 1 != 0).collect()
+    }
+
+    /// The layer's cells that take the larger density-mode share (next to an obstacle or voxel solid); the device reads this mask too.
+    pub fn wall_sigma_solid_mask(&self) -> Vec<bool> {
+        self.wall_sigma_flags().iter().map(|f| f & 2 != 0).collect()
     }
 
     /// Whether Han et al.'s on-node wall-function bounce runs (`spalding_bounce`).
@@ -2264,6 +2421,9 @@ impl Flow {
         let regularized = self.collision.is_regularized();
         let mrt = self.collision == Collision::Mrt;
         let (sigma, gradient_u, grid, periodic) = (self.sigma, &self.gradient_u, self.grid, self.periodic);
+        // The wall-layer rule's layer (empty when it is off or the collision is not the hybrid one).
+        let sigma_flags: std::sync::Arc<Vec<u8>> =
+            if self.wall_layer_sigma_one != 0 && hybrid { self.wall_sigma_flags() } else { std::sync::Arc::default() };
         // Dynamic σ's cap on the von Kármán length: the box's shortest extent in cells.
         let l_max = self.grid.cells.iter().copied().min().unwrap_or(1) as f64;
         let (wp, wm) = (self.omega_plus, self.omega_minus);
@@ -2418,6 +2578,8 @@ impl Flow {
                     // the model's eddy viscosity (Vreman's, or Hou's implicit Smagorinsky one),
                     // 1 at a wall cell under the wall model.
                     let mut nu_model = None;
+                    let mut rule_damp = false;
+                    let mut rule_share = WALL_LAYER_RULE_BULK;
                     let blend = local.as_ref().filter(|_| hybrid).map(|(g, nb)| {
                         let cell_sigma = if dynamic {
                             let s = match wall_rate {
@@ -2442,6 +2604,16 @@ impl Flow {
                         } else {
                             sigma
                         };
+                        // The wall-layer rule: σ = 1 in the layer, and its density mode damped there below.
+                        let flag = sigma_flags.get(b * block + i).copied().unwrap_or(0);
+                        let cell_sigma = if flag & 1 != 0 {
+                            // the rule changes the collision only where the blend was not already σ = 1
+                            rule_damp = cell_sigma != 1.0;
+                            rule_share = if flag & 2 != 0 { WALL_LAYER_RULE_BULK_SOLID } else { WALL_LAYER_RULE_BULK };
+                            1.0
+                        } else {
+                            cell_sigma
+                        };
                         (cell_sigma, crate::hrr::strain(g))
                     });
                     // The cell's rate: a shear-dependent fluid's of its flux (not at a wall cell
@@ -2463,6 +2635,10 @@ impl Flow {
                         );
                     if turbulent {
                         eddy(nu_model.unwrap_or_else(|| from_rate(w)));
+                    }
+                    // The rule's layer also damps its density mode (the hybrid collision only).
+                    if rule_damp {
+                        damp_density_mode(&mut post, rho, uu, rule_share);
                     }
                     for (q, v) in post.iter().enumerate() {
                         put(q, *v);
@@ -2901,6 +3077,9 @@ impl crate::backend::Backend for Flow {
             walls,
             wall_model,
             wall_bounce,
+            wall_layer_sigma_one: _,
+            wall_faces: _,
+            wall_sigma_flags: _,
             nodes,
             bulk: _,
             rheology,

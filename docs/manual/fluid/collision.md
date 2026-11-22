@@ -146,6 +146,8 @@ the model's ν_t, and with heat α_t = ν_t / Pr_t still reaches the scalar latt
 continuous model's estimate; near τ̄ = ½ the scheme's own hyperviscosity is several times larger
 (above), so there dynamic σ dissipates more than the subgrid model it matches.
 
+**Wall layer.** In the layer of resolved walls (live cells with a solid neighbour along an axis, or next to a wall face of the box) σ is 1, and a share of the non-equilibrium density mode (Hermite `|c|² − 1`) is removed: 0.5 next to obstacle and voxel solids, 0.03 next to box faces. Box-face cells within 4 cells of an open cell (inlet, outlet, pressure face) stay out of the layer; cells next to solids stay in. This is on by default. The collision is the one without it after `Flow::set_wall_layer_sigma_one(0)`. It acts only with `"hrr"`, on the CPU and the GPU, and not on rows under a wall law (those nodes do not collide). The two shares mean the same flat wall answers slightly differently as a box face and as an obstacle slab (`tests/wall_layer_sigma.rs`).
+
 ### Multiple relaxation times
 
 The populations are mapped to 19 orthogonal moments m = M f, each relaxed towards its equilibrium
