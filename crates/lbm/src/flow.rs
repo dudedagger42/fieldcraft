@@ -585,25 +585,22 @@ pub struct InletCornerReport {
     pub cells: usize,
     /// The inlet-layer cells that were fluid before, over the inlets that lost some.
     pub inlet_cells: usize,
-    /// The largest share of one inlet's cells that was lost.
-    pub area_lost: f64,
-    /// The largest factor an inlet's velocity was raised by to keep its volume flow.
+    /// The largest factor an inlet's velocity was raised by to keep its volume flow: the flux of the
+    /// inlet's cells before over the flux of the cells that still deliver (flux, not a cell count: the
+    /// cells on a wall's row deliver nothing either).
     pub flux_rescale: f64,
 }
 
 impl InletCornerReport {
-    /// The line a run prints: how many inlet cells became wall cells, the inlet area lost and the velocity factor;
-    /// None when the rule changed nothing.
+    /// The line a run prints: how many inlet cells became wall cells and the factor the inlet's velocity was raised
+    /// by (by flux); None when the rule changed nothing.
     pub fn message(&self) -> Option<String> {
         if self.cells == 0 && !(self.flux_rescale > 1.0) {
             return None;
         }
         Some(format!(
-            "inlet corner rule: {} of {} inlet-layer cells became wall cells; the inlet loses {:.1} % of its area at most and its velocity is raised by up to {:.3} to deliver the requested flow",
-            self.cells,
-            self.inlet_cells,
-            100.0 * self.area_lost,
-            self.flux_rescale
+            "inlet corner rule: {} of {} inlet-layer cells became wall cells; the inlet velocity is raised by up to {:.3} (by flux) to deliver the requested flow",
+            self.cells, self.inlet_cells, self.flux_rescale
         ))
     }
 }
@@ -926,7 +923,6 @@ impl Flow {
                 if corner.is_empty() && wall_row == 0 {
                     continue;
                 }
-                let lost = corner.len() as f64 / cells_before.max(1) as f64;
                 if !(flux_after > 0.0) {
                     return Err(Error::Invalid(format!(
                         "the velocity inlet on box face {} has {} of its {cells_before} cells touching two walls (wall cells under the on-node wall law) and {wall_row} on a wall's row, and none left to deliver its flow: the spacing ({}) is too coarse for its shape; refine it",
@@ -947,7 +943,6 @@ impl Flow {
                 inlet_rescale[face.index()] = flux_before / flux_after;
                 inlet_corners.cells += corner.len();
                 inlet_corners.inlet_cells += cells_before;
-                inlet_corners.area_lost = inlet_corners.area_lost.max(lost);
                 inlet_corners.flux_rescale = inlet_corners.flux_rescale.max(flux_before / flux_after);
             }
         }

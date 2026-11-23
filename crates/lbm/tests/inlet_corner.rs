@@ -72,7 +72,6 @@ fn an_inlet_cell_touching_two_walls_is_a_wall_cell() {
     let flow = fieldcraft_lbm::Flow::new(&setup, &obstacles).unwrap();
     let report = flow.inlet_corner_report();
     assert_eq!((report.cells, report.inlet_cells), (4, 64), "{report:?}");
-    assert!((report.area_lost - 4.0 / 64.0).abs() < 1e-12);
     assert!(report.flux_rescale > 1.0 && report.flux_rescale < 1.3, "{report:?}");
     let g = flow.grid();
     for (j, k) in [(0, 0), (7, 0), (0, 7), (7, 7)] {
@@ -83,13 +82,13 @@ fn an_inlet_cell_touching_two_walls_is_a_wall_cell() {
     }
 }
 
-/// A solved run reports the count and the area lost, and a run without the rule reports nothing.
+/// A solved run reports the count and the factor the inlet was raised by, and a run without the rule reports nothing.
 #[test]
-fn a_run_prints_the_reclassified_cells_and_the_area_lost() {
+fn a_run_prints_the_reclassified_cells_and_the_raise() {
     let m = channel_model((16, 8, 8), false, false, Some(WallModel::SpaldingBounce), vec![]);
     let r = fieldcraft_lbm::solve_fluid(&m, None, &[], &Limits::default()).unwrap();
     let line = r.warnings.iter().find(|w| w.starts_with("inlet corner rule:")).expect("the run reports the corner rule");
-    assert!(line.contains("4 of 64 inlet-layer cells") && line.contains("6.2 % of its area"), "{line}");
+    assert!(line.contains("4 of 64 inlet-layer cells") && line.contains("raised by up to 1.") && line.contains("by flux"), "{line}");
     let m = channel_model((16, 8, 8), false, false, None, vec![]);
     let r = fieldcraft_lbm::solve_fluid(&m, None, &[], &Limits::default()).unwrap();
     assert!(r.warnings.iter().all(|w| !w.starts_with("inlet corner rule:")), "{:?}", r.warnings);
@@ -223,6 +222,21 @@ fn the_inlet_delivers_the_requested_flow() {
         })
         .sum();
     assert!((delivered / requested - 1.0).abs() < 1e-12, "delivered {delivered}, requested {requested}");
+}
+
+/// An inlet with no cell that can deliver flow (a bar across the middle of a 3-cell section leaves only cells that touch
+/// the box wall and the bar) is refused: its flow cannot be delivered at any velocity.
+#[test]
+fn an_inlet_with_no_cell_left_to_deliver_its_flow_is_refused() {
+    let bar = obstacle("Bar", cuboid([0.0, DX, -DX], [0.5, 2.0 * DX, 4.0 * DX]), &CUBOID_FACES);
+    let m = channel_model((16, 3, 3), false, false, Some(WallModel::SpaldingBounce), vec!["Bar".to_string()]);
+    let obstacles = vec![bar];
+    let setup = Setup::new(&m, None, &obstacles, &Limits::default()).unwrap();
+    let e = match fieldcraft_lbm::Flow::new(&setup, &obstacles) {
+        Ok(_) => panic!("no inlet cell can deliver flow"),
+        Err(e) => e.to_string(),
+    };
+    assert!(e.contains("none left to deliver its flow"), "{e}");
 }
 
 /// A wall cell the rule makes is a wall of its neighbours' force groups: no link bounces into the inlet's own group.
