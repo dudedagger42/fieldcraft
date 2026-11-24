@@ -18,7 +18,7 @@ centres across the pipe (`/line/max/velocity`).
 
 | Walls | 8 cells per radius | 16 cells per radius |
 |---|---|---|
-| interpolated (this case) | 0.23963 (−0.15 %) | 0.23990 (−0.04 %) |
+| interpolated (this case) | 0.23958 (−0.17 %) | 0.23990 (−0.04 %) |
 | halfway (the same recipe with `walls: "halfway"`) | 0.22678 (−5.5 %) | 0.23503 (−2.1 %) |
 
 Interpolated walls converge at about second order (the error falls 3.7 times), halfway walls at

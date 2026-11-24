@@ -31,7 +31,7 @@
    "tolerance": {
     "relative": 0.005
    },
-   "reason": "interpolated walls at 8 cells per radius: measured −0.15 %, converging at second order (−0.04 % at 16; the README's table); a third of the tolerance. Halfway walls read −5.5 % here, so the case fails if the obstacle's links fall back to halfway bounce-back",
+   "reason": "interpolated walls at 8 cells per radius: measured −0.17 %, converging at second order (−0.04 % at 16; the README's table); a third of the tolerance. Halfway walls read −5.5 % here, so the case fails if the obstacle's links fall back to halfway bounce-back",
    "fixture": false,
    "fixture_reason": "the pipe wall comes from a SolidCraft design: its triangulation is not bit-identical across platforms, though q is taken on the exact cylinder"
   },
